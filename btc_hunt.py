@@ -550,6 +550,8 @@ def attack_nonce_reuse(address, log, job):
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 
+_HITS_FILE = None  # set in worker mode: append-only JSONL of hits
+
 def _db():
     c = sqlite3.connect(DB_PATH, check_same_thread=False)
     c.executescript("""
@@ -564,6 +566,9 @@ def _save_result(attack, payload):
     with _db() as c:
         c.execute("INSERT INTO results (attack,payload,ts) VALUES (?,?,?)",
                   (attack, json.dumps(payload), datetime.now(timezone.utc).isoformat()))
+    if _HITS_FILE is not None:
+        _HITS_FILE.write(json.dumps({"attack": attack, **payload}) + "\n")
+        _HITS_FILE.flush()
 
 def _list_results():
     with _db() as c:
@@ -871,11 +876,28 @@ def api_log_stream(name):
 # ════════════════════════════════════════════════════════════════════
 # ENTRY
 # ════════════════════════════════════════════════════════════════════
+def _shard_range(start, end, idx, n):
+    """Split [start,end] into n contiguous shards; return shard idx (0-based)."""
+    total = end - start + 1
+    per = total // n
+    s = start + idx * per
+    e = end if idx == n - 1 else s + per - 1
+    return s, e
+
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        epilog="worker mode (for cluster nodes): "
+               "python btc_hunt.py --worker randstorm --shard 3/10   "
+               "# timestamps split across 10 nodes\n"
+               "python btc_hunt.py --worker brainwallet --shard 3/10 --wordlist words.txt")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--build-bloom", action="store_true")
     ap.add_argument("--cli-randstorm", nargs=2, type=int, metavar=("START","END"))
+    ap.add_argument("--worker", choices=["randstorm", "brainwallet"],
+                    help="run a single shard of an attack and exit (cluster worker mode)")
+    ap.add_argument("--shard", metavar="IDX/N", help="0-based shard index / total shards, e.g. 3/10")
+    ap.add_argument("--wordlist", help="passphrase file for --worker brainwallet")
     args = ap.parse_args()
 
     if args.build_bloom:
@@ -887,6 +909,39 @@ if __name__ == "__main__":
         bf = BloomFilter.load(BLOOM_PATH)
         attack_randstorm(args.cli_randstorm[0], args.cli_randstorm[1],
                          bf, print, {"stop": False, "progress": 0, "detail": ""})
+        sys.exit(0)
+
+    if args.worker:
+        if not args.shard or "/" not in args.shard:
+            sys.exit("--worker requires --shard IDX/N (e.g. --shard 3/10)")
+        try:
+            idx, n = (int(x) for x in args.shard.split("/", 1))
+        except ValueError:
+            sys.exit("--shard must look like IDX/N (e.g. 3/10)")
+        if not (0 <= idx < n) or n < 1:
+            sys.exit(f"shard index {idx} out of range for {n} shards")
+        if not BLOOM_PATH.exists():
+            sys.exit("bloom not found — run --build-bloom first "
+                     "(or point DISK_PATH at the node's data dir)")
+        bf = BloomFilter.load(BLOOM_PATH)
+        hits_path = DATA_DIR / f"hits_shard{idx}_of_{n}.jsonl"
+        _HITS_FILE = open(hits_path, "a", encoding="utf-8")
+        job = {"stop": False, "progress": 0, "detail": ""}
+        if args.worker == "randstorm":
+            s, e = _shard_range(GENESIS_TS, CUTOFF_TS, idx, n)
+            print(f"[worker] randstorm shard {idx+1}/{n}: {s}..{e}", flush=True)
+            attack_randstorm(s, e, bf, print, job)
+        else:
+            if not args.wordlist:
+                sys.exit("--worker brainwallet requires --wordlist FILE")
+            with open(args.wordlist, encoding="utf-8", errors="ignore") as f:
+                pws = [l.rstrip("\n") for l in f if l.strip()]
+            shard = pws[idx::n]
+            print(f"[worker] brainwallet shard {idx+1}/{n}: "
+                  f"{len(shard):,}/{len(pws):,} passphrases", flush=True)
+            attack_brainwallet(shard, bf, print, job)
+        _HITS_FILE.close()
+        print(f"[worker] done — hits appended to {hits_path}", flush=True)
         sys.exit(0)
 
     app.run(host="0.0.0.0", port=args.port, debug=False)
