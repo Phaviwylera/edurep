@@ -138,6 +138,11 @@ log "installing requirements"
 # writes to DATA_DIR. This also keeps `sudo git pull` working on the checkout.
 chmod -R a+rX "$APP_DIR"
 
+# The deploy command lives OUTSIDE the git checkout so that `git reset --hard`
+# during an update cannot corrupt the script that is currently executing.
+install -m 0755 "$APP_DIR/deploy/ec2/update.sh" /usr/local/bin/btc-hunt-update
+log "installed /usr/local/bin/btc-hunt-update"
+
 # 5. systemd unit ------------------------------------------------------------
 log "installing systemd unit"
 render_unit /etc/systemd/system/btc-hunt.service
