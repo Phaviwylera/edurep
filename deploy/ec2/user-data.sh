@@ -14,9 +14,9 @@ set -euo pipefail
 exec > >(tee /var/log/btc-hunt-bootstrap.log) 2>&1
 
 REPO_URL="${REPO_URL:-https://github.com/Phaviwylera/edurep.git}"
-# Must be a branch that contains deploy/ec2/. Merge to main and change this
-# to "main" if you deploy from the default branch.
-REPO_BRANCH="${REPO_BRANCH:-arena/33a3dc59-edurep}"
+# Deploys the default branch (main), which contains deploy/ec2/. Override
+# REPO_BRANCH to launch from another branch.
+REPO_BRANCH="${REPO_BRANCH:-main}"
 APP_DIR="${APP_DIR:-/opt/btc-hunt}"
 # Nitro (t3/m6i/...) exposes a second EBS volume as /dev/nvme1n1 even when
 # the block device mapping says /dev/sdf. Set to "" to keep data on the root

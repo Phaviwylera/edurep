@@ -16,19 +16,20 @@ commands.
 
 ## Deploy (Blueprint)
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Phaviwylera/edurep/tree/arena/33a3dc59-edurep)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Phaviwylera/edurep)
 
-That button deploys the branch `arena/33a3dc59-edurep`. If you merge this work
-into `main`, remove the `/tree/arena/33a3dc59-edurep` suffix from the link
-(the repo's default branch is `main`).
+The button deploys the repo's default branch (`main`), which contains
+`render.yaml` and `deploy/ec2/`. To deploy a different branch, append
+`/tree/<branch-name>` to the `repo` URL in the link above.
 
 Or do it manually:
 
-1. Push the branch to GitHub (`git push origin arena/33a3dc59-edurep`).
+1. Make sure `main` is pushed to GitHub (`git push origin main` if you are
+   working from a local clone).
 2. In the [Render Dashboard](https://dashboard.render.com/): **New → Blueprint**
    → connect `Phaviwylera/edurep` (install Render's GitHub App if the repo is private).
-3. **Branch:** `arena/33a3dc59-edurep` (or `main` after merging).
-   **Blueprint Path:** `render.yaml` (root of repo).
+3. **Branch:** `main` (the repo's default branch; select another branch in the
+   form if needed). **Blueprint Path:** `render.yaml` (root of repo).
 4. Review the resources Render lists: one web service `btc-hunt`, plan `1c-2g`,
    and a 10 GB disk `btc-hunt-data` mounted at `/data`.
 5. Render will prompt for `APP_USER` and `APP_PASSWORD`. Set both to require a

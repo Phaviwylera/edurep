@@ -85,11 +85,11 @@ PUBLIC_IP=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTA
 curl -fsS "http://$PUBLIC_IP/health"    # -> {"status":"ok"}
 ```
 
-`user-data.sh` clones the branch `arena/33a3dc59-edurep` (the one containing
-`deploy/ec2/`). Edit `REPO_BRANCH` at the top of the file after merging to
-`main`. For a **private repo**, install a read-only deploy key on the instance
-first — never bake credentials into user-data (it is readable via IMDS and
-stored in your AWS account).
+`user-data.sh` clones the default branch `main` (which contains `deploy/ec2/`).
+Set `REPO_BRANCH` at the top of the file to launch from a different branch.
+For a **private repo**, install a read-only deploy key on the instance first —
+never bake credentials into user-data (it is readable via IMDS and stored in
+your AWS account).
 
 ## Option B — launch from the console
 
@@ -110,8 +110,7 @@ Bootstrap log: `/var/log/btc-hunt-bootstrap.log`.
 ```bash
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends python3 python3-venv python3-pip git nginx curl
-sudo git clone --depth 1 --branch arena/33a3dc59-edurep \
-  https://github.com/Phaviwylera/edurep.git /opt/btc-hunt
+sudo git clone --depth 1 https://github.com/Phaviwylera/edurep.git /opt/btc-hunt
 # DATA_DEVICE is optional; omit it to keep data on the root volume.
 sudo env DATA_DEVICE=/dev/nvme1n1 bash /opt/btc-hunt/deploy/ec2/install.sh
 ```
