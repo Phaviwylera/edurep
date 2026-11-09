@@ -1,7 +1,7 @@
 # Render Blueprint — https://render.com/docs/blueprint-spec
 #
 # Deploy from the Render Dashboard: New > Blueprint > connect this repo, then
-# pick the branch that contains this file (see README.md). Render sets $PORT
+# link the default branch (main); see README.md. Render sets $PORT
 # (10000 by default) and the start command must bind to 0.0.0.0:$PORT.
 #
 # Note: a persistent disk requires a PAID plan, so the free tier cannot be
