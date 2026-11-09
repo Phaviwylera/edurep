@@ -10,6 +10,10 @@ that provisions the whole service.
 > verify the repo but cannot press "Deploy" for you. Everything below is a
 > few clicks in the Render Dashboard.
 
+Prefer your own VM? See [Deploying on EC2](deploy/ec2/README.md) for a
+cloud-init user-data script, systemd unit, nginx config and AWS CLI launch
+commands.
+
 ## Deploy (Blueprint)
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Phaviwylera/edurep/tree/arena/33a3dc59-edurep)
