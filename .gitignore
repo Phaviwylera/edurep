@@ -1,2 +1,23 @@
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Local app state / generated datasets (kept on the Render persistent disk)
+*.sqlite
+*.sqlite-*
+*.bloom
+*.tsv.gz
+*.jsonl
+results.json
+
+# Secrets / editor / OS
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/

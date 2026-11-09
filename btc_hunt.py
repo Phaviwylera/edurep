@@ -9,10 +9,10 @@ BTC Hunt — all viable pre-2015 Bitcoin attacks in one deployable app.
 Dashboard: Flask + SSE progress. Persistent disk at /data.
 Dataset: auto-download from addresses.loyce.club, fallback 3xpl.com.
 
-Deploy: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 120
+Deploy: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 180
 """
 
-import os, sys, io, re, csv, gzip, json, math, time, signal
+import os, sys, io, re, csv, gzip, json, math, time, signal, base64, hmac
 import sqlite3, threading, hashlib, struct, argparse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -35,7 +35,10 @@ BLOOM_PATH = DATA_DIR / "funded.bloom"
 ADDR_GZ    = DATA_DIR / "blockchair.tsv.gz"
 RESULTS    = DATA_DIR / "results.json"
 
+# Prefer HTTPS: some cloud networks drop plain-HTTP egress. The original
+# mirrors stay as fallbacks.
 DATASET_URLS = [
+    "https://addresses.loyce.club/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
     "http://addresses.loyce.club/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
     "https://3xpl.com/data/dumps/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
 ]
@@ -88,7 +91,71 @@ def privkey_to_uncompressed_pub(d):
 def sha256(b): return hashlib.sha256(b).digest()
 def sha256d(b): return sha256(sha256(b))
 def ripemd160(b):
-    h=hashlib.new('ripemd160'); h.update(b); return h.digest()
+    # OpenSSL 3 builds without the legacy provider raise ValueError here
+    # (a known problem on some native-Python PaaS images).
+    try:
+        h=hashlib.new('ripemd160'); h.update(b); return h.digest()
+    except (ValueError, TypeError):
+        return _ripemd160_py(b)
+
+
+def _ripemd160_py(msg):
+    # Pure-Python RIPEMD160, used only if hashlib cannot provide it.
+    h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0]
+    rl = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+          7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+          3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
+          1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
+          4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13]
+    rr = [5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
+          6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+          15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
+          8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
+          12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11]
+    sl = [11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
+          7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+          11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
+          11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
+          9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6]
+    sr = [8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
+          9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+          9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
+          15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
+          8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11]
+    kl = (0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E)
+    kr = (0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000)
+    MASK = 0xFFFFFFFF
+
+    def rol(x, n):
+        return ((x << n) | (x >> (32 - n))) & MASK
+
+    def f(j, x, y, z):
+        if j < 16: return x ^ y ^ z
+        if j < 32: return (x & y) | (~x & z)
+        if j < 48: return (x | ~y) ^ z
+        if j < 64: return (x & z) | (y & ~z)
+        return x ^ (y | ~z)
+
+    data = bytes(msg)
+    bitlen = (len(data) * 8) & 0xFFFFFFFFFFFFFFFF
+    data += b'\x80' + b'\x00' * ((55 - len(data)) % 64) + bitlen.to_bytes(8, 'little')
+    for off in range(0, len(data), 64):
+        X = [int.from_bytes(data[off+4*i:off+4*i+4], 'little') for i in range(16)]
+        al, bl, cl, dl, el = h
+        ar, br, cr, dr, er = h
+        for j in range(80):
+            t = (rol((al + f(j, bl, cl, dl) + X[rl[j]] + kl[j // 16]) & MASK, sl[j]) + el) & MASK
+            al, bl, cl, dl, el = el, t, bl, rol(cl, 10), dl
+            t = (rol((ar + f(79 - j, br, cr, dr) + X[rr[j]] + kr[j // 16]) & MASK, sr[j]) + er) & MASK
+            ar, br, cr, dr, er = er, t, br, rol(cr, 10), dr
+        t = (h[1] + cl + dr) & MASK
+        h[1] = (h[2] + dl + er) & MASK
+        h[2] = (h[3] + el + ar) & MASK
+        h[3] = (h[4] + al + br) & MASK
+        h[4] = (h[0] + bl + cr) & MASK
+        h[0] = t
+    return b''.join(x.to_bytes(4, 'little') for x in h)
+
 def hash160(b): return ripemd160(sha256(b))
 
 # Base58Check
@@ -204,26 +271,33 @@ class BloomFilter:
 # DATASET
 # ════════════════════════════════════════════════════════════════════
 def _download(url, dest, log):
+    # Stream into a .part file so a failed 1.5 GB transfer never leaves a
+    # truncated dataset that later looks "already downloaded".
     log(f"[dl] {url}")
+    tmp = Path(str(dest) + ".part")
     try:
         r = requests.get(url, stream=True, timeout=60)
         r.raise_for_status()
         total = int(r.headers.get('content-length', 0))
         done = 0; last = 0
-        with open(dest, 'wb') as f:
+        with open(tmp, 'wb') as f:
             for chunk in r.iter_content(1 << 20):
                 f.write(chunk); done += len(chunk)
                 if total and done - last > 50 << 20:
                     last = done
                     log(f"[dl] {done/1e9:.2f}/{total/1e9:.2f} GB")
+        tmp.replace(dest)
         log(f"[✓] downloaded {done/1e9:.2f} GB")
         return True
     except Exception as e:
         log(f"[!] {url}: {e}")
+        tmp.unlink(missing_ok=True)
         return False
 
 def build_bloom(log):
-    """Download dataset if needed, stream-parse, build bloom filter."""
+    # Two streaming passes over the gzip: pass 1 sizes the bloom from the row
+    # count, pass 2 fills it directly. Holding every hash160 in a Python set
+    # needs several GB and gets OOM-killed on a small Render instance.
     if not ADDR_GZ.exists():
         ok = False
         for u in DATASET_URLS:
@@ -231,25 +305,26 @@ def build_bloom(log):
         if not ok:
             raise RuntimeError("all dataset mirrors failed")
 
-    log("[parse] streaming gzip → hash160 set")
-    hash_set = set()
-    n = 0
-    with gzip.open(ADDR_GZ, 'rt', errors='ignore') as f:
-        for line in f:
-            parts = line.rstrip('\n').split('\t')
-            if len(parts) < 1: continue
-            addr = parts[0].strip()
-            h = _address_to_hash160(addr)
-            if h:
-                hash_set.add(h)
-                n += 1
-                if n % 500000 == 0:
-                    log(f"[parse] {n/1e6:.1f}M addresses, {len(hash_set)/1e6:.1f}M unique")
+    def hashes():
+        with gzip.open(ADDR_GZ, 'rt', errors='ignore') as f:
+            for line in f:
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 1: continue
+                h = _address_to_hash160(parts[0].strip())
+                if h:
+                    yield h
 
-    log(f"[parse] {len(hash_set):,} unique hash160 — building bloom")
-    bf = BloomFilter.create(len(hash_set) or 1, fp_rate=0.001)
-    for h in hash_set:
-        bf.add(h)
+    log("[parse] pass 1/2 — counting address rows")
+    n = sum(1 for _ in hashes())
+    log(f"[parse] {n:,} rows — sizing bloom")
+    bf = BloomFilter.create(n or 1, fp_rate=0.001)
+
+    log(f"[parse] pass 2/2 — filling bloom ({bf.m/8/1e6:.0f} MB bitset, k={bf.k})")
+    i = 0
+    for h in hashes():
+        bf.add(h); i += 1
+        if i % 500000 == 0:
+            log(f"[parse] {i/1e6:.1f}M/{n/1e6:.1f}M addresses")
     bf.save(BLOOM_PATH)
     log(f"[✓] bloom saved ({BLOOM_PATH.stat().st_size/1e6:.0f} MB, "
         f"{bf.m/8/1e6:.0f} MB bitset, k={bf.k})")
@@ -606,6 +681,38 @@ def _start_job(name, fn, *args):
 # FLASK APP
 # ════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
+
+# Optional HTTP Basic auth. This dashboard exposes unauthenticated POST
+# endpoints and a public URL on Render; set both env vars (the Blueprint
+# prompts for them) to require a login. Leave them blank for the original
+# open behaviour. /health stays public so Render's health check works.
+APP_USER     = os.environ.get("APP_USER", "").strip()
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+
+def _auth_challenge():
+    return Response("Authentication required", 401,
+                    {"WWW-Authenticate": 'Basic realm="BTC Hunt"'})
+
+@app.before_request
+def _require_auth():
+    if not (APP_USER and APP_PASSWORD) or request.path == "/health":
+        return None
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return _auth_challenge()
+    try:
+        user, pw = base64.b64decode(auth[6:], validate=True).decode("utf-8").split(":", 1)
+    except Exception:
+        return _auth_challenge()
+    if not (hmac.compare_digest(user, APP_USER) and
+            hmac.compare_digest(pw, APP_PASSWORD)):
+        return _auth_challenge()
+    return None
+
+@app.route("/health")
+def health():
+    # Liveness only: no disk, dataset or database dependency.
+    return {"status": "ok"}
 
 PAGE = """
 <!doctype html><html><head><meta charset="utf-8">

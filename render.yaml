@@ -1,18 +1,38 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploy from the Render Dashboard: New > Blueprint > connect this repo, then
+# pick the branch that contains this file (see README.md). Render sets $PORT
+# (10000 by default) and the start command must bind to 0.0.0.0:$PORT.
+#
+# Note: a persistent disk requires a PAID plan, so the free tier cannot be
+# used for this service.
+
 services:
   - type: web
     name: btc-hunt
     runtime: python
-    plan: starter            # 2 GB RAM — free tier won't hold the bloom
+    plan: 1c-2g                 # 1 CPU / 2 GB RAM; change to 0.5c-512mb to save cost
+    region: oregon
+    healthCheckPath: /health    # dedicated liveness route, no dataset dependency
+    autoDeployTrigger: commit   # redeploy on every push to the linked branch
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --threads 8
+
     disk:
-      name: data
+      name: btc-hunt-data
       mountPath: /data
-      sizeGB: 10             # 1.5 GB dataset + 60 MB bloom + results
+      sizeGB: 10                # ~1.5 GB dataset + bloom filter + sqlite results
+
     envVars:
       - key: DISK_PATH
         value: /data
       - key: ESPLORA_URL
         value: https://blockstream.info/api
-      - key: PYTHON_VERSION
-        value: 3.12.6
+      - key: PYTHONUNBUFFERED
+        value: "1"              # live logs in the Render dashboard
+      # Optional HTTP Basic auth for the dashboard. Render prompts for these
+      # on Blueprint creation; leave both blank to run without authentication.
+      - key: APP_USER
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
