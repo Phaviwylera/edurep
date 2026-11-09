@@ -1,0 +1,12 @@
+[Unit]
+Description=Check GitHub for BTC Hunt updates every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=30
+Persistent=true
+Unit=btc-hunt-autopull.service
+
+[Install]
+WantedBy=timers.target

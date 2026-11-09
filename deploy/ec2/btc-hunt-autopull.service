@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull latest main and redeploy BTC Hunt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/btc-hunt-update

@@ -8,6 +8,9 @@ user-data script, and config templates.
 > cannot launch the instance for you. Everything below runs from your own AWS
 > account (CLI or console); the repo side is already prepared and pushed.
 
+**Want automatic deploys?** See [AUTODEPLOY.md](AUTODEPLOY.md) — push to
+`main` on GitHub and EC2 updates itself, with no manual steps.
+
 ## Architecture
 
 ```
@@ -149,7 +152,8 @@ review them without touching the host.
 | Logs | `sudo journalctl -u btc-hunt -f` |
 | Restart | `sudo systemctl restart btc-hunt` |
 | nginx config check | `sudo nginx -t` |
-| Update app | `sudo git -C /opt/btc-hunt pull --ff-only && sudo bash /opt/btc-hunt/deploy/ec2/install.sh` |
+| **Deploy (pull latest `main`, reconfigure, restart, health check)** | `sudo btc-hunt-update` |
+| Auto-deploy logs | `sudo journalctl -u btc-hunt-autopull.service -f` |
 | Data usage | `df -h /var/lib/btc-hunt` |
 | Backup | EBS snapshot of the data volume (stop `btc-hunt` first for a consistent SQLite file) |
 

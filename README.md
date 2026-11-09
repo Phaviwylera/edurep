@@ -12,7 +12,8 @@ that provisions the whole service.
 
 Prefer your own VM? See [Deploying on EC2](deploy/ec2/README.md) for a
 cloud-init user-data script, systemd unit, nginx config and AWS CLI launch
-commands.
+commands — and [Push-to-deploy on AWS](deploy/ec2/AUTODEPLOY.md) for automatic
+deploys on every push to `main`.
 
 ## Deploy (Blueprint)
 
