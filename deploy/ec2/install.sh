@@ -167,6 +167,12 @@ PYTHONUNBUFFERED=1
 # Max unique hit addresses checked by one /results "Check balances" run.
 #VERIFY_MAX_ADDRESSES=5000
 
+# Live-check every Bloom candidate at hit time and skip 0-BTC addresses.
+# Set AUTO_VERIFY_HITS=0 for the old save-candidate-first behaviour;
+# AUTO_VERIFY_MIN_SATS=0 keeps zero-balance hits with balance badges.
+#AUTO_VERIFY_HITS=1
+#AUTO_VERIFY_MIN_SATS=1
+
 # Allow the dashboard's Kill all jobs button to replace this Gunicorn worker.
 # Set to 0 to only stop jobs without restarting the worker.
 #BTC_HUNT_WORKER_RESTART=1
