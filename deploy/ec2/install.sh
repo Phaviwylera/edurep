@@ -204,6 +204,18 @@ if [ ! -x "$APP_DIR/.venv/bin/python" ]; then
 fi
 log "installing requirements"
 "$APP_DIR/.venv/bin/pip" install --disable-pip-version-check -q -r "$APP_DIR/requirements.txt"
+# Optional native secp256k1 for the EC hot path (~244x faster per derived key
+# than the pure-Python fallback). NEVER fatal: btc_hunt.py imports coincurve in
+# a try/except and falls back to its precomputed-window implementation, so a
+# missing wheel or C toolchain must not block a deploy.
+if [ -f "$APP_DIR/requirements-fast.txt" ]; then
+  if "$APP_DIR/.venv/bin/pip" install --disable-pip-version-check -q \
+       -r "$APP_DIR/requirements-fast.txt"; then
+    log "optional libsecp256k1 (coincurve) installed - fast EC path enabled"
+  else
+    log "WARNING: optional coincurve install failed - using the pure-Python EC path"
+  fi
+fi
 # Code stays root-owned/read-only for the service user; the process only ever
 # writes to DATA_DIR. This also keeps `sudo git pull` working on the checkout.
 chmod -R a+rX "$APP_DIR"

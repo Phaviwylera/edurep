@@ -1,0 +1,19 @@
+# OPTIONAL performance extra — the app runs fine without this file.
+#
+# coincurve wraps libsecp256k1 and makes the secp256k1 scalar multiplication in
+# the Randstorm / brainwallet / nonce hot path ~244x faster per derived key
+# (~25 us instead of ~6,000 us measured on one vCPU). That is the difference
+# between roughly 9 days and roughly 735 days for a 4,000,000,000 ms scan.
+#
+# It is deliberately NOT in requirements.txt: a platform with no matching wheel
+# and no C toolchain would fail the whole install. btc_hunt.py imports it in a
+# try/except and falls back to a precomputed-window pure-Python implementation
+# (~14x faster than the old affine code, ~4x slower than libsecp256k1).
+#
+# Deploy scripts install this opportunistically and only warn on failure:
+#   pip install -r requirements.txt        # required
+#   pip install -r requirements-fast.txt   # optional
+#
+# Check which backend is live:  curl http://<host>/health   ->  "ec": "..."
+# Force one with EC_BACKEND=libsecp256k1 or EC_BACKEND=python.
+coincurve>=18,<23

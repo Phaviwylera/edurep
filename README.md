@@ -81,7 +81,8 @@ required for the health check and the public URL to work.
 | `AUTO_VERIFY_HITS` | `1` | Live-check every Bloom candidate before saving; `0` restores save-candidate-only mode |
 | `AUTO_VERIFY_MIN_SATS` | `1` | Minimum chain+mempool sats to save a hit; `0` keeps zero-balance hits with balance fields |
 | `RANDSTORM_MAX_MS` | `5000000` | Automatic Randstorm chunk size in ms; large `/randstorm` ranges are split into sequential chunks |
-| `RANDSTORM_MAX_TOTAL_MS` | `4000000000` | Total ms accepted by one `/api/randstorm` run — 4,000,000,000 ms ≈ 46.3 days ≈ 800 default chunks. Raise it to run longer ranges |
+| `RANDSTORM_MAX_TOTAL_MS` | `4000000000` | Total ms accepted by one `/api/randstorm` run — 4,000,000,000 ms ≈ 46.3 days ≈ 800 default chunks. Raise it to run longer ranges. See [Scan speed](#scan-speed-and-the-ec-backend) for what that costs in wall-clock time |
+| `EC_BACKEND` | `auto` | `auto` uses libsecp256k1 (`coincurve`) when importable, otherwise the pure-Python windowed path. Force one with `libsecp256k1` or `python`; shown by `/health` and the page footer |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
 | `PORT` | set by Render | Do not override |
@@ -167,6 +168,67 @@ rare regardless of throughput.
 `/results` shows the newest 500 hits. Use **Download all (JSONL)** or
 **Download nonce results (JSONL)** there to export every hit.
 
+## Scan speed and the EC backend
+
+Every Randstorm timestamp and every brainwallet passphrase needs one secp256k1
+scalar multiplication, so that multiplication *is* the scan speed. Measured on
+one vCPU over 200 random keys:
+
+| Backend | µs per key | vs. old | 4,000,000,000 ms run |
+| --- | ---: | ---: | --- |
+| affine double-and-add, inversion per step (**old**, and run twice per key) | 6,012 | 1× | ~735 days |
+| Jacobian double-and-add | 1,665 | 3.6× | — |
+| Jacobian + precomputed fixed-base window (`w=4`) | 437 | 13.9× | ~28 days |
+| libsecp256k1 via `coincurve` | 24 | 251× | ~7 days |
+
+Three changes sit on top of that table:
+
+1. **One multiplication per key.** `derive_addresses()` used to call `ec_mul()`
+   twice — once for the compressed pubkey, once for the uncompressed one.
+   `derive_pubkeys()` now computes the point once and encodes both forms.
+2. **Hash-first probing.** The loops encoded three addresses and then decoded
+   them again with `_address_to_hash160()` purely to probe the filter.
+   `derive_candidates()` yields `hash160(pubkey)` directly, and
+   `encode_address()` only runs for a candidate that actually matched — about
+   0.15 ms saved per timestamp on the ~100% of keys that miss.
+3. **A real backend switch.** `coincurve` is used when importable; otherwise the
+   windowed pure-Python path runs (its 1,024-entry table is built once, lazily,
+   in ~7 ms). `EC_BACKEND=libsecp256k1|python` forces one, and `/health` plus
+   every page footer report which is active.
+
+End to end — RC4, one multiplication and three bloom probes per timestamp, with
+no address encoding on a miss — the same vCPU went from **~63 timestamps/s to
+~6,700 with coincurve** (a ~106× speed-up) and **~1,635 without it** (~26×):
+
+| Range | Chunks | With coincurve (6,700 ts/s) | Pure Python (1,635 ts/s) |
+| --- | ---: | --- | --- |
+| 5,000,000 ms (one chunk) | 1 | ~12 min | ~51 min |
+| 86,400,000 ms (1 day) | 18 | ~3.6 h | ~15 h |
+| 4,000,000,000 ms (46.3 days, the cap) | 800 | ~7 days | ~28 days |
+
+Measured in a 1-vCPU sandbox; a c6i.large will differ somewhat, and the live
+rate is printed in the job detail (`… ts/s`) and in the footer via `/health`.
+
+`coincurve` is optional and lives in `requirements-fast.txt`, **not**
+`requirements.txt`, so a platform with no matching wheel and no C toolchain
+still deploys:
+
+```bash
+pip install -r requirements.txt          # required
+pip install -r requirements-fast.txt     # optional, ~244x faster EC
+```
+
+`deploy/ec2/install.sh` installs it opportunistically and only warns on
+failure — and since `sudo btc-hunt-update` (and the auto-pull timer) re-runs
+`install.sh`, an existing EC2 box picks it up on the next deploy. The Render
+Blueprint's `buildCommand` does the same. All backends return identical points;
+the test suite compares each one against the slow affine reference.
+
+A 4,000,000,000 ms run is still ~7 days on one worker even with the native
+backend. Shard it across machines with `--worker randstorm --shard i/n`, or
+scan a narrower window first — **Stop** keeps every hit found so far, so a long
+run can be abandoned and resumed in pieces.
+
 ## Verifying hits and false positives
 
 `h in bf` is a probabilistic membership test against a **dated snapshot** of
@@ -233,14 +295,19 @@ authorised to test.
 
 ## Checking which build is live
 
-Every page has a footer showing `build <commit>`, the process start time, and a
-note when a running job is deferring auto-deploy. `GET /health` is public and
-returns the same build id, so from any device:
+Every page has a footer showing `build <commit>`, the process start time, the
+active EC backend, and a note when a running job is deferring auto-deploy.
+`GET /health` is public and returns the same build id, so from any device:
 
 ```bash
 curl http://<your-host>/health
-# {"status":"ok","build":"f5871ab","started":"2026-11-10T05:20:00+00:00"}
+# {"status":"ok","build":"f5871ab","started":"2026-11-10T05:20:00+00:00",
+#  "ec":"libsecp256k1 (coincurve 21.0.0)"}
 ```
+
+`ec` reads `libsecp256k1 (coincurve <version>)` when the optional native
+backend is installed, or `python windowed w=4` when the pure-Python fallback is
+running (~4x slower — see [Scan speed](#scan-speed-and-the-ec-backend)).
 
 Compare `build` with the newest commit on `main`. If the field is missing (a
 process started before this change) or the hash is old, the auto-pull has not
@@ -293,6 +360,7 @@ UI first if you want it to finish cleanly.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-fast.txt   # optional: native EC, ~244x faster
 PORT=10000 DISK_PATH=./local-data .venv/bin/gunicorn btc_hunt:app \
   --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --threads 16
 # or: .venv/bin/python btc_hunt.py --port 10000
