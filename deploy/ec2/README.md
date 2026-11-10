@@ -295,11 +295,28 @@ ETH_RPC_BATCH=100
 ESPLORA_MIN_INTERVAL=0.05
 ```
 
-Public endpoints 429 within seconds of a real sweep: at ~24,000 candidates/s
-with batches of 50, the app would need ~475 requests/s. A throttled batch
-stores **no** verdict (a rate limit says nothing about an address) and is
-counted as `throttled` for a later re-check from `/results` → **Check ETH
-balances**. Full recipe/window honesty table and measured rates:
+Every run probes the configured endpoints first (`ETH_PREFLIGHT=1`) and uses
+only those that answer — public endpoints reject EC2 traffic with `HTTP 403`
+about as often as they 429 it, and the probe turns that into one readable line
+instead of two hours of failures:
+
+```
+[eth_ts] [eth] RPC ethereum-rpc.publicnode.com: block 23,918,442, 141 ms, batch yes
+[eth_ts] [eth] RPC 1rpc.io/eth: UNUSABLE — HTTP 403 Forbidden (refusing this host; parked 3600s)
+[eth_ts] [eth] 3/4 endpoint(s) usable in 0.6s — batches of 50 address(es) (100 calls)
+```
+
+A 429/5xx parks that endpoint and fails over; when nothing is left standing the
+client **waits** for a cooldown instead of dropping the batch. A batch that
+still cannot be checked stores **no** verdict (a rate limit says nothing about
+an address) and is appended to `/var/lib/btc-hunt/eth_pending.jsonl` together
+with its private key, recipe and timestamp — **Re-check queued candidates** on
+`/eth` drains that file later without re-deriving anything. If *every* endpoint
+refuses (403), the run stops and says so rather than filling the queue: point
+`ETH_RPC_URLS` at your own node, then press Re-check.
+
+Public endpoints 429 within seconds of a real sweep anyway: at ~24,000
+candidates/s with batches of 50 the app would need ~475 requests/s. Full recipe/window honesty table and measured rates:
 [Ethereum section in the main README](../../README.md#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
 
 Headless, without the dashboard:
@@ -358,7 +375,9 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
 | Auto-pull stuck on `job running` | New builds write `.btc-hunt-busy.pid`; `update.sh` clears the marker as soon as that worker is gone. For an immediate hard reset `sudo btc-hunt-reset` kills all jobs, clears both markers and force-deploys `main`. On older builds use `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` |
-| `/eth` sweep runs but every batch says `HTTP 429` | Public JSON-RPC endpoints rate-limit hard. Point `ETH_RPC_URLS` at your own node, lower `ETH_RPC_BATCH`, raise `ESPLORA_MIN_INTERVAL`; the job counts them as `throttled` and re-checks from `/results` |
+| `/eth` sweep says `HTTP 429` on every batch | Public JSON-RPC endpoints rate-limit hard. Point `ETH_RPC_URLS` at your own node, lower `ETH_RPC_BATCH`, raise `ESPLORA_MIN_INTERVAL`. Unchecked candidates are queued in `eth_pending.jsonl`, not lost: drain them with **Re-check queued candidates** |
+| `/eth` sweep says `HTTP 403 Forbidden` and stops | That endpoint refuses this host — common for datacenter IPs (`1rpc.io/eth` does). The pre-flight probe lists which endpoints answer; keep those in `ETH_RPC_URLS`, or set `ETH_RPC_USER_AGENT`. If all of them refuse, the run stops by design and the queue holds the candidates |
+| `/eth` derived thousands of candidates but saved nothing | They were queued, not dropped: `wc -l /var/lib/btc-hunt/eth_pending.jsonl`, then press **Re-check queued candidates** once a working endpoint is configured |
 | Bulk nonce scan reports 0 hits but every line after N says `HTTP 429` | The old build counted rate-limited addresses as scanned. Update to the latest `main`: 429 now triggers a global cooldown, blocked addresses are retried and saved to `/var/lib/btc-hunt/nonce_retry.txt`, and the job shows `partial`. Raise `ESPLORA_MIN_INTERVAL` or add `ESPLORA_URLS` |
 | Lots of `★★★ HIT` lines but every address has 0 BTC | On the current build this should not happen with `AUTO_VERIFY_HITS=1` (default): zero-balance candidates are skipped before saving. Hard-refresh and check `/health` for the new build; `AUTO_VERIFY_MIN_SATS=0` intentionally keeps them. Older builds need **Check balances** on `/results`; these are Bloom false positives, so set `BLOOM_FP_RATE=0.000001` (default now) and rebuild from the cached `.gz` |
 | New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |

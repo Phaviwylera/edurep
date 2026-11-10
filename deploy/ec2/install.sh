@@ -194,9 +194,25 @@ PYTHONUNBUFFERED=1
 # batches of ETH_RPC_BATCH addresses (two calls each). The defaults below are
 # public endpoints that rate-limit aggressively; point ETH_RPC_URLS at your own
 # node for any serious sweep. Test them with the page's "Test RPC" button.
-#ETH_RPC_URLS=https://ethereum-rpc.publicnode.com,https://eth.drpc.org,https://1rpc.io/eth,https://rpc.flashbots.net
+#ETH_RPC_URLS=https://ethereum-rpc.publicnode.com,https://eth.drpc.org,https://rpc.flashbots.net,https://ethereum.blockpi.network/v1/rpc/public
+# Your own node is the only endpoint that will neither 403 nor throttle a sweep:
+#ETH_RPC_URLS=http://127.0.0.1:8545
 #ETH_RPC_BATCH=50
 #ETH_RPC_TIMEOUT=25
+# Probe the endpoints before deriving anything and use only those that answer.
+#ETH_PREFLIGHT=1
+# A 401/403 means "we will never answer this host" - park it for an hour; a
+# timeout or other 4xx gets the short park. One batch makes ETH_RPC_ROUNDS full
+# rounds over the usable endpoints before it is queued for a later re-check.
+#ETH_DEAD_COOL_SECS=3600
+#ETH_ERROR_COOL_SECS=30
+#ETH_RPC_ROUNDS=3
+# Candidates whose batch could not be checked are appended to
+# $DATA_DIR/eth_pending.jsonl instead of being dropped; "Re-check queued
+# candidates" on /eth drains that file. Cap it with ETH_PENDING_MAX.
+#ETH_PENDING_MAX=200000
+# Some gateways 403 an unidentified client.
+#ETH_RPC_USER_AGENT=btc-hunt (github.com/Phaviwylera/edurep)
 #ETH_MIN_WEI=1
 #ETH_VERIFY_BALANCES=1
 # Per-chunk and per-run caps on timestamp steps (the Trust Wallet window is
