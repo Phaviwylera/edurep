@@ -176,13 +176,18 @@ run a BitTorrent client, it uses the dated HTTP links from the index. Override
 with a comma-separated `DATASET_URLS=` in `/etc/btc-hunt.env` (then
 `sudo systemctl restart btc-hunt`), or paste one URL into the **Dataset URL**
 box on `/data`. Any gzip containing addresses, `address<TAB>balance` TSV rows,
-or 40-character hash160 hex lines works.
+`balance<TAB>address` rows, or 40-character hash160 hex lines works. Rows with
+a detected balance ≤ `DATASET_MIN_BALANCE` (default `0`) are skipped; both
+column orders are accepted, and text-only/hex dumps with no balance column are
+kept as-is.
 
 A ~1.47 GB / ~51M-row LoyceV dump downloads in one piece and then needs two
 CPU-heavy parse passes. Defaults are `DOWNLOAD_DEADLINE_SECS=1800` (30 min)
 and `BUILD_DEADLINE_SECS=7200` (2 h); raise them in `/etc/btc-hunt.env` and
 restart if your instance is slower. `DATASET_VERIFY_CHECKSUM=1` re-enables
-per-row Base58Check verification for untrusted files.
+per-row Base58Check verification for untrusted files. Set
+`DATASET_MIN_BALANCE=-1` in `/etc/btc-hunt.env` and restart to keep
+zero-balance rows as well.
 
 To place a file manually (useful when the instance cannot reach a mirror but
 your laptop can):
