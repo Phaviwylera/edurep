@@ -51,8 +51,11 @@ except OSError:
 #     and asks users to use torrents; its HTML index still links dated dumps.
 #   * 3xpl retired that path (dumps are now per-chain zstd files needing auth)
 #   * privatekeys.pw paywalls downloads
-# Prefer the .hex.gz variant: ~470 MB of hash160 hex instead of a 1.66 GB TSV
-# of base58 addresses, so it downloads faster and skips base58 decoding.
+# The .hex.gz variant is smaller, but Cloudflare fronts privatekeyfinder.io
+# with a 403 from some EC2 IPs. LoyceV's dated snapshots are discovered at
+# runtime and tried BEFORE these static mirrors; they are the source proven to
+# work from AWS. The official source stays last because free downloads are
+# throttled to ~10 kB/s without a key.
 # Prepend custom mirrors with DATASET_URLS="https://...,https://..." (comma
 # separated), or paste a single URL into the /data page.
 _DEFAULT_DATASET_URLS = [
@@ -66,10 +69,28 @@ _OFFICIAL_DATASET_URL = _DEFAULT_DATASET_URLS[-1]
 LOYCE_INDEX = "http://addresses.loyce.club/"
 _custom_urls = [u.strip() for u in os.environ.get("DATASET_URLS", "").split(",")
                 if u.strip()]
+_CUSTOM_DATASET_URLS = list(_custom_urls)
 DATASET_URLS = _custom_urls + _DEFAULT_DATASET_URLS
-# Wall-clock budget for the whole download+build (a stalled mirror must not
-# hold a job open forever). Individual socket reads still time out at 60 s.
-BUILD_DEADLINE_SECS = 1800
+
+
+def _env_int(name, default, minimum):
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# A 1.47 GB / ~51M-row text dump can exceed 30 minutes on a small CPU after
+# the download. Keep the network budget tight, but let the two
+# streaming parse passes breathe. Both are configurable in /etc/btc-hunt.env.
+DOWNLOAD_DEADLINE_SECS = _env_int("DOWNLOAD_DEADLINE_SECS", 1800, 300)
+BUILD_DEADLINE_SECS = _env_int("BUILD_DEADLINE_SECS", 7200, 600)
+if BUILD_DEADLINE_SECS < DOWNLOAD_DEADLINE_SECS:
+    BUILD_DEADLINE_SECS = DOWNLOAD_DEADLINE_SECS
+# Trusted public dumps do not need a Base58Check checksum hash per row. Set to
+# 1/true/yes/on to verify every checksum (slower) for untrusted custom files.
+DATASET_VERIFY_CHECKSUM = os.environ.get(
+    "DATASET_VERIFY_CHECKSUM", "").strip().lower() in ("1", "true", "yes", "on")
 ESPLORA    = os.environ.get("ESPLORA_URL", "https://blockstream.info/api")
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
@@ -188,6 +209,7 @@ def hash160(b): return ripemd160(sha256(b))
 
 # Base58Check
 B58='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+B58_MAP = {c: i for i, c in enumerate(B58)}
 def b58encode(b):
     n=int.from_bytes(b,'big'); out=''
     while n: n,r=divmod(n,58); out=B58[r]+out
@@ -205,6 +227,7 @@ def p2pkh_address(pubkey, compressed=True):
 
 # Bech32
 BECH32='qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+BECH32_MAP = {c: i for i, c in enumerate(BECH32)}
 def _bech32_polymod(v):
     G=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]; chk=1
     for x in v:
@@ -272,8 +295,14 @@ class BloomFilter:
             yield (h1 + i * h2) % self.m
 
     def add(self, h160):
-        for pos in self._positions(h160):
-            self.bits[pos >> 3] |= 1 << (pos & 7)
+        # Inlined hot path: 51M rows × k positions, avoid a generator per row.
+        h = hashlib.sha256(h160).digest()
+        h1 = int.from_bytes(h[:8], 'big')
+        h2 = int.from_bytes(h[8:16], 'big')
+        m, k, bits = self.m, self.k, self.bits
+        for i in range(k):
+            pos = (h1 + i * h2) % m
+            bits[pos >> 3] |= 1 << (pos & 7)
 
     def __contains__(self, h160):
         for pos in self._positions(h160):
@@ -342,8 +371,8 @@ def _download(url, dest, log, progress=None, should_stop=None, deadline=None):
     except Exception as e:
         log(f"[!] {url}: {e}")
         tmp.unlink(missing_ok=True)
-        if str(e) == "cancelled":
-            raise  # do not silently try the next mirror after a user stop
+        if str(e) in ("cancelled", "download exceeded its time budget"):
+            raise  # stop / expired budget: do not silently try the next mirror
         return False
 
 
@@ -407,11 +436,91 @@ def _decode_hash(token):
     return None
 
 
+HEX_LETTERS = frozenset("abcdefABCDEF")
+
+
+def _hex_to_hash(token):
+    """40-char hash160 hex, optionally 0x-prefixed. Avoid decoding a 40-digit
+    decimal balance as hex: unprefixed all-digit tokens are rejected."""
+    prefixed = token[:2].lower() == "0x"
+    t = token[2:] if prefixed else token
+    if len(t) != 40 or (not prefixed and t.isdecimal()):
+        return None
+    try:
+        b = bytes.fromhex(t)
+    except ValueError:
+        return None
+    return b if len(b) == 20 else None
+
+
+def _address_to_hash160_fast(addr):
+    """Dataset-optimised decoder. Skips per-row checksum hashing for trusted
+    public dumps, but still checks length/version/charset. Set
+    DATASET_VERIFY_CHECKSUM=1 for full Base58Check and bech32 validation.
+    """
+    if not addr:
+        return None
+    if addr[:3].lower() == "bc1":
+        if len(addr) > 90:
+            return None
+        if DATASET_VERIFY_CHECKSUM:
+            return _address_to_hash160(addr)
+        data = _bech32_decode_fast(addr)
+        if data:
+            prog = _convertbits(data[1:], 5, 8, pad=False)
+            if len(prog) == 20:
+                return bytes(prog)
+        return None
+    if len(addr) > 40:
+        return None
+    if addr[0] in "13":
+        try:
+            n = 0
+            for c in addr:
+                n = n * 58 + B58_MAP[c]
+            raw = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+            pad = len(addr) - len(addr.lstrip('1'))
+            raw = b'\x00' * pad + raw
+        except (KeyError, ValueError, OverflowError):
+            return None
+        if len(raw) != 25 or raw[0] not in (0, 5):
+            return None
+        if DATASET_VERIFY_CHECKSUM and sha256d(raw[:21])[:4] != raw[21:]:
+            return None
+        return raw[1:21]
+    return None
+
+
+def _sniff_dataset_format(path, sample_lines=2000):
+    """Decide once which decoder the 51M-row hot loop should use."""
+    hex_hits = addr_hits = 0
+    with gzip.open(path, 'rt', errors='ignore') as f:
+        for i, line in enumerate(f):
+            if i >= sample_lines:
+                break
+            for token in line.rstrip('\r\n').split('\t'):
+                t = token.strip()
+                if not t:
+                    continue
+                if _hex_to_hash(t):
+                    hex_hits += 1
+                elif _address_to_hash160_fast(t):
+                    addr_hits += 1
+    if hex_hits and addr_hits:
+        return "mixed"
+    if hex_hits:
+        return "hex"
+    if addr_hits:
+        return "address"
+    return "generic"
+
+
 def build_bloom(log, progress=None, should_stop=None, urls=None):
     # Two streaming passes over the gzip: pass 1 sizes the bloom from the row
     # count, pass 2 fills it directly. Holding every hash160 in a Python set
     # needs several GB and gets OOM-killed on a small instance.
     deadline = time.time() + BUILD_DEADLINE_SECS
+    download_deadline = min(deadline, time.time() + DOWNLOAD_DEADLINE_SECS)
 
     def report(frac, detail):
         if progress:
@@ -431,21 +540,22 @@ def build_bloom(log, progress=None, should_stop=None, urls=None):
             check()
             dated = _loyce_dated_urls(log, should_stop)
             if dated:
-                # Fast mirrors first, throttled official source last.
-                if _OFFICIAL_DATASET_URL in sources:
-                    i = sources.index(_OFFICIAL_DATASET_URL)
-                    sources[i:i] = dated
-                else:
-                    sources.extend(dated)
+                # LoyceV dated snapshots are the source proven to work from
+                # EC2. Try them immediately after any user-supplied URLs and
+                # before privatekeyfinder.io / throttled Blockchair.
+                i = min(len(_CUSTOM_DATASET_URLS), len(sources))
+                sources[i:i] = dated
     else:
         sources = list(urls)
     if not ADDR_GZ.exists():
         report(0.02, "downloading dataset")
         log(f"[dl] {len(sources)} mirror(s) configured")
+        log(f"[dl] download budget {DOWNLOAD_DEADLINE_SECS}s; "
+            f"build budget {BUILD_DEADLINE_SECS}s")
         ok = False
         for u in sources:
             check()
-            if _download(u, ADDR_GZ, log, progress, should_stop, deadline):
+            if _download(u, ADDR_GZ, log, progress, should_stop, download_deadline):
                 ok = True; break
         if not ok:
             raise RuntimeError(
@@ -454,27 +564,59 @@ def build_bloom(log, progress=None, should_stop=None, urls=None):
     else:
         report(0.25, "dataset already downloaded")
 
+    try:
+        fmt = _sniff_dataset_format(ADDR_GZ)
+    except Exception as e:
+        log(f"[parse] format sniff failed: {e}; using generic parser")
+        fmt = "generic"
+    log(f"[parse] format: {fmt}")
+
     def hashes():
-        # Handles address<TAB>balance TSVs, balance<TAB>address TSVs, plain
-        # address lists and hash160-hex dumps. One hash per line.
+        # One decoder per format instead of trying address + hex + checksum on
+        # every one of ~51M rows. Handles TSVs, plain address lists, hex dumps.
         with gzip.open(ADDR_GZ, 'rt', errors='ignore') as f:
-            for line in f:
-                for token in line.rstrip('\r\n').split('\t'):
-                    h = _decode_hash(token.strip())
-                    if h:
-                        yield h
-                        break
+            if fmt == "hex":
+                for line in f:
+                    for token in line.rstrip('\r\n').split('\t'):
+                        h = _hex_to_hash(token.strip())
+                        if h:
+                            yield h
+                            break
+            elif fmt == "address":
+                for line in f:
+                    for token in line.rstrip('\r\n').split('\t'):
+                        h = _address_to_hash160_fast(token.strip())
+                        if h:
+                            yield h
+                            break
+            elif fmt == "mixed":
+                for line in f:
+                    for token in line.rstrip('\r\n').split('\t'):
+                        t = token.strip()
+                        h = _hex_to_hash(t) or _address_to_hash160_fast(t)
+                        if h:
+                            yield h
+                            break
+            else:
+                for line in f:
+                    for token in line.rstrip('\r\n').split('\t'):
+                        h = _decode_hash(token.strip())
+                        if h:
+                            yield h
+                            break
 
     log("[parse] pass 1/2 — counting address rows")
     report(0.30, "pass 1/2 — counting address rows")
     n = 0
     for _ in hashes():
-        check()
         n += 1
+        if n % 100000 == 0:
+            check()  # time.time()/stop check per row was a large overhead
         if n % 1000000 == 0:
             log(f"[parse] pass 1 — {n/1e6:.1f}M rows counted")
             report(0.30 + 0.05 * min(n / 100_000_000, 1.0),
                    f"pass 1/2 — {n/1e6:.1f}M rows counted")
+    check()
     log(f"[parse] {n:,} rows — sizing bloom")
     if not n:
         raise RuntimeError("dataset contains no usable addresses")
@@ -484,12 +626,14 @@ def build_bloom(log, progress=None, should_stop=None, urls=None):
     report(0.35, "pass 2/2 — filling bloom")
     i = 0
     for h in hashes():
-        check()
         bf.add(h); i += 1
+        if i % 100000 == 0:
+            check()
         if i % 500000 == 0:
             log(f"[parse] {i/1e6:.1f}M/{n/1e6:.1f}M addresses")
             report(0.35 + 0.60 * min(i / n, 1.0),
                    f"pass 2/2 — {i/1e6:.1f}M/{n/1e6:.1f}M addresses")
+    check()
     bf.save(BLOOM_PATH)
     log(f"[✓] bloom saved ({BLOOM_PATH.stat().st_size/1e6:.0f} MB, "
         f"{bf.m/8/1e6:.0f} MB bitset, k={bf.k})")
@@ -515,7 +659,7 @@ def _address_to_hash160(addr):
 def _b58decode(s):
     n = 0
     for c in s:
-        n = n * 58 + B58.index(c)
+        n = n * 58 + B58_MAP[c]
     raw = n.to_bytes((n.bit_length()+7)//8, 'big')
     pad = len(s) - len(s.lstrip('1'))
     return b'\x00'*pad + raw
@@ -524,10 +668,22 @@ def _bech32_decode(addr):
     addr = addr.lower()
     pos = addr.rfind('1')
     if pos < 1: return None
-    data = [BECH32.find(c) for c in addr[pos+1:]]
+    data = [BECH32_MAP.get(c, -1) for c in addr[pos+1:]]
     if -1 in data: return None
     hrp = addr[:pos]
     if _bech32_polymod(_bech32_hrp_expand(hrp) + data) != 1:
+        return None
+    return data[:-6]
+
+
+def _bech32_decode_fast(addr):
+    """Trusted-dump decoder: validate charset/hrp/length, skip polymod checksum."""
+    addr = addr.lower()
+    pos = addr.rfind('1')
+    if pos < 1 or addr[:pos] != 'bc':
+        return None
+    data = [BECH32_MAP.get(c, -1) for c in addr[pos+1:]]
+    if -1 in data or len(data) < 7:
         return None
     return data[:-6]
 
@@ -1049,12 +1205,13 @@ else '✗ not built'}</p>
 <button class="btn" onclick="startDataset(false)">Download &amp; build bloom</button>
 <button class="btn" onclick="startDataset(true)">Re-download &amp; rebuild</button>
 <button class="btn danger" onclick="stop('dataset')">Stop</button>
-<p class="muted">Tries several public mirrors automatically, then LoyceV's
-dated snapshots (its LATEST direct download was disabled in 2026). A .hex.gz
-hash160 dump (~470 MB) is preferred over a .tsv.gz address dump (~1.6 GB).
-You can also copy a .gz to {DATA_DIR}/blockchair.tsv.gz and click Download —
-the cached file is used without re-downloading. Progress and the live log are
-below.</p>
+<p class="muted">Tries LoyceV's dated snapshots first (its LATEST direct
+download was disabled in 2026), then other public mirrors. A .hex.gz hash160
+dump (~470 MB) is preferred over a .tsv.gz address dump (~1.6 GB). Budget:
+{BUILD_DEADLINE_SECS // 60} min total, {DOWNLOAD_DEADLINE_SECS // 60} min for
+the download. You can also copy a .gz to {DATA_DIR}/blockchair.tsv.gz and
+click Download — the cached file is used without re-downloading. Progress and
+the live log are below.</p>
 </div>
 <div class="card"><h2>Progress</h2>
 <div class="bar"><div id="bar" style="width:0%"></div></div>

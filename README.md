@@ -61,6 +61,9 @@ required for the health check and the public URL to work.
 | `PYTHONUNBUFFERED` | `1` | Unbuffered logs |
 | `APP_USER` / `APP_PASSWORD` | empty | Optional HTTP Basic auth; **both** must be set to enable it |
 | `DATASET_URLS` | unset | Comma-separated `.gz` mirror URLs tried before the built-in defaults |
+| `DOWNLOAD_DEADLINE_SECS` | `1800` | Network budget for one mirror download |
+| `BUILD_DEADLINE_SECS` | `7200` | Total budget for download + two-pass bloom build |
+| `DATASET_VERIFY_CHECKSUM` | `0` | Set to `1` to verify Base58Check checksums on untrusted dumps (slower) |
 | `PORT` | set by Render | Do not override |
 
 `Procfile` contains the same start command for Heroku-style platforms; Render
@@ -69,11 +72,13 @@ uses `startCommand` from the Blueprint.
 ## After the first deploy
 
 1. `GET /health` → `{"status":"ok"}` — Render uses this to mark the deploy live.
-2. Open `/` → `/data` → **Download & build bloom**. This tries several public
-   mirrors, then LoyceV's dated snapshots (its `LATEST` direct download was
-   disabled in 2026), preferring the ~470 MB hash160-hex dump over the ~1.6 GB
-   address TSV, then parses it twice to build `funded.bloom` on the persistent
-   disk.
+2. Open `/` → `/data` → **Download & build bloom**. It tries LoyceV's dated
+   snapshots first (its `LATEST` direct download was disabled in 2026), then
+   other public mirrors. The parser autodetects address TSVs, plain address
+   lists and hash160-hex dumps, then makes two streaming passes to build
+   `funded.bloom` on the persistent disk. A ~1.5 GB / ~51M-row dump has a
+   30-minute download budget and a 2-hour total budget by default; both are
+   configurable.
    Watch progress through the live log on that page. Interrupted downloads go
    to a `.part` file and responses are verified to be real gzip data, so a
    truncated dump or an HTML error page is never treated as complete. Use
@@ -115,9 +120,10 @@ practical option on smaller plans.
   `LATEST` aliases now 404 and `3xpl.com` returns 400; the LoyceV owner asks
   heavy users to use torrents instead. Rather than ship a BitTorrent client,
   the app scrapes LoyceV's small HTML index for dated `.gz` snapshots and tries
-  several other live mirrors, accepting address TSVs, plain address lists or
-  hash160-hex dumps. `gz.blockchair.com` remains as a last resort but free
-  downloads are throttled to ~10 kB/s. If your network blocks all of them,
+  them first, then several other live mirrors. Cloudflare may return 403 from
+  EC2 for `privatekeyfinder.io`; those URLs remain as fallbacks only.
+  `gz.blockchair.com` is a last resort but free downloads are throttled to
+  ~10 kB/s. If your network blocks all of them,
   paste a working `.gz` URL into the **Dataset URL** field on `/data`, set
   `DATASET_URLS`, or copy a `.gz` to `DISK_PATH/blockchair.tsv.gz` yourself
   (Render SSH + `scp`, or `sudo cp` on EC2) — a cached file is used without
