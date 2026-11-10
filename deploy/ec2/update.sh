@@ -47,17 +47,32 @@ if [ -f "$BUSY_MARKER" ] && [ "${BTC_HUNT_FORCE_UPDATE:-0}" != "1" ]; then
   fi
 fi
 
+# Stamp written ONLY after install.sh (and therefore the service restart)
+# succeeds. Comparing HEAD alone is not enough: if a previous run reset the
+# checkout but install.sh failed (e.g. a transient pip/network error), the
+# next tick would see "HEAD unchanged + /health OK" and never restart the old
+# process — leaving the previous UI live forever.
+DEPLOY_STAMP="$DISK_PATH/.btc-hunt-deployed"
+DEPLOYED=""
+if [ -f "$DEPLOY_STAMP" ]; then
+  DEPLOYED="$(cat "$DEPLOY_STAMP" 2>/dev/null || true)"
+fi
+
 BEFORE="$(git -C "$APP_DIR" rev-parse HEAD)"
 echo "[update] fetching origin/$REPO_BRANCH"
 git -C "$APP_DIR" fetch --depth 1 origin "$REPO_BRANCH"
 git -C "$APP_DIR" reset --hard FETCH_HEAD
 AFTER="$(git -C "$APP_DIR" rev-parse HEAD)"
 
-if [ "$BEFORE" = "$AFTER" ] && curl -fsS http://127.0.0.1/health >/dev/null 2>&1; then
+if [ "${BTC_HUNT_FORCE_UPDATE:-0}" != "1" ] &&
+   [ "$BEFORE" = "$AFTER" ] && [ "$DEPLOYED" = "$AFTER" ] &&
+   curl -fsS http://127.0.0.1/health >/dev/null 2>&1; then
   echo "[update] already up to date at ${AFTER:0:7} — no restart"
   exit 0
 fi
 
 echo "[update] deploying ${BEFORE:0:7} -> ${AFTER:0:7}"
 bash "$APP_DIR/deploy/ec2/install.sh"
+printf '%s\n' "$AFTER" > "$DEPLOY_STAMP"
+chmod 0644 "$DEPLOY_STAMP" 2>/dev/null || true
 echo "[update] deployed ${AFTER:0:7}"

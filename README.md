@@ -71,6 +71,7 @@ required for the health check and the public URL to work.
 | `ESPLORA_CACHE_SIZE` | `4096` | Bounded in-memory cache of Esplora responses per process |
 | `NONCE_MAX_ADDRESSES` | `5000` | Cap on addresses in one bulk upload |
 | `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
+| `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `PORT` | set by Render | Do not override |
 
 `Procfile` contains the same start command for Heroku-style platforms; Render
@@ -122,6 +123,33 @@ flooded with bogus recoveries.
 
 `/results` shows the newest 500 hits. Use **Download all (JSONL)** or
 **Download nonce results (JSONL)** there to export every hit.
+
+## Checking which build is live
+
+Every page has a footer showing `build <commit>`, the process start time, and a
+note when a running job is deferring auto-deploy. `GET /health` is public and
+returns the same build id, so from any device:
+
+```bash
+curl http://<your-host>/health
+# {"status":"ok","build":"f5871ab","started":"2026-11-10T05:20:00+00:00"}
+```
+
+Compare `build` with the newest commit on `main`. If the field is missing (a
+process started before this change) or the hash is old, the auto-pull has not
+restarted the service yet. On EC2:
+
+```bash
+sudo systemctl status btc-hunt-autopull.timer
+sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager
+sudo btc-hunt-update
+```
+
+`btc-hunt-update` writes `.btc-hunt-deployed` only after `install.sh` and the
+service restart succeed, so a failed install is retried on the next 2-minute
+tick instead of leaving the old process running forever. Dashboard HTML is
+served with `Cache-Control: no-store`, but an already-open tab can still show
+the previous layout until you hard-refresh (Ctrl+Shift+R).
 
 ## Run locally
 

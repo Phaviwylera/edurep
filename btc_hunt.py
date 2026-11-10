@@ -13,6 +13,7 @@ Deploy: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 180
 """
 
 import os, sys, io, re, csv, gzip, json, math, time, signal, base64, hmac, html
+import subprocess
 import sqlite3, threading, hashlib, struct, argparse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -119,6 +120,24 @@ NONCE_MAX_UPLOAD_BYTES = _env_int("NONCE_MAX_UPLOAD_BYTES", 2_000_000, 1024)
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
 CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
+
+# Visible build marker: tells you whether the running process is actually the
+# commit currently on main. Override with BTC_HUNT_BUILD_ID on platforms that
+# ship without a .git directory (e.g. a build from a tarball).
+def _detect_build_id():
+    forced = os.environ.get("BTC_HUNT_BUILD_ID", "").strip()
+    if forced:
+        return forced
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            stderr=subprocess.DEVNULL, timeout=3).decode().strip()
+    except Exception:
+        return "unknown"
+
+BUILD_ID = _detect_build_id()
+STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 # secp256k1
 P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
@@ -1277,8 +1296,10 @@ def _require_auth():
 
 @app.route("/health")
 def health():
-    # Liveness only: no disk, dataset or database dependency.
-    return {"status": "ok"}
+    # Liveness only: no disk, dataset or database dependency. `build` is the
+    # git commit this process started from — compare it with the latest commit
+    # on main to check whether an auto-pull deploy actually took effect.
+    return {"status": "ok", "build": BUILD_ID, "started": STARTED_AT}
 
 PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
@@ -1371,11 +1392,32 @@ function watch(name){
 <hr style="border-color:#3b4252;margin:14px 0">
 <div id="msg" class="msg"></div>
 {body}
+<hr style="border-color:#3b4252;margin:14px 0">
+<p class="muted">build {build_id} · started {started_at}{deploy_note}</p>
 </body></html>
 """
 
 def page(body):
-    return PAGE.replace("{body}", body)
+    note = ""
+    if BUSY_FILE.exists():
+        try:
+            names = BUSY_FILE.read_text(encoding="utf-8").strip()
+            note = (" · auto-deploy deferred while job(s) run: "
+                    + html.escape(names or "unknown"))
+        except OSError:
+            note = " · auto-deploy deferred while a job runs"
+    return (PAGE.replace("{body}", body)
+                .replace("{build_id}", html.escape(BUILD_ID))
+                .replace("{started_at}", html.escape(STARTED_AT))
+                .replace("{deploy_note}", note))
+
+@app.after_request
+def _html_no_store(resp):
+    # Dashboard HTML must never be served from a browser back/forward cache:
+    # after a deploy that would silently show the previous page layout.
+    if resp.mimetype == "text/html":
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 @app.route("/")
 def home():
