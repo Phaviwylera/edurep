@@ -60,6 +60,7 @@ required for the health check and the public URL to work.
 | `ESPLORA_URL` | `https://blockstream.info/api` | Used by the nonce-reuse attack |
 | `PYTHONUNBUFFERED` | `1` | Unbuffered logs |
 | `APP_USER` / `APP_PASSWORD` | empty | Optional HTTP Basic auth; **both** must be set to enable it |
+| `DATASET_URLS` | unset | Comma-separated `.gz` mirror URLs tried before the built-in defaults |
 | `PORT` | set by Render | Do not override |
 
 `Procfile` contains the same start command for Heroku-style platforms; Render
@@ -68,12 +69,15 @@ uses `startCommand` from the Blueprint.
 ## After the first deploy
 
 1. `GET /health` → `{"status":"ok"}` — Render uses this to mark the deploy live.
-2. Open `/` → `/data` → **Download & build bloom**. This downloads the address
-   dump (HTTPS first, then the two fallback mirrors), then parses it twice to
-   build `funded.bloom` on the persistent disk. It is a large download and a
-   CPU-heavy job; watch progress through the live log on that page. If a
-   download is interrupted it is written to a `.part` file and retried, so a
-   truncated dump is never treated as complete.
+2. Open `/` → `/data` → **Download & build bloom**. This tries several public
+   mirrors, then LoyceV's dated snapshots (its `LATEST` direct download was
+   disabled in 2026), preferring the ~470 MB hash160-hex dump over the ~1.6 GB
+   address TSV, then parses it twice to build `funded.bloom` on the persistent
+   disk.
+   Watch progress through the live log on that page. Interrupted downloads go
+   to a `.part` file and responses are verified to be real gzip data, so a
+   truncated dump or an HTML error page is never treated as complete. Use
+   **Re-download & rebuild** to discard a cached dump and start over.
 3. Once `funded.bloom` exists, the Randstorm / brainwallet / nonce-reuse pages
    are usable and hits are stored in SQLite, visible at `/results`.
 
@@ -107,10 +111,17 @@ practical option on smaller plans.
 
 - **Paid plan required.** Render's free tier has an ephemeral filesystem and
   cannot attach a persistent disk, so `DISK_PATH` would be wiped on every deploy.
-- **Third-party dataset mirrors.** `build_bloom` needs outbound access to
-  `addresses.loyce.club` or `3xpl.com`. If all mirrors are unreachable, upload
-  the `.tsv.gz` to `/data` yourself (Render SSH + `scp`) and it will be used
-  without re-downloading.
+- **Third-party dataset mirrors.** The old fixed `addresses.loyce.club`
+  `LATEST` aliases now 404 and `3xpl.com` returns 400; the LoyceV owner asks
+  heavy users to use torrents instead. Rather than ship a BitTorrent client,
+  the app scrapes LoyceV's small HTML index for dated `.gz` snapshots and tries
+  several other live mirrors, accepting address TSVs, plain address lists or
+  hash160-hex dumps. `gz.blockchair.com` remains as a last resort but free
+  downloads are throttled to ~10 kB/s. If your network blocks all of them,
+  paste a working `.gz` URL into the **Dataset URL** field on `/data`, set
+  `DATASET_URLS`, or copy a `.gz` to `DISK_PATH/blockchair.tsv.gz` yourself
+  (Render SSH + `scp`, or `sudo cp` on EC2) — a cached file is used without
+  re-downloading.
 - **Single instance only.** Job state (`_JOBS`) and the SQLite DB are in-process
   and on a local disk. Do not set `numInstances` > 1 or add autoscaling.
 - **Python 3.12.** Pinned because dependency versions are pinned. The app also

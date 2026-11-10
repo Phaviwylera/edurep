@@ -7,7 +7,7 @@ BTC Hunt — all viable pre-2015 Bitcoin attacks in one deployable app.
   3. Nonce Reuse (ECDSA, P2PKH/P2WPKH)         — Esplora API → algebra
 
 Dashboard: Flask + short JSON progress polls. Persistent disk at /data.
-Dataset: auto-download from addresses.loyce.club, fallback 3xpl.com.
+Dataset: auto-download from public mirrors; source is configurable.
 
 Deploy: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 180
 """
@@ -45,13 +45,28 @@ try:
 except OSError:
     pass
 
-# Prefer HTTPS: some cloud networks drop plain-HTTP egress. The original
-# mirrors stay as fallbacks.
-DATASET_URLS = [
-    "https://addresses.loyce.club/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
-    "http://addresses.loyce.club/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
-    "https://3xpl.com/data/dumps/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
+# Public mirrors of the funded-Bitcoin-address dump. The old fixed URLs are
+# dead as of 2026-11-09:
+#   * addresses.loyce.club disabled direct /LATEST downloads (bandwidth abuse)
+#     and asks users to use torrents; its HTML index still links dated dumps.
+#   * 3xpl retired that path (dumps are now per-chain zstd files needing auth)
+#   * privatekeys.pw paywalls downloads
+# Prefer the .hex.gz variant: ~470 MB of hash160 hex instead of a 1.66 GB TSV
+# of base58 addresses, so it downloads faster and skips base58 decoding.
+# Prepend custom mirrors with DATASET_URLS="https://...,https://..." (comma
+# separated), or paste a single URL into the /data page.
+_DEFAULT_DATASET_URLS = [
+    "https://privatekeyfinder.io/assets/downloads/bitcoin.hex.gz",
+    "https://privatekeyfinder.io/assets/downloads/bitcoin.tsv.gz",
+    "https://privatekeyfinder.io/assets/downloads/blockchair_bitcoin_addresses_latest.tsv.gz",
+    # Official source, but free downloads are throttled to ~10 kB/s without a key.
+    "https://gz.blockchair.com/bitcoin/addresses/blockchair_bitcoin_addresses_latest.tsv.gz",
 ]
+_OFFICIAL_DATASET_URL = _DEFAULT_DATASET_URLS[-1]
+LOYCE_INDEX = "http://addresses.loyce.club/"
+_custom_urls = [u.strip() for u in os.environ.get("DATASET_URLS", "").split(",")
+                if u.strip()]
+DATASET_URLS = _custom_urls + _DEFAULT_DATASET_URLS
 # Wall-clock budget for the whole download+build (a stalled mirror must not
 # hold a job open forever). Individual socket reads still time out at 60 s.
 BUILD_DEADLINE_SECS = 1800
@@ -294,7 +309,10 @@ def _download(url, dest, log, progress=None, should_stop=None, deadline=None):
         # Some mirrors reject the default python-requests User-Agent.
         r = requests.get(url, stream=True, timeout=(15, 60),
                          headers={"User-Agent":
-                                  "Mozilla/5.0 (compatible; btc-hunt/1.0)"})
+                                  "Mozilla/5.0 (compatible; btc-hunt/1.0)",
+                                  # Never let requests transparently decompress the
+                                  # .gz file into a corrupt "dataset".
+                                  "Accept-Encoding": "identity"})
         r.raise_for_status()
         total = int(r.headers.get('content-length', 0))
         done = 0; last = 0
@@ -313,6 +331,9 @@ def _download(url, dest, log, progress=None, should_stop=None, deadline=None):
                                  f"downloading {done/1e9:.2f}/{total/1e9:.2f} GB")
         if not done:
             raise RuntimeError("mirror returned an empty response")
+        with open(tmp, 'rb') as fh:
+            if fh.read(2) != b'\x1f\x8b':
+                raise RuntimeError("mirror returned non-gzip content (HTML error page?)")
         tmp.replace(dest)
         log(f"[✓] downloaded {done/1e9:.2f} GB")
         if progress:
@@ -326,7 +347,67 @@ def _download(url, dest, log, progress=None, should_stop=None, deadline=None):
         return False
 
 
-def build_bloom(log, progress=None, should_stop=None):
+def _loyce_dated_urls(log, should_stop=None):
+    """LoyceV disabled its LATEST direct downloads in 2026 but still links
+    dated snapshots from its index. Discover the newest few so the fallback
+    list does not go stale every time the date changes. Torrent is not used:
+    it would require a BitTorrent client and inbound peer ports on EC2.
+    """
+    if should_stop and should_stop():
+        raise RuntimeError("cancelled")
+    try:
+        r = requests.get(LOYCE_INDEX, timeout=(10, 20), headers={
+            "User-Agent": "Mozilla/5.0 (compatible; btc-hunt/1.0)"})
+        r.raise_for_status()
+        scored = []
+        for href in re.findall(r'href="([^"]+\.gz)"', r.text, re.I):
+            m = re.search(
+                r'(Bitcoin_addresses|blockchair_bitcoin_addresses_and_balance)'
+                r'_([A-Za-z]+)_(\d{1,2})_(\d{4})\.(txt|tsv)\.gz$', href)
+            if not m:
+                continue
+            try:
+                ts = datetime.strptime(
+                    f"{m.group(2)} {m.group(3)} {m.group(4)}", "%B %d %Y").timestamp()
+            except ValueError:
+                continue
+            scored.append((ts, urljoin(LOYCE_INDEX, href)))
+        # Newest first; on the same day prefer the smaller text-only dump.
+        scored.sort(key=lambda t: (t[0], ".txt.gz" in t[1]), reverse=True)
+        urls, seen = [], set()
+        for _, u in scored:
+            if u in seen:
+                continue
+            seen.add(u); urls.append(u)
+            if len(urls) >= 6:
+                break
+        if urls:
+            log(f"[dl] LoyceV index: {len(urls)} dated snapshot(s) found")
+        return urls
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log(f"[dl] LoyceV index unavailable: {e}")
+        return []
+
+
+def _decode_hash(token):
+    """Accept a base58/bech32 address OR a 40-char hash160 hex string."""
+    h = _address_to_hash160(token)
+    if h:
+        return h
+    t = token[2:] if token.lower().startswith("0x") else token
+    if len(t) == 40:
+        try:
+            b = bytes.fromhex(t)
+            if len(b) == 20:
+                return b
+        except ValueError:
+            pass
+    return None
+
+
+def build_bloom(log, progress=None, should_stop=None, urls=None):
     # Two streaming passes over the gzip: pass 1 sizes the bloom from the row
     # count, pass 2 fills it directly. Holding every hash160 in a Python set
     # needs several GB and gets OOM-killed on a small instance.
@@ -342,26 +423,47 @@ def build_bloom(log, progress=None, should_stop=None):
         if time.time() > deadline:
             raise RuntimeError("dataset build exceeded its time budget")
 
+    if urls is None:
+        sources = list(DATASET_URLS)
+        # Only scrape the index when a download is actually needed; a cached
+        # .gz must build completely offline.
+        if not ADDR_GZ.exists():
+            check()
+            dated = _loyce_dated_urls(log, should_stop)
+            if dated:
+                # Fast mirrors first, throttled official source last.
+                if _OFFICIAL_DATASET_URL in sources:
+                    i = sources.index(_OFFICIAL_DATASET_URL)
+                    sources[i:i] = dated
+                else:
+                    sources.extend(dated)
+    else:
+        sources = list(urls)
     if not ADDR_GZ.exists():
         report(0.02, "downloading dataset")
+        log(f"[dl] {len(sources)} mirror(s) configured")
         ok = False
-        for u in DATASET_URLS:
+        for u in sources:
             check()
             if _download(u, ADDR_GZ, log, progress, should_stop, deadline):
                 ok = True; break
         if not ok:
-            raise RuntimeError("all dataset mirrors failed")
+            raise RuntimeError(
+                f"all {len(sources)} dataset mirrors failed — paste a working "
+                f".gz URL above, set DATASET_URLS, or place the file at {ADDR_GZ}")
     else:
         report(0.25, "dataset already downloaded")
 
     def hashes():
+        # Handles address<TAB>balance TSVs, balance<TAB>address TSVs, plain
+        # address lists and hash160-hex dumps. One hash per line.
         with gzip.open(ADDR_GZ, 'rt', errors='ignore') as f:
             for line in f:
-                parts = line.rstrip('\n').split('\t')
-                if len(parts) < 1: continue
-                h = _address_to_hash160(parts[0].strip())
-                if h:
-                    yield h
+                for token in line.rstrip('\r\n').split('\t'):
+                    h = _decode_hash(token.strip())
+                    if h:
+                        yield h
+                        break
 
     log("[parse] pass 1/2 — counting address rows")
     report(0.30, "pass 1/2 — counting address rows")
@@ -938,30 +1040,64 @@ def data_page():
     }
     body = f"""
 <div class="card"><h2>Dataset status</h2>
-<p>blockchair.tsv.gz: {'✓ ' + f'{status["gz_size"]/1e9:.2f} GB' if status['gz']
+<p>cached dataset (.gz): {'✓ ' + f'{status["gz_size"]/1e9:.2f} GB' if status['gz']
 else '✗ not downloaded'}</p>
 <p>funded.bloom: {'✓ ' + f'{status["bloom_size"]/1e6:.0f} MB' if status['bloom']
 else '✗ not built'}</p>
-<button class="btn" onclick="post('/api/dataset')">Download &amp; build bloom</button>
+<label>Dataset URL (optional — tried first, before the built-in mirrors)</label>
+<input id="u" placeholder="https://example.com/bitcoin.hex.gz">
+<button class="btn" onclick="startDataset(false)">Download &amp; build bloom</button>
+<button class="btn" onclick="startDataset(true)">Re-download &amp; rebuild</button>
 <button class="btn danger" onclick="stop('dataset')">Stop</button>
-<p class="muted">Downloads ~1.5 GB from public mirrors, then two streaming passes
-build the bloom filter. This takes a while — progress and the live log are below.</p>
+<p class="muted">Tries several public mirrors automatically, then LoyceV's
+dated snapshots (its LATEST direct download was disabled in 2026). A .hex.gz
+hash160 dump (~470 MB) is preferred over a .tsv.gz address dump (~1.6 GB).
+You can also copy a .gz to {DATA_DIR}/blockchair.tsv.gz and click Download —
+the cached file is used without re-downloading. Progress and the live log are
+below.</p>
 </div>
 <div class="card"><h2>Progress</h2>
 <div class="bar"><div id="bar" style="width:0%"></div></div>
 <p id="detail" class="muted">not started</p><pre id="log"></pre>
 </div>
-<script>watch('dataset');</script>"""
+<script>
+function startDataset(force){{
+  const u=document.getElementById('u').value.trim();
+  const d={{force:force}};
+  if(u) d.url=u;
+  post('/api/dataset',d);
+}}
+watch('dataset');
+</script>"""
     return page(body)
 
 @app.route("/api/dataset", methods=["POST"])
 def api_dataset():
+    j = request.get_json(silent=True)
+    if not isinstance(j, dict):
+        j = {}
+    force = bool(j.get("force"))
+    raw_url = j.get("url")
+    custom = raw_url.strip() if isinstance(raw_url, str) else ""
+    if custom and not re.match(r"^https?://", custom, re.I):
+        return {"ok": False, "msg": "dataset URL must start with http:// or https://"}
+    with _JOBS_LOCK:
+        busy = "dataset" in _JOBS and _JOBS["dataset"]["alive"]
+    if busy:
+        return {"ok": False, "msg": "a dataset job is already running"}
+    if force:
+        ADDR_GZ.unlink(missing_ok=True)
+        Path(str(ADDR_GZ) + ".part").unlink(missing_ok=True)
+    # None => use the default list plus automatic LoyceV dated-snapshot
+    # discovery. A custom URL is tried first, with the defaults as fallbacks.
+    sources = [custom] + DATASET_URLS if custom else None
+
     def runner(job, log):
         def progress(frac, detail):
             job["progress"] = max(0.0, min(1.0, frac))
             job["detail"] = detail
         try:
-            build_bloom(log, progress, lambda: job["stop"])
+            build_bloom(log, progress, lambda: job["stop"], sources)
             job["progress"] = 1.0
             job["detail"] = "done — bloom filter ready"
             log("[✓] dataset ready")
