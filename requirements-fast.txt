@@ -17,3 +17,9 @@
 # Check which backend is live:  curl http://<host>/health   ->  "ec": "..."
 # Force one with EC_BACKEND=libsecp256k1 or EC_BACKEND=python.
 coincurve>=18,<23
+
+# Optional native Keccak-256. Ethereum addresses are keccak256(pubkey)[12:],
+# and the pure-Python permutation costs ~400 us per hash — it dominates every
+# cheap recipe. pycryptodome does it in ~3.4 us (~117x). Same rules as above:
+# optional, imported in a try/except, pure-Python fallback otherwise.
+pycryptodome>=3.19,<5

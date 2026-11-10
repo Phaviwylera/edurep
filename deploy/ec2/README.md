@@ -275,6 +275,40 @@ the chain shows `tx_count=0` and 0 sats, `spent / empty`, or a BTC amount to
 verify manually with a block explorer. The JSONL downloads on `/results`
 include the same fields.
 
+## Ethereum scans
+
+`/eth` sweeps weak Ethereum generators and checks every candidate live over
+JSON-RPC. There is **no bloom filter and no dataset download** for Ethereum —
+no public dump of funded addresses exists — so the batch request is the filter
+and your RPC endpoint is the bottleneck, not the CPU.
+
+```bash
+# which endpoints answer from this host, their block height, batch support
+curl -s -u admin:PASS -X POST http://127.0.0.1:8000/api/eth/ping | python3 -m json.tool
+```
+
+Set your own node in `/etc/btc-hunt.env` and restart:
+
+```bash
+ETH_RPC_URLS=http://127.0.0.1:8545
+ETH_RPC_BATCH=100
+ESPLORA_MIN_INTERVAL=0.05
+```
+
+Public endpoints 429 within seconds of a real sweep: at ~24,000 candidates/s
+with batches of 50, the app would need ~475 requests/s. A throttled batch
+stores **no** verdict (a rate limit says nothing about an address) and is
+counted as `throttled` for a later re-check from `/results` → **Check ETH
+balances**. Full recipe/window honesty table and measured rates:
+[Ethereum section in the main README](../../README.md#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
+
+Headless, without the dashboard:
+
+```bash
+sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
+  --cli-eth 1669248000 1671753599 --unit s --recipes tw_bip39_s,sha256_dec
+```
+
 ## Dataset mirrors
 
 `/data` tries, in order: any `DATASET_URLS` you configured, up to four recent
@@ -324,6 +358,7 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
 | Auto-pull stuck on `job running` | New builds write `.btc-hunt-busy.pid`; `update.sh` clears the marker as soon as that worker is gone. For an immediate hard reset `sudo btc-hunt-reset` kills all jobs, clears both markers and force-deploys `main`. On older builds use `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` |
+| `/eth` sweep runs but every batch says `HTTP 429` | Public JSON-RPC endpoints rate-limit hard. Point `ETH_RPC_URLS` at your own node, lower `ETH_RPC_BATCH`, raise `ESPLORA_MIN_INTERVAL`; the job counts them as `throttled` and re-checks from `/results` |
 | Bulk nonce scan reports 0 hits but every line after N says `HTTP 429` | The old build counted rate-limited addresses as scanned. Update to the latest `main`: 429 now triggers a global cooldown, blocked addresses are retried and saved to `/var/lib/btc-hunt/nonce_retry.txt`, and the job shows `partial`. Raise `ESPLORA_MIN_INTERVAL` or add `ESPLORA_URLS` |
 | Lots of `★★★ HIT` lines but every address has 0 BTC | On the current build this should not happen with `AUTO_VERIFY_HITS=1` (default): zero-balance candidates are skipped before saving. Hard-refresh and check `/health` for the new build; `AUTO_VERIFY_MIN_SATS=0` intentionally keeps them. Older builds need **Check balances** on `/results`; these are Bloom false positives, so set `BLOOM_FP_RATE=0.000001` (default now) and rebuild from the cached `.gz` |
 | New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |

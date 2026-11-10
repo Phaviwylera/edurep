@@ -189,6 +189,24 @@ PYTHONUNBUFFERED=1
 #RANDSTORM_MAX_MS=5000000
 #RANDSTORM_MAX_TOTAL_MS=4000000000
 
+# Ethereum (/eth) balance checks go over JSON-RPC - there is no bloom filter
+# and no local dataset, so every derived address is asked about on chain, in
+# batches of ETH_RPC_BATCH addresses (two calls each). The defaults below are
+# public endpoints that rate-limit aggressively; point ETH_RPC_URLS at your own
+# node for any serious sweep. Test them with the page's "Test RPC" button.
+#ETH_RPC_URLS=https://ethereum-rpc.publicnode.com,https://eth.drpc.org,https://1rpc.io/eth,https://rpc.flashbots.net
+#ETH_RPC_BATCH=50
+#ETH_RPC_TIMEOUT=25
+#ETH_MIN_WEI=1
+#ETH_VERIFY_BALANCES=1
+# Per-chunk and per-run caps on timestamp steps (the Trust Wallet window is
+# 2,505,600 one-second seeds), and the cap on one weak-key run.
+#ETH_MAX_STEPS=5000000
+#ETH_MAX_TOTAL_STEPS=20000000
+#ETH_MAX_WEAK_KEYS=2000000
+# Vendored 2048-word BIP-39 English list (sha256 2f5eed53...).
+#BIP39_WORDLIST_PATH=/opt/btc-hunt/data/bip39_english.txt
+
 # Allow the dashboard's Kill all jobs button to replace this Gunicorn worker.
 # Set to 0 to only stop jobs without restarting the worker.
 #BTC_HUNT_WORKER_RESTART=1

@@ -5,6 +5,12 @@ persistent disk for the dataset, bloom filter and SQLite results.
 `render.yaml` is a [Render Blueprint](https://render.com/docs/blueprint-spec)
 that provisions the whole service.
 
+Four scans ship today: the timestamp dataset sweep, Randstorm-style
+millisecond timestamps, passphrase brainwallets, ECDSA nonce reuse — plus an
+[Ethereum page](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances) that
+sweeps weak Ethereum generators and verifies every candidate live over
+JSON-RPC.
+
 > **The service has to be created from your own Render account.** This
 > workspace has no Render integration or API token, so it can prepare and
 > verify the repo but cannot press "Deploy" for you. Everything below is a
@@ -76,13 +82,22 @@ required for the health check and the public URL to work.
 | `NONCE_MAX_ADDRESSES` | `5000` | Cap on addresses in one bulk upload |
 | `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
 | `BLOOM_FP_RATE` | `0.000001` | Bloom false-positive target; lower = fewer false hits, larger/slower build. Rebuild the bloom after changing it |
-| `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run |
+| `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run (Bitcoin **and** Ethereum) |
 | `VERIFY_RETRY_PASSES` | `3` | Extra passes over addresses that were still throttled (HTTP 429) when a `/results` balance run ended |
 | `AUTO_VERIFY_HITS` | `1` | Live-check every Bloom candidate before saving; `0` restores save-candidate-only mode |
 | `AUTO_VERIFY_MIN_SATS` | `1` | Minimum chain+mempool sats to save a hit; `0` keeps zero-balance hits with balance fields |
 | `RANDSTORM_MAX_MS` | `5000000` | Automatic Randstorm chunk size in ms; large `/randstorm` ranges are split into sequential chunks |
 | `RANDSTORM_MAX_TOTAL_MS` | `4000000000` | Total ms accepted by one `/api/randstorm` run — 4,000,000,000 ms ≈ 46.3 days ≈ 800 default chunks. Raise it to run longer ranges. See [Scan speed](#scan-speed-and-the-ec-backend) for what that costs in wall-clock time |
 | `EC_BACKEND` | `auto` | `auto` uses libsecp256k1 (`coincurve`) when importable, otherwise the pure-Python windowed path. Force one with `libsecp256k1` or `python`; shown by `/health` and the page footer |
+| `ETH_RPC_URLS` | `ethereum-rpc.publicnode.com,eth.drpc.org,1rpc.io/eth,rpc.flashbots.net` | Comma-separated Ethereum JSON-RPC endpoints for `/eth` balance checks. Each keeps its own 429 cooldown; requests fail over. Point this at your own node for any serious sweep |
+| `ETH_RPC_BATCH` | `50` | Addresses per JSON-RPC batch request (two calls each). Endpoints that refuse batches are detected and switched to one request per call |
+| `ETH_RPC_TIMEOUT` | `25` | Seconds per RPC request |
+| `ETH_MIN_WEI` | `1` | Minimum balance (wei) to save an Ethereum hit; `0` also saves never-used and emptied addresses |
+| `ETH_VERIFY_BALANCES` | `1` | Live-check derived addresses before saving. `0` skips verification entirely and only counts candidates as `unchecked` |
+| `ETH_MAX_STEPS` | `5000000` | Timestamps per chunk on `/eth`; larger ranges split automatically |
+| `ETH_MAX_TOTAL_STEPS` | `20000000` | Total timestamps accepted by one `/api/eth/timestamp` run (the Trust Wallet window is 2,505,600) |
+| `ETH_MAX_WEAK_KEYS` | `2000000` | Cap on sequential + pasted keys per weak-key run |
+| `BIP39_WORDLIST_PATH` | `data/bip39_english.txt` | The vendored 2048-word BIP-39 English list (SHA-256 `2f5eed53…`) |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
 | `PORT` | set by Render | Do not override |
@@ -293,6 +308,133 @@ false positive can coincidentally have a balance. Always confirm with a block
 explorer before trusting any private key. Only test addresses you own or are
 authorised to test.
 
+## Ethereum: timestamp sweeps, weak keys, live RPC balances
+
+`/eth` adds Ethereum to the same dashboard. The curve is identical
+(secp256k1), so the EC backend from the Randstorm work is reused unchanged;
+only the address hash differs — an Ethereum address is the last 20 bytes of
+**Keccak-256** (the pre-NIST padding, not `hashlib.sha3_256`) over the 64-byte
+uncompressed public key *without* its `0x04` prefix, rendered in EIP-55
+mixed case.
+
+The important structural difference: **there is no bloom filter.** No public
+dump of funded Ethereum addresses exists, so the scan runs in the opposite
+direction. Candidates are derived locally, then checked against the chain in
+batches — `ETH_RPC_BATCH` addresses per HTTP request, two JSON-RPC calls each
+(`eth_getBalance` + `eth_getTransactionCount` at `latest`). The batch *is* the
+filter.
+
+### What each recipe can and cannot find
+
+A timestamp is a **seed for a broken generator, never a private key**. Each
+recipe reproduces one specific generator and declares the unit it was fed; the
+page disables recipes that do not accept the selected unit.
+
+| Recipe id | What it computes | Unit | Honest expectation |
+| --- | --- | --- | --- |
+| `tw_bip39_s` | MT19937 seeded with the Unix timestamp in seconds → first four 32-bit outputs as 16 bytes of BIP-39 entropy → mnemonic → PBKDF2-HMAC-SHA512 (2048) → BIP-32 `m/44'/60'/0'/0/0` | s | The Trust Wallet browser-extension shape. Each layer matches its published test vector, but **the exact order in which the vulnerable library consumed MT output is not publicly documented**, so a miss means "this recipe shape did not match", not "the window is safe" |
+| `sha256_dec` | `privkey = sha256(str(timestamp))` | ms, s | The classic timestamp brainwallet, common in 2015-era scripts and tutorials |
+| `keccak_dec` | `privkey = keccak256(str(timestamp))` | ms, s | The Ethereum-native variant of the same idea |
+| `sha256_be8` | `privkey = sha256(timestamp as 8-byte big-endian)` | ms, s | What a program hashing the raw integer would produce |
+| `mt19937_s` | MT19937 seeded with seconds → first eight outputs used directly as the key | s | Timestamp-seeded keys with no BIP-39 layer |
+| `raw` | `privkey = timestamp` | ms, s | Included because early users really did this; no wallet library generates keys this way |
+
+Documented windows, as preset buttons on the page (exact UTC epochs):
+
+| Window | Range | Verdict |
+| --- | --- | --- |
+| Trust Wallet extension v2.68 | `1669248000`–`1671753599` s (2022-11-24 → 2022-12-22), 2,505,600 seeds | **The genuine timestamp-seeded Ethereum window.** Worth sweeping with `tw_bip39_s` / `mt19937_s`, with the caveat above |
+| Frontier era | `1438214400000`–`1451606399000` ms (2015-07-30 → 2015-12-31) | 13.4 billion ms timestamps. Weak/brainwallet generation was real here, but sweep a slice — the whole range is weeks of RPC-bound work |
+| CryptoJS < 4.2 era | `1514764800`–`1577836799` s (2018 → 2020) | CVE-2023-46233 made `WordArray.random` fall back to `Math.random`. Recovering those wallets needs the **browser PRNG state**, not a timestamp sweep: a timestamp recipe only finds keys that were *also* seeded from the clock |
+| 2014 presale | `1405987200000`–`1409702399000` ms (2014-07-22 → 2014-09-02) | **Will not recover a presale wallet.** Presale keys came from a real CSPRNG; the documented weakness is in the *encrypted keystore* (weak password, IV reuse). Kept only so the window is not mistaken for a scannable one |
+
+The 2015–2016 "ethercombing" / Blockchain Bandit drain was **sequential and
+dictionary private keys**, not timestamps — that is the second card on `/eth`
+(`1..N` plus any pasted hex keys), and it is the only Ethereum vector on this
+page that is known to have actually paid out.
+
+### Verification, saving and exporting
+
+Every batch is checked before anything is saved:
+
+- `wei > 0` → saved as a hit, logged `★★★ ETH HIT`, verdict
+  `funded_verify_manually`. Nothing here proves the funds are spendable — it
+  proves the address is *live*, and you must confirm by hand before acting.
+- `wei == 0, nonce == 0` → **skipped** (never used), counted in the job detail.
+  Set `ETH_MIN_WEI=0` to save them anyway.
+- `wei == 0, nonce > 0` → used and emptied; logged, not saved as a hit.
+- Transport failure or HTTP 429 → the batch stores **nothing** and is counted
+  as `throttled`. A rate limit is not a verdict; re-run the check later.
+- A per-call RPC error (one item in the batch) stores an error row and saves
+  the candidate fail-open, rather than dropping a possible hit.
+
+ETH rows reuse the `balance_checks` table with an exact split: `sats` holds
+whole **gwei**, `mempool_sats` holds the remaining **wei**
+(`sats * 1e9 + mempool_sats` reconstructs the balance with no float error), and
+`tx_count` holds the **nonce**. `/results` shows ETH badges
+(`1.234568 ETH · nonce 7`), **Check ETH balances** re-checks every saved `0x`
+address in batches with retry passes, and **Download Ethereum results
+(JSONL)** exports every `eth_*` bucket.
+
+### Endpoints and rate limits
+
+Four public, keyless endpoints are configured by default
+(`ethereum-rpc.publicnode.com`, `eth.drpc.org`, `1rpc.io/eth`,
+`rpc.flashbots.net`); set `ETH_RPC_URLS` (comma-separated) to replace them.
+That list was chosen from third-party measurements in October 2026 of which
+public endpoints still answer without a key — Ankr now needs one and
+`eth.llamarpc.com` was returning 525/403 — but **none of them could be reached
+from the sandbox that built this**, so treat the list as unverified and use the
+page's **Test RPC** button
+(`POST /api/eth/ping`) to see which ones answer from your host, their block
+height and whether they accept batch requests. An endpoint that answers a batch
+with a single object is remembered and gets one request per call instead.
+
+429/5xx handling is shared with the Esplora client: the endpoint that failed is
+parked for a cooldown (honouring `Retry-After`), the request fails over to the
+next one, and adaptive spacing applies globally.
+
+### Measured speed (this matters less than your RPC)
+
+Derivation rates measured on one vCPU (`c6i.large`), per candidate including
+address encoding, with the Trust Wallet 2,505,600-seed window as the yardstick:
+
+| Recipe | coincurve + pycryptodome | coincurve + pure-Python Keccak | pure-Python EC + pycryptodome | pure-Python EC + Keccak |
+| --- | --- | --- | --- | --- |
+| `raw` | 31,240/s → 1.3 min | 1,197/s → 35 min | 12,693/s → 3.3 min | 1,161/s → 36 min |
+| `sha256_dec` | 28,838/s → 1.4 min | 1,387/s → 30 min | 2,544/s → 16 min | 844/s → 50 min |
+| `mt19937_s` | 3,617/s → 12 min | 1,114/s → 38 min | 1,510/s → 28 min | 760/s → 55 min |
+| `tw_bip39_s` | 641/s → 65 min | 411/s → 102 min | 340/s → 123 min | 304/s → 137 min |
+
+Job-level rates are a little lower (loop, chunking and progress bookkeeping):
+23,780 ts/s for `sha256_dec` and 540 ts/s for `tw_bip39_s` with both optional
+accelerators installed. `pycryptodome` does Keccak-256 in ~3.4 µs versus
+~400 µs for the pure-Python permutation (~117×); `tw_bip39_s` is dominated by
+PBKDF2-HMAC-SHA512, which no backend here accelerates.
+
+**Those numbers are the ceiling, not the expectation.** At 23,780 ts/s with
+batches of 50 addresses, the sweep would need ~475 HTTP requests per second —
+no public endpoint allows that, and you will be rate-limited within seconds.
+Real throughput is set by your RPC: sweeping the Trust Wallet window needs
+~50,000 batch requests, so at a sustainable 5 req/s that is ~2.8 hours of
+network time regardless of how fast the derivation is. `ETH_RPC_URLS` pointing
+at your own node (or a paid provider) is the only way to make a large sweep
+practical; `ESPLORA_MIN_INTERVAL` spaces the requests.
+
+### Headless sweep
+
+```bash
+# no bloom filter is needed, so no --build-bloom first
+.venv/bin/python btc_hunt.py --cli-eth 1669248000 1671753599 \
+  --unit s --recipes tw_bip39_s,sha256_dec
+```
+
+### Scope
+
+Only sweep windows and addresses you own or are authorised to test. Sweeping
+someone else's address space is key-guessing, and a funded hit is not
+authorisation to move funds.
+
 ## Checking which build is live
 
 Every page has a footer showing `build <commit>`, the process start time, the
@@ -301,13 +443,16 @@ active EC backend, and a note when a running job is deferring auto-deploy.
 
 ```bash
 curl http://<your-host>/health
-# {"status":"ok","build":"f5871ab","started":"2026-11-10T05:20:00+00:00",
-#  "ec":"libsecp256k1 (coincurve 21.0.0)"}
+# {"status":"ok","build":"a942280","started":"2026-11-10T05:20:00+00:00",
+#  "ec":"libsecp256k1 (coincurve 21.0.0)","keccak":"pycryptodome 4.4.0"}
 ```
 
 `ec` reads `libsecp256k1 (coincurve <version>)` when the optional native
 backend is installed, or `python windowed w=4` when the pure-Python fallback is
 running (~4x slower — see [Scan speed](#scan-speed-and-the-ec-backend)).
+`keccak` reads `pycryptodome <version>` or `python keccak-f1600 (~400 us/hash)`
+and only affects the Ethereum page (~117x slower without it — see
+[Ethereum](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances)).
 
 Compare `build` with the newest commit on `main`. If the field is missing (a
 process started before this change) or the hash is old, the auto-pull has not
@@ -397,6 +542,10 @@ practical option on smaller plans.
   `DATASET_URLS`, or copy a `.gz` to `DISK_PATH/blockchair.tsv.gz` yourself
   (Render SSH + `scp`, or `sudo cp` on EC2) — a cached file is used without
   re-downloading.
+- **Ethereum has no local dataset.** Every `/eth` candidate is checked over
+  JSON-RPC, so public endpoints — not the CPU — set the sweep rate, and a
+  large window needs your own node or a paid provider. See
+  [Ethereum](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
 - **Single instance only.** Job state (`_JOBS`) and the SQLite DB are in-process
   and on a local disk. Do not set `numInstances` > 1 or add autoscaling.
 - **Python 3.12.** Pinned because dependency versions are pinned. The app also
