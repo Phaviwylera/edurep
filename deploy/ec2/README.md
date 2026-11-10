@@ -164,6 +164,33 @@ CPU, and a real persistent volume. Note `.python-version` is only used by
 Render; on EC2 the system Python (3.12 on Ubuntu 24.04) is used inside the
 venv, and `requirements.txt` pins the dependencies.
 
+## Bulk nonce-reuse scans
+
+Open `/nonce` and use **Scan file** to upload a `.txt` (or CSV whose first
+column is an address) with up to `NONCE_MAX_ADDRESSES` (default 5000) mainnet
+addresses. Blank lines, `#` comments, duplicates and extra columns are
+ignored. The job shares the single `nonce` slot with single-address scans, so
+the progress bar, log and **Stop** button work; the busy marker also protects
+it from the 2-minute auto-pull restarting a live scan.
+
+Public Blockstream Esplora is rate limited. The app paces requests with
+`ESPLORA_MIN_INTERVAL` (default 0.15 s), caches responses in a bounded LRU and
+retries 429/5xx. Tune these in `/etc/btc-hunt.env` and
+`sudo systemctl restart btc-hunt`:
+
+```bash
+ESPLORA_MIN_INTERVAL=0.3
+ESPLORA_MAX_RETRIES=3
+ESPLORA_CACHE_SIZE=8192
+NONCE_MAX_ADDRESSES=10000
+```
+
+Only legacy P2PKH spending signatures are parsed today; `bc1...` addresses
+are accepted but segwit witness signatures will not yield `r` values. Hits
+land in `/var/lib/btc-hunt/btc_hunt.sqlite` and are visible at `/results`;
+export all of them (the page shows only 500) with the JSONL download links on
+that page. Nonce reuse does **not** need `funded.bloom`.
+
 ## Dataset mirrors
 
 `/data` tries, in order: any `DATASET_URLS` you configured, up to four recent

