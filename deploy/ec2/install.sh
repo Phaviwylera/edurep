@@ -127,6 +127,14 @@ PYTHONUNBUFFERED=1
 # public mirrors. Leave commented to use the built-in defaults. Restart with
 # sudo systemctl restart btc-hunt after editing this file.
 #DATASET_URLS=https://my-mirror.example/bitcoin.hex.gz
+
+# Optional: dataset download / build time budgets in seconds. Defaults are
+# 1800 (30 min) for the download and 7200 (2 h) for the two parse passes.
+#DOWNLOAD_DEADLINE_SECS=1800
+#BUILD_DEADLINE_SECS=7200
+
+# Set to 1 to verify Base58Check checksums on untrusted custom dumps (slower).
+#DATASET_VERIFY_CHECKSUM=0
 EOF
   chmod 0600 "$ENV_FILE"
   log "created $ENV_FILE (add APP_USER / APP_PASSWORD there to require login)"

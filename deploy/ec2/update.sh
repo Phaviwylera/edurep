@@ -29,9 +29,11 @@ ENV_FILE="${ENV_FILE:-/etc/btc-hunt.env}"
 DISK_PATH="$(sed -n 's/^DISK_PATH=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
 DISK_PATH="${DISK_PATH:-/var/lib/btc-hunt}"
 BUSY_MARKER="$DISK_PATH/.btc-hunt-busy"
-# A hard-killed process can leave the marker behind forever. The dataset job's
-# own deadline is 30 minutes, so 35 minutes is a safe "definitely stale" bound.
-BUSY_MAX_AGE_SECS="${BUSY_MAX_AGE_SECS:-2100}"
+# A hard-killed process can leave the marker behind forever. Wait a little
+# longer than the app's own build budget before declaring the marker stale.
+BUILD_DEADLINE_SECS="$(sed -n 's/^BUILD_DEADLINE_SECS=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
+case "$BUILD_DEADLINE_SECS" in ''|*[!0-9]*) BUILD_DEADLINE_SECS=7200 ;; esac
+BUSY_MAX_AGE_SECS="${BUSY_MAX_AGE_SECS:-$((BUILD_DEADLINE_SECS + 600))}"
 if [ -f "$BUSY_MARKER" ] && [ "${BTC_HUNT_FORCE_UPDATE:-0}" != "1" ]; then
   MARKER_MTIME="$(stat -c %Y "$BUSY_MARKER" 2>/dev/null || echo 0)"
   MARKER_AGE="$(( $(date +%s) - MARKER_MTIME ))"
