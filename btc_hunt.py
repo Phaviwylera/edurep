@@ -164,9 +164,14 @@ AUTO_VERIFY_HITS = os.environ.get(
 AUTO_VERIFY_MIN_SATS = _env_int("AUTO_VERIFY_MIN_SATS", 1, 0)
 # Automatic Randstorm chunking. The UI accepts larger ranges and the job splits
 # them into sequential chunks, so one run cannot lock the dashboard forever.
+# 4,000,000,000 ms is ~46.3 days of timestamps = 800 default chunks. Stop is
+# honoured between and inside chunks, so a run that long can be abandoned at
+# any point and still keeps every hit it found.
 RANDSTORM_MAX_MS        = max(1000, _env_int("RANDSTORM_MAX_MS", 5_000_000, 1000))
 RANDSTORM_MAX_TOTAL_MS  = max(RANDSTORM_MAX_MS,
-                              _env_int("RANDSTORM_MAX_TOTAL_MS", 50_000_000, 1000))
+                              _env_int("RANDSTORM_MAX_TOTAL_MS",
+                                       4_000_000_000, 1000))
+_MS_PER_DAY = 86_400_000
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
 CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
@@ -915,12 +920,15 @@ def attack_randstorm(start_ms, end_ms, bf, log, job):
     total = int(end_ms) - int(start_ms) + 1
     if total <= 0:
         return []
-    chunks = list(_randstorm_chunks(start_ms, end_ms, RANDSTORM_MAX_MS))
-    chunk_count = len(chunks)
-    log(f"[randstorm] {start_ms}..{end_ms}  ({total:,} timestamps, "
-        f"{chunk_count:,} chunk(s) of at most {RANDSTORM_MAX_MS:,} ms)")
+    # ceil-division, not list(...): with the 4-billion-ms cap a small
+    # RANDSTORM_MAX_MS would otherwise allocate millions of chunk tuples.
+    chunk_count = -(-total // max(1, RANDSTORM_MAX_MS))
+    log(f"[randstorm] {start_ms}..{end_ms}  ({total:,} timestamps "
+        f"\u2248 {total / _MS_PER_DAY:.1f} days, {chunk_count:,} chunk(s) of at "
+        f"most {RANDSTORM_MAX_MS:,} ms)")
     hits = []; skipped = 0; t0 = time.time(); base_done = 0
-    for chunk_no, (chunk_start, chunk_end) in enumerate(chunks, 1):
+    for chunk_no, (chunk_start, chunk_end) in enumerate(
+            _randstorm_chunks(start_ms, end_ms, RANDSTORM_MAX_MS), 1):
         if job["stop"]:
             log("[randstorm] stopped")
             break
@@ -2271,9 +2279,14 @@ def rs_page():
 <input id="e" value="1293840001000">
 <p class="muted">2011-01-01 → 2015-01-01 is the vulnerable window, but that is
 126 billion timestamps and would take months. Larger ranges are split
-automatically into chunks of at most 5,000,000 ms and run in order; the total
-range cap is 50,000,000 ms by default. Bloom candidates are live-checked for
-balance as found; zero-balance addresses are skipped by default.</p>
+automatically into chunks of at most {chunk_ms} ms and run in order; one run may
+span up to {total_ms} ms (about {total_days} days, {total_chunks} chunks) by
+default — set RANDSTORM_MAX_TOTAL_MS to change that cap. A run that size takes
+many hours: progress, chunk number, hits and ETA stay visible, and Stop ends it
+cleanly between or inside a chunk while keeping everything found so far. Bloom
+candidates are live-checked for balance as found; zero-balance addresses are
+skipped by default. At BLOOM_FP_RATE=1e-6 expect roughly 3 false candidates per
+million timestamps, each costing one paced explorer request.</p>
 <button class="btn" onclick="start()">Start</button>
 <button class="btn danger" onclick="stop('randstorm')">Stop</button>
 </div>
@@ -2289,6 +2302,14 @@ function start(){
 }
 watch('randstorm');
 </script>"""
+    # Placeholders, not an f-string: the body is full of JS/CSS braces.
+    body = (body
+            .replace("{chunk_ms}", f"{RANDSTORM_MAX_MS:,}")
+            .replace("{total_chunks}",
+                     f"{-(-RANDSTORM_MAX_TOTAL_MS // max(1, RANDSTORM_MAX_MS)):,}")
+            .replace("{total_days}",
+                     f"{RANDSTORM_MAX_TOTAL_MS / _MS_PER_DAY:.1f}")
+            .replace("{total_ms}", f"{RANDSTORM_MAX_TOTAL_MS:,}"))
     return page(body)
 
 @app.route("/api/randstorm", methods=["POST"])
@@ -2305,8 +2326,11 @@ def api_rs():
         return {"ok": False, "msg": "end must be >= start"}
     if end - start + 1 > RANDSTORM_MAX_TOTAL_MS:
         return {"ok": False,
-                "msg": (f"range too large (max {RANDSTORM_MAX_TOTAL_MS:,} ms total; "
-                        "set RANDSTORM_MAX_TOTAL_MS to raise it) — split it up")}
+                "msg": (f"range too large: {end - start + 1:,} ms is over the "
+                        f"{RANDSTORM_MAX_TOTAL_MS:,} ms cap "
+                        f"(\u2248{RANDSTORM_MAX_TOTAL_MS / _MS_PER_DAY:.1f} days); "
+                        "set RANDSTORM_MAX_TOTAL_MS to raise it, or run it in "
+                        "pieces — Stop keeps everything found so far")}
     try:
         bf = BloomFilter.load(BLOOM_PATH)
     except Exception as e:
