@@ -86,8 +86,9 @@ required for the health check and the public URL to work.
 | `VERIFY_RETRY_PASSES` | `3` | Extra passes over addresses that were still throttled (HTTP 429) when a `/results` balance run ended |
 | `AUTO_VERIFY_HITS` | `1` | Live-check every Bloom candidate before saving; `0` restores save-candidate-only mode |
 | `AUTO_VERIFY_MIN_SATS` | `1` | Minimum chain+mempool sats to save a hit; `0` keeps zero-balance hits with balance fields |
-| `RANDSTORM_MAX_MS` | `5000000` | Automatic Randstorm chunk size in ms; large `/randstorm` ranges are split into sequential chunks |
-| `RANDSTORM_MAX_TOTAL_MS` | `4000000000` | Total ms accepted by one `/api/randstorm` run — 4,000,000,000 ms ≈ 46.3 days ≈ 800 default chunks. Raise it to run longer ranges. See [Scan speed](#scan-speed-and-the-ec-backend) for what that costs in wall-clock time |
+| `RANDSTORM_MAX_MS` | `5000000` | **Batch size** in ms. Every `/randstorm` range, however large, is split into batches of at most this many ms and the batches run one after another (`chunk i/N` in the log) |
+| `RANDSTORM_MAX_TOTAL_MS` | `4000000000` | **Warn threshold, not a cap** — 4,000,000,000 ms ≈ 46.3 days ≈ 800 batches. Nothing is refused; above it the start reply also gives the batch count and a wall-clock estimate. See [Scan speed](#scan-speed-and-the-ec-backend) |
+| `RANDSTORM_RATE` | `6000` | Timestamps/s assumed by that estimate (measured with libsecp256k1 on one vCPU). The job log always shows the real rate |
 | `EC_BACKEND` | `auto` | `auto` uses libsecp256k1 (`coincurve`) when importable, otherwise the pure-Python windowed path. Force one with `libsecp256k1` or `python`; shown by `/health` and the page footer |
 | `ETH_RPC_URLS` | `ethereum-rpc.publicnode.com,eth.drpc.org,rpc.flashbots.net,ethereum.blockpi.network/v1/rpc/public` | Comma-separated Ethereum JSON-RPC endpoints for `/eth` balance checks. Each keeps its own cooldown; requests fail over. Point this at your own node for any serious sweep |
 | `ETH_RPC_BATCH` | `50` | Addresses per JSON-RPC batch request (two calls each). This is the **starting** size: it halves when an endpoint refuses arrays or a large batch, and grows back after 20 clean requests |
@@ -100,10 +101,11 @@ required for the health check and the public URL to work.
 | `ETH_RPC_USER_AGENT` | the Esplora-style agent | Override the `User-Agent` sent to RPC endpoints; some gateways 403 an unidentified client |
 | `ETH_MIN_WEI` | `1` | Minimum balance (wei) to save an Ethereum hit; `0` also saves never-used and emptied addresses |
 | `ETH_VERIFY_BALANCES` | `1` | Live-check derived addresses before saving. `0` skips verification entirely and only counts candidates as `unchecked` |
-| `ETH_MAX_STEPS` | `5000000` | Timestamps per chunk on `/eth`; larger ranges split automatically |
-| `ETH_MAX_TOTAL_STEPS` | `20000000` | Total timestamps accepted by one run — `/api/eth/timestamp` **and** the era batch, where it applies to the sum of the per-era steps (the Trust Wallet window is 2,505,600) |
-| `ETH_ERA_STEPS` | `1000000` | Default slice of **each** era taken by one era-batch run (floored at 1000). The eras are billions of timestamps wide, so this is a sample, not a sweep — raise it only if you have a private RPC endpoint |
-| `ETH_MAX_WEAK_KEYS` | `2000000` | Cap on sequential + pasted keys per weak-key run |
+| `ETH_MAX_STEPS` | `5000000` | **Batch size** in timestamps. Every sweep — `/api/eth/timestamp` and each era of the era batch — is split into batches of at most this many and the batches run one after another (`chunk i/N` in the log) |
+| `ETH_MAX_TOTAL_STEPS` | `20000000` | **Warn threshold, not a cap.** Nothing is refused: above it the start reply and the log add the batch count and a wall-clock estimate. Applies to one sweep, and to the sum of the per-era steps in an era batch |
+| `ETH_RATE` | `24000` | Candidates/s assumed by that estimate (measured `sha256_dec` with both accelerators on one vCPU); divided by the number of selected recipes. The job log always shows the real rate |
+| `ETH_ERA_STEPS` | `1000000` | Default slice of **each** era taken by one era-batch run (floored at 1000). The eras are billions of timestamps wide, so this is a sample, not a sweep — raise it, or set an era's steps to its whole span, if you have a private RPC endpoint and the patience |
+| `ETH_MAX_WEAK_KEYS` | `2000000` | **Warn threshold, not a cap** on sequential + pasted keys per weak-key run: keys are streamed and checked one RPC batch at a time, so a larger count just runs longer |
 | `BIP39_WORDLIST_PATH` | `data/bip39_english.txt` | The vendored 2048-word BIP-39 English list (SHA-256 `2f5eed53…`) |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
@@ -226,7 +228,13 @@ no address encoding on a miss — the same vCPU went from **~63 timestamps/s to
 | --- | ---: | --- | --- |
 | 5,000,000 ms (one chunk) | 1 | ~12 min | ~51 min |
 | 86,400,000 ms (1 day) | 18 | ~3.6 h | ~15 h |
-| 4,000,000,000 ms (46.3 days, the cap) | 800 | ~7 days | ~28 days |
+| 4,000,000,000 ms (46.3 days, the warn threshold) | 800 | ~7 days | ~28 days |
+| 126,230,400,000 ms (2011→2015, the whole window) | 25,247 | ~243 days | ~900 days |
+
+Nothing is refused: the last row is what `/randstorm` accepts for the full
+vulnerable window, split into 25,247 batches that run in order. Stop works
+between and inside batches and keeps everything found so far — a stopped run's
+progress bar shows the percentage it actually reached, not 100%.
 
 Measured in a 1-vCPU sandbox; a c6i.large will differ somewhat, and the live
 rate is printed in the job detail (`… ts/s`) and in the footer via `/health`.
@@ -362,13 +370,17 @@ private-key timestamp sweep of this window cannot recover a presale wallet, and
 the page, the log and `--list-eras` all say so every time it is selected. It is
 listed so the window is never mistaken for a scannable one.
 
-**A batch run samples each era; it does not sweep it.** With the default
-`ETH_ERA_STEPS=1000000`, one run covers 0.0016% of Era 3, and
-`ETH_MAX_TOTAL_STEPS` (20,000,000) refuses anything larger outright. The whole
-of Era 3 is ~30 days of pure CPU at the ~24,000 `sha256_dec` candidates/s
-measured on the EC2 box — and 1.26 billion batch requests, which is ~8 years at a
-sustainable 5 requests/s from a public endpoint. The RPC, not the CPU, is the
-wall. Use `steps` to size the sample and `offset` to walk through the era run by
+**A batch run samples each era by default, but nothing is refused.** With the
+default `ETH_ERA_STEPS=1000000`, one run covers 0.0016% of Era 3. Press
+**whole era** and it takes the entire span instead: the run is split into
+batches of `ETH_MAX_STEPS` (5,000,000) timestamps that go one after another,
+each logging `chunk i/N`, with Stop honoured between batches. What the size
+buys you is time, not permission — the whole of Era 3 is ~30 days of pure CPU at
+the ~24,000 `sha256_dec` candidates/s measured on the EC2 box, and 1.26 billion
+batch requests, which is ~8 years at a sustainable 5 requests/s from a public
+endpoint. The RPC, not the CPU, is the wall, and above
+`ETH_MAX_TOTAL_STEPS` (20,000,000) the start reply says exactly that in
+wall-clock terms instead of blocking. Use `steps` to size the sample and `offset` to walk through the era run by
 run — the same offset plus steps resumes exactly where the last run stopped, and
 every run logs the exact slice and the percentage of the window it covered.
 
@@ -513,8 +525,10 @@ practical; `ESPLORA_MIN_INTERVAL` spaces the requests.
 ```
 
 `--steps N` sets the default per-era slice when an era token omits it. The
-batch refuses an unknown era, a unit no selected recipe accepts, and a total
-over `ETH_MAX_TOTAL_STEPS` **before** deriving anything.
+batch refuses an unknown era and a unit no selected recipe accepts — mistakes
+that would waste the run — but **not** a large total: over
+`ETH_MAX_TOTAL_STEPS` it prints `note: N steps in M batches of B … (≈T at R/s)`
+and runs anyway, batch after batch.
 
 ### Scope
 
@@ -607,11 +621,12 @@ Worker/CLI modes are unchanged, e.g. `python btc_hunt.py --build-bloom` or
 python tests/test_eth.py       # no pytest, no network: requests is monkeypatched
 ```
 
-29 groups: published vectors for every Ethereum primitive, the recipes, the
+30 groups: published vectors for every Ethereum primitive, the recipes, the
 JSON-RPC client (batching, per-item errors, batch refusal, 429 failover, 403
 parking, pre-flight probe, adaptive batch size), the sweeps, the retry queue and
 its drainer, the fixed era table (including the corrected CVE id and the
-14-digit end), the era batch route/job/CLI, the dashboard widgets, and a Bitcoin
+14-digit end), the era batch route/job/CLI, the dashboard widgets, the
+no-range-refused batching on both the ETH and the Bitcoin side, and a Bitcoin
 regression group. It writes only to a temporary `DISK_PATH` and runs the CLI
 groups as subprocesses with `ETH_VERIFY_BALANCES=0`, so it needs no network.
 
@@ -649,13 +664,17 @@ practical option on smaller plans.
   reject datacenter IPs outright (HTTP 403), which the pre-flight probe reports
   before a run wastes hours. See
   [Ethereum](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
-- **The era windows cannot be swept.** Era 2 is 13.4 billion timestamps and
-  Era 3 is 63.1 billion; at the ~24,000 candidates/s measured on EC2 that is ~6
-  and ~30 days of pure CPU, but 268 million and 1.26 billion batch requests —
-  ~2 and ~8 years at a sustainable 5 requests/s from a public endpoint. The era batch therefore samples
-  `ETH_ERA_STEPS` timestamps per era and reports the exact slice and the
-  percentage of the window it covered. Era 1 (2014 presale) is additionally
-  **not** recoverable by a private-key timestamp sweep at all —
+- **No range is refused, so a big range is a time commitment.** Era 2 is 13.4
+  billion timestamps and Era 3 is 63.1 billion; at the ~24,000 candidates/s
+  measured on EC2 that is ~6 and ~30 days of pure CPU, but 268 million and 1.26
+  billion batch requests — ~2 and ~8 years at a sustainable 5 requests/s from a
+  public endpoint. The app starts them anyway, in batches of `ETH_MAX_STEPS`,
+  and says what they will cost; the era batch defaults to a
+  `ETH_ERA_STEPS`-sized sample per era and reports the exact slice and the
+  percentage of the window it covered. Stop is honoured between and inside
+  batches, keeps everything found so far, and leaves the progress bar at the
+  percentage actually reached. Era 1 (2014 presale) is additionally **not**
+  recoverable by a private-key timestamp sweep at all —
   see [The fixed era windows](#the-fixed-era-windows-batch-and-manual).
 - **Single instance only.** Job state (`_JOBS`) and the SQLite DB are in-process
   and on a local disk. Do not set `numInstances` > 1 or add autoscaling.

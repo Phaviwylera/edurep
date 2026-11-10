@@ -12,10 +12,11 @@ this is safe to run on a deploy box or in CI. It covers
   16-22 the failure modes that matter on a real host: HTTP 403 parking, the
         pre-flight probe, the durable retry queue and its drainer, adaptive
         batch sizing, the queue cap, and a mid-run Stop
-  24-29 the fixed era windows and the era batch: table values, route
+  24-30 the fixed era windows and the era batch: table values, route
         validation, sequential sweeping with per-era steps/offset, Stop, the
         unscannable-era warning, the era widget on /eth, the home-page
-        launcher, and the headless --cli-eth-era / --list-eras
+        launcher, the headless --cli-eth-era / --list-eras, and the
+        no-range-refused batching on both the ETH and the BTC side
 
 Every assertion that encodes a published test vector says so in a comment.
 """
@@ -344,10 +345,26 @@ assert d["ok"] is False and "unit must be" in d["msg"], d
 d = cl.post("/api/eth/timestamp", json={"start": 5, "end": 1, "unit": "s",
                                         "recipes": ["raw"]}).get_json()
 assert d["ok"] is False and "end must be >= start" in d["msg"], d
+# A billion steps is NOT refused: it is accepted, split into batches of
+# ETH_MAX_STEPS (1000 in this suite) and run in order. The reply says how many
+# batches that is and what it costs in wall-clock time.
 d = cl.post("/api/eth/timestamp", json={"start": 1, "end": 10 ** 9, "unit": "s",
                                         "recipes": ["raw"]}).get_json()
-assert d["ok"] is False and "ETH_MAX_TOTAL_STEPS" in d["msg"], d
-print("8 ok  unit filtering and range caps enforced")
+assert d["ok"] is True, d
+assert d["span"] == 10 ** 9
+assert d["batches"] == 10 ** 9 // b.ETH_MAX_STEPS == 1_000_000, d
+assert d["batch_steps"] == b.ETH_MAX_STEPS
+assert "1,000,000 batches of 1,000" in d["msg"], d["msg"]
+assert "batches run one after another" in d["msg"], d["msg"]
+assert "Stop between them keeps everything found so far" in d["msg"], d["msg"]
+assert "at %s/s" % format(b.ETH_RATE, ",") in d["msg"], d["msg"]
+assert "range too large" not in d["msg"] and "cap" not in d["msg"], d["msg"]
+b._JOBS["eth_ts"]["stop"] = True            # do not really sweep a billion
+wait_job("eth_ts", 60)
+job = b._JOBS["eth_ts"]
+assert job["progress"] < 1.0 and not job["error"], job
+reset_rpc()
+print("8 ok  unit filtering enforced; a billion steps is batched, not refused")
 
 # ══════════════════════════════════════════════════════════════════════
 # 9 — weak / sequential keys, pasted hex, dedupe
@@ -461,8 +478,16 @@ assert p["ok"] is True and len(p["bases"]) == len(b._ETH_RPC_BASES)
 assert all(x["block"] == 0x123456 and x["batch"] for x in p["bases"]), p
 d = cl.post("/api/eth/weakkeys", json={"count": "0", "keys": ""}).get_json()
 assert d["ok"] is False and "set a count" in d["msg"], d
+# a billion weak keys is accepted too, with the cost spelled out
 d = cl.post("/api/eth/weakkeys", json={"count": 10 ** 9}).get_json()
-assert d["ok"] is False and "ETH_MAX_WEAK_KEYS" in d["msg"], d
+assert d["ok"] is True and d["keys"] == 10 ** 9, d
+assert "past ETH_MAX_WEAK_KEYS" in d["msg"] and "Stop keeps every hit" in d["msg"], d
+assert "too many keys" not in d["msg"], d["msg"]
+b._JOBS["eth_weak"]["stop"] = True
+wait_job("eth_weak", 60)
+assert b._JOBS["eth_weak"]["progress"] < 1.0, b._JOBS["eth_weak"]
+assert "stopped at" in b._JOBS["eth_weak"]["detail"], b._JOBS["eth_weak"]["detail"]
+reset_rpc()
 for path in ("/health", "/", "/results", "/randstorm", "/nonce", "/data",
              "/brain", "/eth", "/api/esplora", "/api/eth/pending",
              "/api/eth/recipes"):
@@ -799,25 +824,27 @@ r = cl.post("/api/eth/era", json={"eras": ["tw", "frontier"],
 assert r["ok"] is True, r
 wait_job("eth_era", 20)
 assert not b._JOBS["eth_era"]["alive"], b._JOBS["eth_era"]
-# the per-era slice is capped by ETH_MAX_TOTAL_STEPS (100,000 in this suite)
+# 160,000 steps across two eras is over ETH_MAX_TOTAL_STEPS (100,000 in this
+# suite) and still starts: that knob is a warn threshold now, not a refusal.
 r = cl.post("/api/eth/era", json={"eras": ["frontier", "cryptojs"],
                                   "recipes": ["sha256_dec"],
                                   "steps": 80000}).get_json()
-assert r["ok"] is False and "ETH_MAX_TOTAL_STEPS" in r["msg"], r
-# ... and the cap is per run, not per era
-r = cl.post("/api/eth/era", json={"eras": ["frontier", "cryptojs"],
-                                  "recipes": ["sha256_dec"],
-                                  "steps": 40000}).get_json()
-assert r["ok"] is True and r["steps"] == 80000, r
-b._JOBS["eth_era"]["stop"] = True            # do not really sweep 80k per era
-wait_job("eth_era", 30)
+assert r["ok"] is True and r["steps"] == 160000, r
+assert r["batches"] == 160000 // b.ETH_MAX_STEPS == 160, r
+assert "160 batches of 1,000" in r["msg"], r["msg"]
+assert "at %s/s" % format(b.ETH_RATE, ",") in r["msg"], r["msg"]
+assert "over the" not in r["msg"] and "cap" not in r["msg"], r["msg"]
+b._JOBS["eth_era"]["stop"] = True            # do not really sweep 160k
+wait_job("eth_era", 60)
+assert b._JOBS["eth_era"]["progress"] < 1.0, b._JOBS["eth_era"]
+reset_rpc()
 # an unknown era in a list of known ones is rejected outright, nothing starts
 r = cl.post("/api/eth/era", json={"eras": [{"id": "tw", "steps": 10},
                                            {"id": "bogus"}],
                                   "recipes": ["sha256_dec"]}).get_json()
 assert r["ok"] is False and "bogus" in r["msg"], r
 assert not b._JOBS["eth_era"]["alive"], b._JOBS["eth_era"]
-print("25 ok  /api/eth/era validation: unknown ids, units, recipes, cap")
+print("25 ok  /api/eth/era validation: unknown ids, units, recipes; no size cap")
 
 # ══════════════════════════════════════════════════════════════════════
 # 26 — attack_eth_eras sweeps the selected eras in sequence, with slices
@@ -909,8 +936,12 @@ b.attack_eth_eras([{"id": "tw", "steps": 3}, {"id": "frontier", "steps": 3}],
                   ["sha256_dec"], logs.append, job)
 b.attack_eth_timestamp = _orig
 assert job["eth_skipped"] == 3, job        # only era 1 ran
-assert any("stopped before frontier" in l for l in logs), logs
-assert job["progress"] < 1.0, job
+# era 1 finished and Stop landed after it, so it IS credited and era 2 is not
+assert any("stopped after tw completed — 1 of 2 era(s) swept" in l
+           for l in logs), logs
+assert not any("[era 2/2" in l for l in logs), logs
+assert abs(job["progress"] - 0.5) < 1e-9, job      # half the bar, not full
+assert any("batch done — 1 of 2 era(s)" in l for l in logs), logs
 # every endpoint refusing: the batch stops rather than deriving blind
 reset_rpc()
 MODE["fail"] = "all"
@@ -964,7 +995,7 @@ assert "%d days of pure" % round(span3 / 24000 / 86400) in txt, "CPU days"
 assert format(int(span3 / b.ETH_RPC_BATCH), ",") in txt, "batch request count"
 years3 = round(span3 / b.ETH_RPC_BATCH / 5 / 86400 / 365)
 assert years3 >= 1, years3                     # never renders as "0 years"
-assert "about %d years at a sustainable" % years3 in txt
+assert "%d years at a sustainable" % years3 in txt
 assert "one timestamp in %s" % format(
     max(1, int(span3 / b.ETH_ERA_STEPS)), ",") in txt, "slice ratio"
 assert not any(tok in txt for tok in
@@ -1016,10 +1047,10 @@ ENV = dict(os.environ, DISK_PATH=DISK, APP_USER="", APP_PASSWORD="",
            ETH_VERIFY_BALANCES="0")       # no network: derive and count only
 
 
-def cli(*argv):
+def cli(*argv, env=None):
     return subprocess.run([sys.executable, os.path.join(ROOT, "btc_hunt.py")]
                           + list(argv), capture_output=True, text=True,
-                          env=ENV, timeout=180)
+                          env=env or ENV, timeout=180)
 
 
 r = cli("--list-eras")
@@ -1040,12 +1071,140 @@ r = cli("--cli-eth-era", "bogus")
 assert r.returncode != 0 and "unknown era(s): bogus" in r.stderr, r.stderr[-300:]
 r = cli("--cli-eth-era", "tw:notanumber")
 assert r.returncode != 0 and "must be integers" in r.stderr, r.stderr[-300:]
-r = cli("--cli-eth-era", "tw:99999999")
-assert r.returncode != 0 and "ETH_MAX_TOTAL_STEPS" in r.stderr, r.stderr[-300:]
+# over the warn threshold the CLI prints the batch plan and RUNS anyway
+# ETH_MAX_STEPS is floored at 1000, so 3000 steps is exactly 3 batches
+WARN_ENV = dict(ENV, ETH_MAX_TOTAL_STEPS="50")
+r = cli("--cli-eth-era", "tw:3000", "--recipes", "sha256_dec", env=WARN_ENV)
+assert r.returncode == 0, r.stderr[-300:]
+assert "note: 3,000 steps in 3 batches of 1,000" in r.stdout, r.stdout[-500:]
+assert "batches run one after another" in r.stdout
+assert "at %s/s" % format(b.ETH_RATE, ",") in r.stdout, r.stdout[-500:]
+# and the batches really do run in order, one finishing before the next starts
+order = [r.stdout.index("chunk %d/3" % i) for i in (1, 2, 3)]
+assert order == sorted(order), order
+assert "batch done — 1 of 1 era(s)" in r.stdout
+r = cli("--list-eras")
+assert "refused" in r.stdout and "warn above" in r.stdout, r.stdout[-300:]
 print("29 ok  --list-eras and --cli-eth-era slices, offsets and validation")
 
 # ══════════════════════════════════════════════════════════════════════
-# 30 — throughput, for the docs (informational)
+# 30 — no range is refused: it is split into batches that run in order
+# ══════════════════════════════════════════════════════════════════════
+# the helpers behind every "N batches of M" sentence
+assert b._batch_count(21, 7) == 3 and b._batch_count(22, 7) == 4
+assert b._batch_count(7, 7) == 1 and b._batch_count(0, 7) == 1
+assert b._batch_count(10 ** 12, 5 * 10 ** 6) == 200_000
+assert b._human_secs(30) == "30 s" and "min" in b._human_secs(600)
+assert "h" in b._human_secs(7200) and "days" in b._human_secs(86400 * 3)
+assert "years" in b._human_secs(86400 * 365 * 1000)
+assert b._human_secs(float("inf")) == "?" and b._human_secs(None) == "?"
+note = b._batch_note(21, 7, "steps", 3)
+assert note.startswith("21 steps in 3 batches of 7"), note
+assert "one after another" in note and "(\u22487 s at 3/s)" in note, note
+
+# a 21-step range at 7 steps per batch = 3 batches, run in order
+reset_rpc()
+OLD_MAX_STEPS = b.ETH_MAX_STEPS
+b.ETH_MAX_STEPS = 7
+try:
+    job, logs = newjob(), []
+    b.attack_eth_timestamp(1_000_000, 1_000_020, "ms", ["raw"],
+                           logs.append, job)
+    chunks = [l for l in logs if "chunk " in l and "/" in l]
+    assert len(chunks) == 3, chunks
+    assert "chunk 1/3: 1000000..1000006" in chunks[0], chunks[0]
+    assert "chunk 2/3: 1000007..1000013" in chunks[1], chunks[1]
+    assert "chunk 3/3: 1000014..1000020" in chunks[2], chunks[2]
+    assert [logs.index(c) for c in chunks] == sorted(logs.index(c)
+                                                     for c in chunks)
+    assert "3 chunk(s) of at most 7 steps" in logs[0], logs[0]
+    assert job["progress"] == 1.0 and job["eth_skipped"] == 21, job
+
+    # Stop between batches: the finished batch keeps its hit, the rest do not run
+    reset_rpc()
+    hit_ts = 1_000_002                       # inside batch 1 of 3
+    FUNDED[b.eth_address(hit_ts).lower()] = 7 * 10 ** 17
+    real_flush = b._eth_flush
+    state = {"n": 0}
+
+    def flush_then_stop(pending, log, job, stopped_fn):
+        out = real_flush(pending, log, job, stopped_fn)
+        state["n"] += 1
+        if state["n"] == 1:
+            job["stop"] = True               # user pressed Stop after batch 1
+        return out
+
+    b._eth_flush = flush_then_stop
+    job, logs = newjob(), []
+    hits = b.attack_eth_timestamp(1_000_000, 1_000_020, "ms", ["raw"],
+                                  logs.append, job)
+    b._eth_flush = real_flush
+    assert len(hits) == 1 and hits[0]["ts"] == hit_ts, hits
+    assert any("chunk 1/3" in l for l in logs), logs
+    assert not any("chunk 2/3" in l for l in logs), logs
+    assert any("stopped" in l for l in logs), logs
+    assert job["progress"] < 1.0, job        # the bar does not lie
+    rows = [json.loads(x) for _a, x in b._db().execute(
+        "SELECT attack,payload FROM results")]
+    assert any(r["address"] == b.eth_address(hit_ts) for r in rows), rows
+finally:
+    b.ETH_MAX_STEPS = OLD_MAX_STEPS
+
+# the whole era as one run: accepted by the route, batched, and stoppable
+reset_rpc()
+r = cl.post("/api/eth/era", json={"eras": [{"id": "frontier",
+                                            "steps": 13_391_999_001}],
+                                  "recipes": ["sha256_dec"]}).get_json()
+assert r["ok"] is True, r
+assert r["batches"] == -(-13_391_999_001 // b.ETH_MAX_STEPS), r
+assert "%s batches of %s" % (format(r["batches"], ","),
+                             format(b.ETH_MAX_STEPS, ",")) in r["msg"], r["msg"]
+assert b._human_secs(13_391_999_001 / b.ETH_RATE) in r["msg"], r["msg"]
+assert "at %s/s" % format(b.ETH_RATE, ",") in r["msg"], r["msg"]
+b._JOBS["eth_era"]["stop"] = True
+wait_job("eth_era", 60)
+era_job = b._JOBS["eth_era"]
+assert era_job["progress"] < 1.0, era_job      # a stopped run never shows 100%
+assert "stopped at" in era_job["detail"], era_job["detail"]
+assert era_job.get("partial") is True, era_job
+# Stop races the worker thread, so it lands either before the era starts or
+# inside it; both are honest, and neither may credit the era as swept.
+assert any(("stopped before frontier" in l) or ("stopped during frontier" in l)
+           for l in era_job["log"]), era_job["log"]
+assert any("batch done — 0 of 1 era(s)" in l for l in era_job["log"])
+assert era_job.get("eth_skipped", 0) < 13_391_999_001
+reset_rpc()
+
+# and the same on the Bitcoin side: the randstorm route refuses nothing
+_bloom_made = not b.BLOOM_PATH.exists()
+if _bloom_made:
+    b.BloomFilter.create(8).save(b.BLOOM_PATH)     # empty: no candidate hits
+try:
+    d = cl.post("/api/randstorm", json={"start": 0,
+                                        "end": 126_230_400_000}).get_json()
+    assert d["ok"] is True, d
+    assert d["batches"] == 25_247, d
+    assert "25,247 batches of 5,000,000" in d["msg"], d["msg"]
+    assert "243.5 days at %s/s" % format(b.RANDSTORM_RATE, ",") in d["msg"], d["msg"]
+    assert "range too large" not in d["msg"], d["msg"]
+    b._JOBS["randstorm"]["stop"] = True
+    wait_job("randstorm", 60)
+    assert b._JOBS["randstorm"]["progress"] < 1.0, b._JOBS["randstorm"]
+    # a small range still reports its batches, without the wall-clock note
+    d = cl.post("/api/randstorm", json={"start": 1293840000000,
+                                        "end": 1293852000000}).get_json()
+    assert d["ok"] is True and d["batches"] == 3, d
+    assert "3 batches of 5,000,000" in d["msg"] and "days" not in d["msg"], d["msg"]
+    b._JOBS["randstorm"]["stop"] = True
+    wait_job("randstorm", 60)
+finally:
+    if _bloom_made:
+        b.BLOOM_PATH.unlink(missing_ok=True)
+reset_rpc()
+print("30 ok  no range refused: batches run in order, Stop keeps the bar honest")
+
+# ══════════════════════════════════════════════════════════════════════
+# 31 — throughput, for the docs (informational)
 # ══════════════════════════════════════════════════════════════════════
 for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
     fn = b.ETH_RECIPES[rid]["fn"]
@@ -1054,7 +1213,7 @@ for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
         priv, _extra = fn(TS0 + i, "s")[0]
         b.eth_address(priv)
     el = (time.time() - t0) / n
-    print("30 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
+    print("31 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
           "Trust Wallet window in %5.1f min"
           % (rid, el * 1000, 1 / el, 2_505_600 * el / 60))
 
