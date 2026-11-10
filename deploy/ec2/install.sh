@@ -135,6 +135,10 @@ PYTHONUNBUFFERED=1
 
 # Set to 1 to verify Base58Check checksums on untrusted custom dumps (slower).
 #DATASET_VERIFY_CHECKSUM=0
+
+# Skip TSV rows with balance <= this value. Default 0 drops zero/negative
+# balances; -1 keeps every row. No effect on text/hex dumps without balances.
+#DATASET_MIN_BALANCE=0
 EOF
   chmod 0600 "$ENV_FILE"
   log "created $ENV_FILE (add APP_USER / APP_PASSWORD there to require login)"

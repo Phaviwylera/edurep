@@ -80,6 +80,13 @@ def _env_int(name, default, minimum):
         return default
 
 
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # A 1.47 GB / ~51M-row text dump can exceed 30 minutes on a small CPU after
 # the download. Keep the network budget tight, but let the two
 # streaming parse passes breathe. Both are configurable in /etc/btc-hunt.env.
@@ -91,6 +98,10 @@ if BUILD_DEADLINE_SECS < DOWNLOAD_DEADLINE_SECS:
 # 1/true/yes/on to verify every checksum (slower) for untrusted custom files.
 DATASET_VERIFY_CHECKSUM = os.environ.get(
     "DATASET_VERIFY_CHECKSUM", "").strip().lower() in ("1", "true", "yes", "on")
+# Skip TSV rows whose balance is <= this value. Default 0 removes zero and
+# negative balances from balance dumps; -1 disables filtering entirely (useful
+# for text-only address lists, which have no balance column anyway).
+DATASET_MIN_BALANCE = _env_float("DATASET_MIN_BALANCE", 0.0)
 ESPLORA    = os.environ.get("ESPLORA_URL", "https://blockstream.info/api")
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
@@ -439,6 +450,21 @@ def _decode_hash(token):
 HEX_LETTERS = frozenset("abcdefABCDEF")
 
 
+def _parse_balance(token):
+    """Return a numeric balance from a TSV column, or None if it isn't one."""
+    t = token.strip().replace(",", "")
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    # Tolerate units / trailing text such as "123.45 BTC".
+    m = re.match(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", t)
+    try:
+        return float(m.group(0)) if m else None
+    except ValueError:
+        return None
+
+
 def _hex_to_hash(token):
     """40-char hash160 hex, optionally 0x-prefixed. Avoid decoding a 40-digit
     decimal balance as hex: unprefixed all-digit tokens are rejected."""
@@ -570,40 +596,50 @@ def build_bloom(log, progress=None, should_stop=None, urls=None):
         log(f"[parse] format sniff failed: {e}; using generic parser")
         fmt = "generic"
     log(f"[parse] format: {fmt}")
+    if DATASET_MIN_BALANCE > -1:
+        log(f"[parse] balance filter: keep rows with balance > {DATASET_MIN_BALANCE:g}")
+    else:
+        log("[parse] balance filter: disabled (DATASET_MIN_BALANCE <= -1)")
 
     def hashes():
-        # One decoder per format instead of trying address + hex + checksum on
-        # every one of ~51M rows. Handles TSVs, plain address lists, hex dumps.
+        # A Python set of 50.8M 20-byte hash160 values needs several GB and
+        # OOM-kills a c6i.large. Keep the two-pass streaming Bloom filter and
+        # apply the requested balance > threshold filter here instead.
+        if fmt == "hex":
+            decode = _hex_to_hash
+        elif fmt == "address":
+            decode = _address_to_hash160_fast
+        elif fmt == "mixed":
+            decode = lambda t: _hex_to_hash(t) or _address_to_hash160_fast(t)
+        else:
+            decode = _decode_hash
         with gzip.open(ADDR_GZ, 'rt', errors='ignore') as f:
-            if fmt == "hex":
-                for line in f:
-                    for token in line.rstrip('\r\n').split('\t'):
-                        h = _hex_to_hash(token.strip())
-                        if h:
-                            yield h
-                            break
-            elif fmt == "address":
-                for line in f:
-                    for token in line.rstrip('\r\n').split('\t'):
-                        h = _address_to_hash160_fast(token.strip())
-                        if h:
-                            yield h
-                            break
-            elif fmt == "mixed":
-                for line in f:
-                    for token in line.rstrip('\r\n').split('\t'):
-                        t = token.strip()
-                        h = _hex_to_hash(t) or _address_to_hash160_fast(t)
-                        if h:
-                            yield h
-                            break
-            else:
-                for line in f:
-                    for token in line.rstrip('\r\n').split('\t'):
-                        h = _decode_hash(token.strip())
-                        if h:
-                            yield h
-                            break
+            for line in f:
+                tokens = line.rstrip('\r\n').split('\t')
+                h = None
+                hash_idx = -1
+                for idx, token in enumerate(tokens):
+                    cand = decode(token.strip())
+                    if cand:
+                        h, hash_idx = cand, idx
+                        break
+                if not h:
+                    continue  # header, blank or unparseable row
+                # Only TSV-ish rows have a balance column. Plain address lists
+                # and hex dumps have one token and are kept as-is. Works for
+                # address<TAB>balance and balance<TAB>address layouts.
+                if len(tokens) > 1 and DATASET_MIN_BALANCE > -1:
+                    for idx, token in enumerate(tokens):
+                        if idx == hash_idx:
+                            continue
+                        bal = _parse_balance(token)
+                        if bal is None:
+                            continue
+                        if bal <= DATASET_MIN_BALANCE:
+                            h = None
+                        break
+                if h:
+                    yield h
 
     log("[parse] pass 1/2 — counting address rows")
     report(0.30, "pass 1/2 — counting address rows")
@@ -1194,6 +1230,10 @@ def data_page():
         "bloom_size": BLOOM_PATH.stat().st_size if BLOOM_PATH.exists() else 0,
         "gz_size": ADDR_GZ.stat().st_size if ADDR_GZ.exists() else 0,
     }
+    if DATASET_MIN_BALANCE <= -1:
+        balance_note = "disabled (all rows kept)"
+    else:
+        balance_note = f"keep rows with balance &gt; {DATASET_MIN_BALANCE:g}"
     body = f"""
 <div class="card"><h2>Dataset status</h2>
 <p>cached dataset (.gz): {'✓ ' + f'{status["gz_size"]/1e9:.2f} GB' if status['gz']
@@ -1209,9 +1249,10 @@ else '✗ not built'}</p>
 download was disabled in 2026), then other public mirrors. A .hex.gz hash160
 dump (~470 MB) is preferred over a .tsv.gz address dump (~1.6 GB). Budget:
 {BUILD_DEADLINE_SECS // 60} min total, {DOWNLOAD_DEADLINE_SECS // 60} min for
-the download. You can also copy a .gz to {DATA_DIR}/blockchair.tsv.gz and
-click Download — the cached file is used without re-downloading. Progress and
-the live log are below.</p>
+the download. Balance filter: {balance_note}
+(set DATASET_MIN_BALANCE=-1 to keep zero balances). You can also copy a .gz to
+{DATA_DIR}/blockchair.tsv.gz and click Download — the cached file is used
+without re-downloading. Progress and the live log are below.</p>
 </div>
 <div class="card"><h2>Progress</h2>
 <div class="bar"><div id="bar" style="width:0%"></div></div>

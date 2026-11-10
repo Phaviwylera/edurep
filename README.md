@@ -64,6 +64,7 @@ required for the health check and the public URL to work.
 | `DOWNLOAD_DEADLINE_SECS` | `1800` | Network budget for one mirror download |
 | `BUILD_DEADLINE_SECS` | `7200` | Total budget for download + two-pass bloom build |
 | `DATASET_VERIFY_CHECKSUM` | `0` | Set to `1` to verify Base58Check checksums on untrusted dumps (slower) |
+| `DATASET_MIN_BALANCE` | `0` | Skip TSV rows with balance ≤ this value; `-1` disables filtering |
 | `PORT` | set by Render | Do not override |
 
 `Procfile` contains the same start command for Heroku-style platforms; Render
@@ -75,10 +76,12 @@ uses `startCommand` from the Blueprint.
 2. Open `/` → `/data` → **Download & build bloom**. It tries LoyceV's dated
    snapshots first (its `LATEST` direct download was disabled in 2026), then
    other public mirrors. The parser autodetects address TSVs, plain address
-   lists and hash160-hex dumps, then makes two streaming passes to build
-   `funded.bloom` on the persistent disk. A ~1.5 GB / ~51M-row dump has a
-   30-minute download budget and a 2-hour total budget by default; both are
-   configurable.
+   lists and hash160-hex dumps, skips TSV rows whose balance is ≤
+   `DATASET_MIN_BALANCE` (default `0`), then makes two streaming passes to
+   build `funded.bloom` on the persistent disk. It does **not** materialise a
+   Python `set` of ~51M hashes — that would need several GB of RAM. A ~1.5 GB /
+   ~51M-row dump has a 30-minute download budget and a 2-hour total budget by
+   default; both are configurable.
    Watch progress through the live log on that page. Interrupted downloads go
    to a `.part` file and responses are verified to be real gzip data, so a
    truncated dump or an HTML error page is never treated as complete. Use
