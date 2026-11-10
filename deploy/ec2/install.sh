@@ -139,6 +139,10 @@ PYTHONUNBUFFERED=1
 # Skip TSV rows with balance <= this value. Default 0 drops zero/negative
 # balances; -1 keeps every row. No effect on text/hex dumps without balances.
 #DATASET_MIN_BALANCE=0
+
+# Prefer LoyceV dated balance TSVs (default 1). Set to 0 to prefer the
+# smaller text-only dumps. Restart after changing this file.
+#DATASET_PREFER_BALANCE_TSV=1
 EOF
   chmod 0600 "$ENV_FILE"
   log "created $ENV_FILE (add APP_USER / APP_PASSWORD there to require login)"

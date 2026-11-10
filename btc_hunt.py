@@ -51,11 +51,11 @@ except OSError:
 #     and asks users to use torrents; its HTML index still links dated dumps.
 #   * 3xpl retired that path (dumps are now per-chain zstd files needing auth)
 #   * privatekeys.pw paywalls downloads
-# The .hex.gz variant is smaller, but Cloudflare fronts privatekeyfinder.io
-# with a 403 from some EC2 IPs. LoyceV's dated snapshots are discovered at
-# runtime and tried BEFORE these static mirrors; they are the source proven to
-# work from AWS. The official source stays last because free downloads are
-# throttled to ~10 kB/s without a key.
+# LoyceV's dated balance TSVs are discovered at runtime and tried BEFORE these
+# static mirrors: they are the source proven to work from AWS, and they carry
+# the balances that DATASET_MIN_BALANCE filters on. Smaller text/hex dumps
+# remain fallbacks. Cloudflare may 403 privatekeyfinder.io from EC2 IPs; the
+# official source stays last because free downloads are throttled to ~10 kB/s.
 # Prepend custom mirrors with DATASET_URLS="https://...,https://..." (comma
 # separated), or paste a single URL into the /data page.
 _DEFAULT_DATASET_URLS = [
@@ -102,6 +102,11 @@ DATASET_VERIFY_CHECKSUM = os.environ.get(
 # negative balances from balance dumps; -1 disables filtering entirely (useful
 # for text-only address lists, which have no balance column anyway).
 DATASET_MIN_BALANCE = _env_float("DATASET_MIN_BALANCE", 0.0)
+# Prefer LoyceV's dated balance TSVs over the smaller text-only dumps so the
+# balance filter has balances to act on. Set to 0/false/no/off to revert.
+DATASET_PREFER_BALANCE_TSV = os.environ.get(
+    "DATASET_PREFER_BALANCE_TSV", "1").strip().lower() not in (
+        "0", "false", "no", "off")
 ESPLORA    = os.environ.get("ESPLORA_URL", "https://blockstream.info/api")
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
@@ -411,18 +416,29 @@ def _loyce_dated_urls(log, should_stop=None):
                     f"{m.group(2)} {m.group(3)} {m.group(4)}", "%B %d %Y").timestamp()
             except ValueError:
                 continue
-            scored.append((ts, urljoin(LOYCE_INDEX, href)))
-        # Newest first; on the same day prefer the smaller text-only dump.
-        scored.sort(key=lambda t: (t[0], ".txt.gz" in t[1]), reverse=True)
+            kind = ("balance" if m.group(1) ==
+                    "blockchair_bitcoin_addresses_and_balance" else "text")
+            scored.append((ts, kind, urljoin(LOYCE_INDEX, href)))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        balance_urls = [u for _, k, u in scored if k == "balance"]
+        text_urls = [u for _, k, u in scored if k == "text"]
+        if DATASET_PREFER_BALANCE_TSV:
+            primary, secondary = balance_urls, text_urls
+            label = "balance TSV preferred"
+        else:
+            primary, secondary = text_urls, balance_urls
+            label = "text dump preferred"
+        # Try up to four primary snapshots first, then fill the remaining
+        # slots with the other type so a blocked TSV still has a text fallback.
         urls, seen = [], set()
-        for _, u in scored:
+        for u in primary[:4] + secondary:
             if u in seen:
                 continue
             seen.add(u); urls.append(u)
             if len(urls) >= 6:
                 break
         if urls:
-            log(f"[dl] LoyceV index: {len(urls)} dated snapshot(s) found")
+            log(f"[dl] LoyceV index: {len(urls)} dated snapshot(s) found ({label})")
         return urls
     except RuntimeError:
         raise
@@ -1245,14 +1261,17 @@ else '✗ not built'}</p>
 <button class="btn" onclick="startDataset(false)">Download &amp; build bloom</button>
 <button class="btn" onclick="startDataset(true)">Re-download &amp; rebuild</button>
 <button class="btn danger" onclick="stop('dataset')">Stop</button>
-<p class="muted">Tries LoyceV's dated snapshots first (its LATEST direct
-download was disabled in 2026), then other public mirrors. A .hex.gz hash160
-dump (~470 MB) is preferred over a .tsv.gz address dump (~1.6 GB). Budget:
+<p class="muted">Tries LoyceV's dated balance TSVs first (its LATEST direct
+download was disabled in 2026), then text dumps and other public mirrors.
+The balance TSV is ~1.7 GB; smaller text/hex dumps are fallbacks. Set
+DATASET_PREFER_BALANCE_TSV=0 to prefer the smaller text dump. Budget:
 {BUILD_DEADLINE_SECS // 60} min total, {DOWNLOAD_DEADLINE_SECS // 60} min for
 the download. Balance filter: {balance_note}
-(set DATASET_MIN_BALANCE=-1 to keep zero balances). You can also copy a .gz to
-{DATA_DIR}/blockchair.tsv.gz and click Download — the cached file is used
-without re-downloading. Progress and the live log are below.</p>
+(set DATASET_MIN_BALANCE=-1 to keep zero balances). To replace an already
+cached text dump with a balance TSV, click Re-download &amp; rebuild. You can
+also copy a .gz to {DATA_DIR}/blockchair.tsv.gz and click Download — the
+cached file is used without re-downloading. Progress and the live log are
+below.</p>
 </div>
 <div class="card"><h2>Progress</h2>
 <div class="bar"><div id="bar" style="width:0%"></div></div>

@@ -65,6 +65,7 @@ required for the health check and the public URL to work.
 | `BUILD_DEADLINE_SECS` | `7200` | Total budget for download + two-pass bloom build |
 | `DATASET_VERIFY_CHECKSUM` | `0` | Set to `1` to verify Base58Check checksums on untrusted dumps (slower) |
 | `DATASET_MIN_BALANCE` | `0` | Skip TSV rows with balance ≤ this value; `-1` disables filtering |
+| `DATASET_PREFER_BALANCE_TSV` | `1` | Prefer LoyceV dated balance TSVs; set to `0` to prefer smaller text dumps |
 | `PORT` | set by Render | Do not override |
 
 `Procfile` contains the same start command for Heroku-style platforms; Render
@@ -74,14 +75,16 @@ uses `startCommand` from the Blueprint.
 
 1. `GET /health` → `{"status":"ok"}` — Render uses this to mark the deploy live.
 2. Open `/` → `/data` → **Download & build bloom**. It tries LoyceV's dated
-   snapshots first (its `LATEST` direct download was disabled in 2026), then
-   other public mirrors. The parser autodetects address TSVs, plain address
-   lists and hash160-hex dumps, skips TSV rows whose balance is ≤
-   `DATASET_MIN_BALANCE` (default `0`), then makes two streaming passes to
-   build `funded.bloom` on the persistent disk. It does **not** materialise a
-   Python `set` of ~51M hashes — that would need several GB of RAM. A ~1.5 GB /
-   ~51M-row dump has a 30-minute download budget and a 2-hour total budget by
-   default; both are configurable.
+   **balance TSVs** first (its `LATEST` direct download was disabled in 2026),
+   then text dumps and other public mirrors. The balance TSV is ~1.7 GB and
+   lets `DATASET_MIN_BALANCE` (default `0`) remove zero-balance rows; text/hex
+   dumps are fallbacks. Set `DATASET_PREFER_BALANCE_TSV=0` to prefer the smaller
+   text dump. The parser autodetects address TSVs, plain address lists and
+   hash160-hex dumps, then makes two streaming passes to build `funded.bloom`
+   on the persistent disk. It does **not** materialise a Python `set` of ~51M
+   hashes — that would need several GB of RAM. A ~1.7 GB / ~51M-row dump has a
+   30-minute download budget and a 2-hour total budget by default; both are
+   configurable.
    Watch progress through the live log on that page. Interrupted downloads go
    to a `.part` file and responses are verified to be real gzip data, so a
    truncated dump or an HTML error page is never treated as complete. Use
@@ -122,8 +125,9 @@ practical option on smaller plans.
 - **Third-party dataset mirrors.** The old fixed `addresses.loyce.club`
   `LATEST` aliases now 404 and `3xpl.com` returns 400; the LoyceV owner asks
   heavy users to use torrents instead. Rather than ship a BitTorrent client,
-  the app scrapes LoyceV's small HTML index for dated `.gz` snapshots and tries
-  them first, then several other live mirrors. Cloudflare may return 403 from
+  the app scrapes LoyceV's small HTML index for dated balance TSVs, tries up
+  to four of them first, then text dumps and several other live mirrors.
+  Cloudflare may return 403 from
   EC2 for `privatekeyfinder.io`; those URLs remain as fallbacks only.
   `gz.blockchair.com` is a last resort but free downloads are throttled to
   ~10 kB/s. If your network blocks all of them,
