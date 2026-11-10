@@ -235,17 +235,54 @@ ESPLORA_MAX_RETRIES=3
 ESPLORA_MAX_BACKOFF_SECS=120
 ESPLORA_CACHE_SIZE=8192
 NONCE_MAX_ADDRESSES=10000
+NONCE_MAX_TXS=5000
 ```
 
 `ESPLORA_URLS` must contain **mainnet** endpoints only. A 3,000-address run
 against the free public APIs takes hours; a local Bitcoin Core node or paid
 RPC is the only fast option.
 
-Only legacy P2PKH spending signatures are parsed today; `bc1...` addresses
-are accepted but segwit witness signatures will not yield `r` values. Hits
-land in `/var/lib/btc-hunt/btc_hunt.sqlite` and are visible at `/results`;
-export all of them (the page shows only 500) with the JSONL download links on
-that page. Nonce reuse does **not** need `funded.bloom`.
+Legacy `scriptSig` **and** segwit witness signatures are parsed: a witness
+signature is checked against its BIP-143 digest, so `bc1q…`, P2SH-P2WPKH and
+P2WSH inputs yield `r` values too. Taproot/BIP-341 inputs are counted and
+skipped. A recovered key is saved only once it verifies against the signing
+pubkey (or the address/scriptPubKey being spent). Hits land in
+`/var/lib/btc-hunt/btc_hunt.sqlite` and are visible at `/results`; export all
+of them (the page shows only 500) with the JSONL download links on that page.
+Nonce reuse does **not** need `funded.bloom`.
+
+## Live block monitor
+
+`/live` follows the chain tip and indexes every ECDSA signature in each new
+block — legacy and segwit — looking for a repeated `r`, which leaks the key
+outright. The index is a rolling window in the same SQLite file
+(`LIVE_WINDOW_BLOCKS`, default 2016 ≈ two weeks) and the last height is
+persisted, so a run resumes where the previous one stopped and a restart loses
+nothing. One block costs `ceil(tx_count/25) + 2` Esplora requests and nothing
+per transaction; at the default 0.3 s pacing a 3,000-tx block is ~37 s, so a
+day of blocks (`LIVE_MAX_BLOCKS=144`) is hours, not minutes.
+
+```bash
+# /etc/btc-hunt.env
+LIVE_ENABLED=1
+LIVE_MAX_BLOCKS=144
+LIVE_WINDOW_BLOCKS=2016
+LIVE_POLL_SECS=15
+ESPLORA_MIN_INTERVAL=0.3
+```
+
+```bash
+sudo btc-hunt-update && sudo systemctl restart btc-hunt
+sudo -u btc-hunt /opt/btc-hunt/venv/bin/python /opt/btc-hunt/btc_hunt.py --live-status
+```
+
+It is a **tripwire, not a sweep**: it cannot find weak entropy, because no
+signature reveals how its key was generated. For that use `/randstorm`,
+`/brain` or the dataset bloom. Running it for long stretches is polite only
+against your own Esplora/node — point `ESPLORA_URLS` there and lower
+`ESPLORA_MIN_INTERVAL` if you want to keep up with the tip continuously. The
+2-minute auto-pull will not restart the service while the `live` job runs
+(it writes the same busy marker as every other job).
 
 ## False positives and balance checks
 
@@ -407,6 +444,9 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | `/eth` sweep says `HTTP 429` on every batch | Public JSON-RPC endpoints rate-limit hard. Point `ETH_RPC_URLS` at your own node, lower `ETH_RPC_BATCH`, raise `ESPLORA_MIN_INTERVAL`. Unchecked candidates are queued in `eth_pending.jsonl`, not lost: drain them with **Re-check queued candidates** |
 | `/eth` sweep says `HTTP 403 Forbidden` and stops | That endpoint refuses this host — common for datacenter IPs (`1rpc.io/eth` does). The pre-flight probe lists which endpoints answer; keep those in `ETH_RPC_URLS`, or set `ETH_RPC_USER_AGENT`. If all of them refuse, the run stops by design and the queue holds the candidates |
 | `/eth` derived thousands of candidates but saved nothing | They were queued, not dropped: `wc -l /var/lib/btc-hunt/eth_pending.jsonl`, then press **Re-check queued candidates** once a working endpoint is configured |
+| `/live` says `could not read the chain tip` | Every configured Esplora endpoint refused or timed out. Check `GET /api/esplora` for cooldowns, raise `ESPLORA_MAX_RETRIES`, or point `ESPLORA_URLS` at your own instance. The run is flagged `partial`; nothing was scanned and nothing was claimed |
+| `/live` logs `r … does not verify` | Working as intended: two signatures shared an `r` but no candidate key reproduces either pubkey, so it was not a real reuse. Nothing is saved for those |
+| `/live` falls behind the tip | One block is `ceil(tx_count/25)+2` requests at `ESPLORA_MIN_INTERVAL`. Raise the pacing only against your own Esplora; public instances will 429 and the run stops `partial` after `LIVE_HEIGHT_RETRIES` failures |
 | Bulk nonce scan reports 0 hits but every line after N says `HTTP 429` | The old build counted rate-limited addresses as scanned. Update to the latest `main`: 429 now triggers a global cooldown, blocked addresses are retried and saved to `/var/lib/btc-hunt/nonce_retry.txt`, and the job shows `partial`. Raise `ESPLORA_MIN_INTERVAL` or add `ESPLORA_URLS` |
 | Lots of `★★★ HIT` lines but every address has 0 BTC | On the current build this should not happen with `AUTO_VERIFY_HITS=1` (default): zero-balance candidates are skipped before saving. Hard-refresh and check `/health` for the new build; `AUTO_VERIFY_MIN_SATS=0` intentionally keeps them. Older builds need **Check balances** on `/results`; these are Bloom false positives, so set `BLOOM_FP_RATE=0.000001` (default now) and rebuild from the cached `.gz` |
 | New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |
