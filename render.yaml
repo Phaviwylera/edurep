@@ -33,6 +33,11 @@ services:
         value: https://blockstream.info/api
       - key: PYTHONUNBUFFERED
         value: "1"              # live logs in the Render dashboard
+      # Ethereum (/eth) balances are checked over JSON-RPC - there is no bloom
+      # filter for Ethereum, so set your own endpoint for any real sweep.
+      # The built-in default is three public, rate-limited endpoints.
+      - key: ETH_RPC_URLS
+        sync: false
       # Optional HTTP Basic auth for the dashboard. Render prompts for these
       # on Blueprint creation; leave both blank to run without authentication.
       - key: APP_USER
