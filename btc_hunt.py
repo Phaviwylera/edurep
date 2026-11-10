@@ -112,13 +112,27 @@ DATASET_PREFER_BALANCE_TSV = os.environ.get(
     "DATASET_PREFER_BALANCE_TSV", "1").strip().lower() not in (
         "0", "false", "no", "off")
 ESPLORA    = os.environ.get("ESPLORA_URL", "https://blockstream.info/api")
-# Optional comma-separated list of MAINNET Esplora base URLs. On a 429 the
-# next attempt rotates to the following endpoint after the global cooldown.
-# Never put testnet endpoints here — the address list is mainnet.
-_ESPLORA_BASES = [u.strip().rstrip("/") for u in
-                  os.environ.get("ESPLORA_URLS", ESPLORA).split(",") if u.strip()]
-if not _ESPLORA_BASES:
-    _ESPLORA_BASES = [ESPLORA]
+# blockstream.info answered HTTP 429 to a mere 149-address verify pass, and
+# ESPLORA_URLS used to default to that one URL — so "rotation" rotated from
+# blockstream.info to blockstream.info. The default is now TWO mainnet bases:
+# each keeps its own cooldown deadline and requests fail over to the next
+# base that is still answering. Set ESPLORA_URLS to override the list
+# entirely (comma-separated, MAINNET only — the address list is mainnet).
+_ESPLORA_FALLBACK = "https://mempool.space/api"
+
+
+def _esplora_base_list():
+    raw = os.environ.get("ESPLORA_URLS", "").strip() or \
+        f"{ESPLORA},{_ESPLORA_FALLBACK}"
+    out = []
+    for u in raw.split(","):
+        u = u.strip().rstrip("/")
+        if u and u not in out:
+            out.append(u)
+    return out or [ESPLORA]
+
+
+_ESPLORA_BASES = _esplora_base_list()
 # Politeness limits for bulk nonce scans against public Esplora instances.
 # 0.15 s was too fast: ~750 requests (29 addresses x ~26 calls) triggered a
 # 429 that then persisted for the rest of a 3,000-address run.
@@ -136,6 +150,10 @@ NONCE_RETRY_FILE         = "nonce_retry.txt"
 BLOOM_FP_RATE = min(0.5, max(1e-12, _env_float("BLOOM_FP_RATE", 1e-6)))
 # Cap on unique addresses checked by one /api/verify run.
 VERIFY_MAX_ADDRESSES = _env_int("VERIFY_MAX_ADDRESSES", 5000, 1)
+# Extra passes over addresses that were still throttled (HTTP 429) when a
+# verify pass ended. 0 means one pass only. Whatever is still throttled after
+# the last pass stays "not checked yet" instead of being stored as an error.
+VERIFY_RETRY_PASSES = _env_int("VERIFY_RETRY_PASSES", 3, 0)
 # Live-verify every Bloom candidate as it is found. Adds one paced Esplora
 # request per candidate, but stops 0-BTC false positives reaching /results.
 # Set 0 for the old "save candidate, verify later" mode.
@@ -1004,6 +1022,11 @@ _RATE_LOCK = threading.Lock()
 _RATE_NEXT = [0.0]
 _RATE_INTERVAL = [ESPLORA_MIN_INTERVAL]
 _RATE_FAILURES = [0]
+# Per-endpoint cooldowns. Throttling ONE public instance must not stall the
+# others: a 429 from blockstream.info parks that base only, and the next
+# attempt goes to mempool.space while the global spacing still slows down.
+_BASE_COOL = {}
+_BASE_FAILS = {}
 
 def _esplora_cache_get(path):
     if ESPLORA_CACHE_SIZE <= 0:
@@ -1063,25 +1086,87 @@ def _retry_after_seconds(response):
         pass
     return 0.0
 
-def _esplora_rate_limited(response):
-    """One 429 pauses the whole scan; spacing doubles until requests succeed."""
+_ESPLORA_HEADERS = {"Accept": "application/json"}
+
+def _esplora_headers():
+    """Identify ourselves: a stock python-requests UA is throttled harder.
+
+    Built lazily because BUILD_ID is resolved after this config section.
+    """
+    if "User-Agent" not in _ESPLORA_HEADERS:
+        _ESPLORA_HEADERS["User-Agent"] = (
+            os.environ.get("ESPLORA_USER_AGENT", "").strip()
+            or f"btc-hunt/{BUILD_ID} (github.com/Phaviwylera/edurep)")
+    return _ESPLORA_HEADERS
+
+def _esplora_host(base):
+    return base.split("//")[-1].split("/")[0]
+
+def _esplora_throttled(base, response):
+    """Park ONE endpoint after a 429/5xx and slow the global spacing down.
+
+    Returns the cooldown in seconds. The other bases stay usable, so a single
+    throttled public instance no longer freezes a whole verify pass.
+    """
     hint = _retry_after_seconds(response)
+    now = time.monotonic()
     with _RATE_LOCK:
         _RATE_FAILURES[0] += 1
-        f = _RATE_FAILURES[0]
+        n = _BASE_FAILS[base] = _BASE_FAILS.get(base, 0) + 1
         backoff = min(ESPLORA_MAX_BACKOFF_SECS,
-                      max(hint, 2.0 * (2 ** min(f - 1, 5))))
-        _RATE_NEXT[0] = max(_RATE_NEXT[0], time.monotonic() + backoff)
-        base = max(ESPLORA_MIN_INTERVAL, 0.25)
+                      max(hint, 2.0 * (2 ** min(n - 1, 5))))
+        _BASE_COOL[base] = max(_BASE_COOL.get(base, 0.0), now + backoff)
+        floor = max(ESPLORA_MIN_INTERVAL, 0.25)
         _RATE_INTERVAL[0] = min(ESPLORA_PACE_MAX_SECS,
-                                max(_RATE_INTERVAL[0], base) * 2)
+                                max(_RATE_INTERVAL[0], floor) * 2)
+        return backoff
 
-def _esplora_rate_ok():
+def _esplora_rate_ok(base=None):
     with _RATE_LOCK:
         _RATE_FAILURES[0] = 0
+        if base:
+            _BASE_FAILS[base] = 0
+            _BASE_COOL.pop(base, None)
         if _RATE_INTERVAL[0] > ESPLORA_MIN_INTERVAL:
             _RATE_INTERVAL[0] = max(ESPLORA_MIN_INTERVAL,
                                     _RATE_INTERVAL[0] * 0.8)
+
+def _esplora_ready():
+    """Bases that are not cooling down right now."""
+    now = time.monotonic()
+    with _RATE_LOCK:
+        return [b for b in _ESPLORA_BASES if _BASE_COOL.get(b, 0.0) <= now]
+
+def _esplora_wait_for_base(should_stop=None):
+    """Block (Stop-aware) until at least one endpoint is out of cooldown."""
+    while True:
+        ready = _esplora_ready()
+        if ready:
+            return ready
+        now = time.monotonic()
+        with _RATE_LOCK:
+            left = min(_BASE_COOL.get(b, 0.0) - now for b in _ESPLORA_BASES)
+        _esplora_sleep(min(max(left, 0.0), ESPLORA_MAX_BACKOFF_SECS),
+                       should_stop)
+
+def _esplora_pick(ready, avoid=None):
+    """Prefer an endpoint other than the one that just failed."""
+    if avoid and len(ready) > 1:
+        for b in ready:
+            if b != avoid:
+                return b
+    return ready[0]
+
+def _esplora_status():
+    """One-line per-endpoint state for the log and the /results page."""
+    now = time.monotonic()
+    with _RATE_LOCK:
+        parts = []
+        for b in _ESPLORA_BASES:
+            left = _BASE_COOL.get(b, 0.0) - now
+            parts.append(f"{_esplora_host(b)}: cooling {left:.0f}s"
+                         if left > 0 else f"{_esplora_host(b)}: ok")
+        return "  ".join(parts)
 
 def _esplora_get(path, should_stop=None):
     """GET one Esplora path: cache, pacing, 429 cooldown, endpoint rotation."""
@@ -1089,17 +1174,27 @@ def _esplora_get(path, should_stop=None):
     if hit is not None:
         return hit
     last_err = None
+    failed_base = None
     for attempt in range(ESPLORA_MAX_RETRIES + 1):
         if should_stop and should_stop():
             raise RuntimeError("stopped by user")
-        base = _ESPLORA_BASES[attempt % len(_ESPLORA_BASES)]
+        # Wait for whichever endpoint is usable, and never retry the base
+        # that just throttled us while another one is still answering.
+        ready = _esplora_wait_for_base(should_stop)
+        base = _esplora_pick(ready, failed_base)
         _esplora_pace(should_stop)
         try:
-            r = requests.get(f"{base}{path}", timeout=25)
+            r = requests.get(f"{base}{path}", timeout=25,
+                             headers=_esplora_headers())
             if r.status_code == 429 or r.status_code >= 500:
-                _esplora_rate_limited(r)
+                cool = _esplora_throttled(base, r)
+                failed_base = base
+                nxt = _esplora_pick(_esplora_ready() or [base], base)
                 last_err = _EsploraRateLimited(
-                    f"HTTP {r.status_code} from {base} — cooling down")
+                    f"HTTP {r.status_code} from {_esplora_host(base)} — "
+                    f"cooling {cool:.0f}s"
+                    + (f", failing over to {_esplora_host(nxt)}"
+                       if nxt != base else ""))
                 continue
             r.raise_for_status()
             text = r.text
@@ -1111,7 +1206,7 @@ def _esplora_get(path, should_stop=None):
         except Exception as e:
             last_err = e
             continue
-        _esplora_rate_ok()
+        _esplora_rate_ok(base)
         _esplora_cache_put(path, text)
         return text
     if isinstance(last_err, _EsploraRateLimited):
@@ -1565,8 +1660,15 @@ def _balance_gate(hit, log, job, should_stop=None, prefix=""):
     if not _valid_address(addr):
         return True, hit, "invalid address — saved as candidate"
     stop = should_stop or (lambda: job.get("stop", False))
+    throttled = False
     try:
         b = _live_balance(addr, stop)
+    except _EsploraRateLimited as e:
+        # The endpoint is rate-limiting us. That says nothing about the
+        # address, so keep it queued for /results instead of storing a
+        # "check failed" verdict against it.
+        err = str(e)
+        throttled = True
     except RuntimeError as e:
         if "stopped by user" in str(e):
             log(f"{prefix}[auto-verify] stopped by user")
@@ -1595,6 +1697,17 @@ def _balance_gate(hit, log, job, should_stop=None, prefix=""):
         log(f"{prefix}[-] skipped {addr}: 0 BTC · {why} "
             "(Bloom false positive)")
         return False, enriched, ""
+    if throttled:
+        job["throttled"] = job.get("throttled", 0) + 1
+        enriched = {**hit, "balance_sats": None, "balance_tx_count": 0,
+                    "balance_checked_at":
+                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "balance_error": str(err)[:200],
+                    "balance_verdict": "check_failed_throttled",
+                    "balance_retry": True}
+        log(f"{prefix}[!] {addr}: endpoint throttled ({err}) — saved "
+            "unverified, re-check it from /results")
+        return True, enriched, "endpoint throttled — re-check later"
     _store_balance_check(addr, 0, 0, 0, err)
     enriched = {**hit, "balance_sats": None, "balance_tx_count": 0,
                 "balance_checked_at":
@@ -1606,7 +1719,14 @@ def _balance_gate(hit, log, job, should_stop=None, prefix=""):
 
 
 def verify_result_balances(force, log, job):
-    """Check saved hits against Esplora. Paced, cached, stoppable."""
+    """Check saved hits against Esplora. Paced, cached, stoppable, retried.
+
+    A 429 is not a verdict about an address. Throttled addresses go back on
+    the queue for another pass (up to VERIFY_RETRY_PASSES) and, if every pass
+    is throttled, they stay "not checked yet" instead of being stored as
+    errors — so one rate limit can no longer turn a 149-address run into 149
+    "check failed" badges.
+    """
     if force:
         log("[verify] forced re-check (Esplora cache cleared)")
     addrs = _all_result_addresses(VERIFY_MAX_ADDRESSES)
@@ -1615,49 +1735,86 @@ def verify_result_balances(force, log, job):
         job["detail"] = "no addresses to check"
         return
     total = len(addrs)
-    log(f"[verify] checking {total:,} unique address(es) against {ESPLORA}")
+    endpoints = ", ".join(_esplora_host(b) for b in _ESPLORA_BASES)
+    log(f"[verify] checking {total:,} unique address(es) against {endpoints}")
     t0 = time.time()
-    funded = never_funded = errors = 0
-    for i, addr in enumerate(addrs):
-        if job["stop"]:
-            log("[verify] stopped by user")
-            break
-        try:
-            txt = _esplora_get(f"/address/{addr}", lambda: job["stop"])
-            d = json.loads(txt)
-            chain = d.get("chain_stats") or {}
-            mem = d.get("mempool_stats") or {}
-            sats = int(chain.get("funded_txo_sum", 0)) - int(chain.get("spent_txo_sum", 0))
-            msats = int(mem.get("funded_txo_sum", 0)) - int(mem.get("spent_txo_sum", 0))
-            tx_count = int(chain.get("tx_count", 0))
-            _store_balance_check(addr, sats, tx_count, msats)
-            if sats + msats > 0:
-                funded += 1
-                log(f"[verify] {addr}: {sats+msats:,} sats — VERIFY MANUALLY")
-            elif tx_count == 0:
-                never_funded += 1
-            else:
-                log(f"[verify] {addr}: 0 sats (spent/empty)")
-        except RuntimeError as e:
-            if "stopped by user" in str(e):
+    funded = never_funded = errors = checked = 0
+    stopped = False
+    pending = list(addrs)
+    passes = 0
+
+    def report():
+        rate = checked / max(time.time() - t0, 0.001)
+        job["progress"] = min(1.0, checked / total)
+        job["throttled"] = len(pending)
+        job["detail"] = (f"{checked:,}/{total:,} addresses  funded={funded:,}  "
+                         f"never-funded={never_funded:,}  errors={errors:,}  "
+                         f"throttled={len(pending):,}  {rate:.2f} addr/s")
+
+    while pending and passes <= VERIFY_RETRY_PASSES and not stopped:
+        passes += 1
+        batch, pending = pending, []
+        if passes > 1:
+            wait = min(ESPLORA_MAX_BACKOFF_SECS, 5.0 * (2 ** (passes - 2)))
+            log(f"[verify] pass {passes}/{VERIFY_RETRY_PASSES + 1}: retrying "
+                f"{len(batch):,} throttled address(es) in {wait:.0f}s — "
+                f"{_esplora_status()}")
+            try:
+                _esplora_sleep(wait, lambda: job["stop"])
+            except RuntimeError:
                 log("[verify] stopped by user")
                 break
-            errors += 1
-            _store_balance_check(addr, 0, 0, 0, str(e))
-            log(f"[verify] {addr}: {e}")
-        except Exception as e:
-            # One bad response must not abort a multi-thousand-address run.
-            errors += 1
-            _store_balance_check(addr, 0, 0, 0, str(e))
-            log(f"[verify] {addr}: {e}")
-        done = i + 1
-        rate = done / max(time.time() - t0, 0.001)
-        job["progress"] = done / total
-        job["detail"] = (f"{done:,}/{total:,} addresses  funded={funded:,}  "
-                         f"never-funded={never_funded:,}  errors={errors:,}  "
-                         f"{rate:.2f} addr/s")
+        for addr in batch:
+            if job["stop"]:
+                log("[verify] stopped by user")
+                stopped = True
+                break
+            try:
+                txt = _esplora_get(f"/address/{addr}", lambda: job["stop"])
+                d = json.loads(txt)
+                chain = d.get("chain_stats") or {}
+                mem = d.get("mempool_stats") or {}
+                sats = int(chain.get("funded_txo_sum", 0)) - int(chain.get("spent_txo_sum", 0))
+                msats = int(mem.get("funded_txo_sum", 0)) - int(mem.get("spent_txo_sum", 0))
+                tx_count = int(chain.get("tx_count", 0))
+                _store_balance_check(addr, sats, tx_count, msats)
+                checked += 1
+                if sats + msats > 0:
+                    funded += 1
+                    log(f"[verify] {addr}: {sats+msats:,} sats — VERIFY MANUALLY")
+                elif tx_count == 0:
+                    never_funded += 1
+                else:
+                    log(f"[verify] {addr}: 0 sats (spent/empty)")
+            except _EsploraRateLimited as e:
+                # Still throttled: re-queue, and store nothing so the badge
+                # stays "not checked yet" rather than "check failed".
+                pending.append(addr)
+                if len(pending) == 1 or len(pending) % 25 == 0:
+                    log(f"[verify] {addr}: {e}")
+            except RuntimeError as e:
+                if "stopped by user" in str(e):
+                    log("[verify] stopped by user")
+                    stopped = True
+                    break
+                errors += 1
+                checked += 1
+                _store_balance_check(addr, 0, 0, 0, str(e))
+                log(f"[verify] {addr}: {e}")
+            except Exception as e:
+                # One bad response must not abort a multi-thousand-address run.
+                errors += 1
+                checked += 1
+                _store_balance_check(addr, 0, 0, 0, str(e))
+                log(f"[verify] {addr}: {e}")
+            report()
+    job["throttled"] = len(pending)
+    report()
+    tail = (f", {len(pending):,} still throttled after {passes} pass(es) — "
+            f"run Check balances again ({_esplora_status()})" if pending else "")
     log(f"[verify] done — {funded:,} with balance, {never_funded:,} never funded, "
-        f"{errors:,} errors")
+        f"{errors:,} errors{tail}")
+
 
 def _sync_busy():
     """Keep the deploy marker and its PID file in sync with the live jobs."""
@@ -1684,7 +1841,7 @@ def _start_job(name, fn, *args):
         job = {"progress": 0.0, "detail": "starting…", "alive": True,
                "stop": False, "log": [], "log_total": 0, "error": "",
                "killed": False, "resetting": False,
-               "auto_verify_skipped": 0,
+               "auto_verify_skipped": 0, "throttled": 0,
                "started": datetime.now(timezone.utc).isoformat()}
         _JOBS[name] = job
     _sync_busy()
@@ -2319,11 +2476,18 @@ def results_page():
              "<button class='btn' onclick=\"verifyBalances(true)\">"
              "Force re-check</button>"
              "<button class='btn danger' onclick=\"stop('verify')\">Stop</button>"
-             f"<p class='muted'>New hits are already checked live. This re-checks "
-             f"saved hit addresses against {html.escape(ESPLORA)}, paced by "
-             "ESPLORA_MIN_INTERVAL and cached per process. Force re-check "
-             "clears that cache. "
+             "<p class='muted'>New hits are already checked live. This re-checks "
+             f"saved hit addresses against {html.escape(_esplora_host(_ESPLORA_BASES[0]))}"
+             + (f" (failing over to "
+                f"{html.escape(', '.join(_esplora_host(b) for b in _ESPLORA_BASES[1:]))})"
+                if len(_ESPLORA_BASES) > 1 else "")
+             + ", paced by ESPLORA_MIN_INTERVAL and cached per process. On "
+               "HTTP 429 that endpoint cools down, the next one is used, and "
+               "the affected addresses are retried in up to "
+             f"{VERIFY_RETRY_PASSES + 1} passes instead of being recorded as "
+               "errors. Force re-check clears that cache. "
              f"Max {VERIFY_MAX_ADDRESSES:,} unique addresses per run.</p>"
+             f"<p class='muted'>Endpoints now: {html.escape(_esplora_status())}</p>"
              "<div class='bar'><div id='bar' style='width:0%'></div></div>"
              "<p id='detail' class='muted'></p><pre id='log'></pre></div>")
     if not rows:
@@ -2374,6 +2538,24 @@ def api_verify():
         _esplora_cache_clear()
     ok, msg = _start_job("verify", verify_result_balances, force)
     return {"ok": ok, "msg": msg}
+
+
+@app.route("/api/esplora")
+def api_esplora():
+    """Live Esplora endpoint health: which base is cooling down, and for how long."""
+    with _RATE_LOCK:
+        interval = _RATE_INTERVAL[0]
+        cached = len(_ESPLORA_CACHE)
+    return {"bases": [{"url": b, "host": _esplora_host(b)} for b in _ESPLORA_BASES],
+            "status": _esplora_status(),
+            "interval_secs": round(interval, 3),
+            "min_interval_secs": ESPLORA_MIN_INTERVAL,
+            "pace_max_secs": ESPLORA_PACE_MAX_SECS,
+            "max_backoff_secs": ESPLORA_MAX_BACKOFF_SECS,
+            "max_retries": ESPLORA_MAX_RETRIES,
+            "cached_responses": cached,
+            "user_agent": _esplora_headers().get("User-Agent", ""),
+            "verify_retry_passes": VERIFY_RETRY_PASSES}
 
 @app.route("/api/results/export")
 def api_results_export():
