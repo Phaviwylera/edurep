@@ -164,6 +164,26 @@ CPU, and a real persistent volume. Note `.python-version` is only used by
 Render; on EC2 the system Python (3.12 on Ubuntu 24.04) is used inside the
 venv, and `requirements.txt` pins the dependencies.
 
+## Verifying a deploy
+
+Every page footer shows `build <commit>` and the process start time, and
+`GET /health` (public, no auth) returns the same id:
+
+```bash
+curl http://127.0.0.1/health
+# {"status":"ok","build":"f5871ab","started":"2026-11-10T05:20:00+00:00"}
+```
+
+If `build` is missing or stale after a merge to `main`, check
+`sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager` and
+`sudo systemctl status btc-hunt-autopull.timer`. A **running job** creates
+`.btc-hunt-busy` and legitimately defers the restart; the footer shows that
+too. `btc-hunt-update` now records `.btc-hunt-deployed` only after a
+successful `install.sh` + restart, so a failed install is retried on the next
+tick instead of being mistaken for "already up to date".
+`sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` redeploys immediately, but
+it **kills any running job** — only use it when no job is active.
+
 ## Bulk nonce-reuse scans
 
 Open `/nonce` and use **Scan file** to upload a `.txt` (or CSV whose first
@@ -240,6 +260,7 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
 | Auto-pull stuck on `job running` | A stale busy marker older than `BUILD_DEADLINE_SECS + 600` (default 130 min) is cleared automatically; `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` forces it immediately |
+| New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |
 | `dataset build exceeded its time budget` | Raise `BUILD_DEADLINE_SECS` in `/etc/btc-hunt.env` and `sudo systemctl restart btc-hunt`; the cached `.gz` is reused, so no re-download is needed. Defaults are now 2 h total / 30 min download |
 | All dataset mirrors failed | LoyceV disabled its `LATEST` direct download (torrent-only); the app now discovers dated snapshots from its index. Paste a working `.gz` URL into the Dataset URL field, set `DATASET_URLS` in `/etc/btc-hunt.env`, or `sudo cp` a dump to `/var/lib/btc-hunt/blockchair.tsv.gz` |
 | 401 after enabling auth | Restart the service; `/etc/btc-hunt.env` is read once at process start |
