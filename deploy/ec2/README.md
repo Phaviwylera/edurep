@@ -193,17 +193,30 @@ ignored. The job shares the single `nonce` slot with single-address scans, so
 the progress bar, log and **Stop** button work; the busy marker also protects
 it from the 2-minute auto-pull restarting a live scan.
 
-Public Blockstream Esplora is rate limited. The app paces requests with
-`ESPLORA_MIN_INTERVAL` (default 0.15 s), caches responses in a bounded LRU and
-retries 429/5xx. Tune these in `/etc/btc-hunt.env` and
+Public Blockstream Esplora is rate limited: ~750 requests (29 addresses ×
+~26 calls) is enough to get a 429. The app paces requests with
+`ESPLORA_MIN_INTERVAL` (default 0.3 s), caches responses in a bounded LRU,
+and on 429/5xx applies a **process-wide cooldown** (honouring `Retry-After`,
+exponential, capped by `ESPLORA_MAX_BACKOFF_SECS=60`) so one rate limit does
+not cascade into thousands of skipped addresses. It doubles the spacing up to
+`ESPLORA_PACE_MAX_SECS=2` and decays it back on success. A rate-limited
+address is retried once and, if still blocked, written to
+`/var/lib/btc-hunt/nonce_retry.txt` for re-upload; the job is flagged
+`partial` rather than claiming 100%. Tune these in `/etc/btc-hunt.env` and
 `sudo systemctl restart btc-hunt`:
 
 ```bash
-ESPLORA_MIN_INTERVAL=0.3
+ESPLORA_MIN_INTERVAL=0.5
+ESPLORA_URLS=https://blockstream.info/api,https://mempool.space/api
 ESPLORA_MAX_RETRIES=3
+ESPLORA_MAX_BACKOFF_SECS=120
 ESPLORA_CACHE_SIZE=8192
 NONCE_MAX_ADDRESSES=10000
 ```
+
+`ESPLORA_URLS` must contain **mainnet** endpoints only. A 3,000-address run
+against the free public APIs takes hours; a local Bitcoin Core node or paid
+RPC is the only fast option.
 
 Only legacy P2PKH spending signatures are parsed today; `bc1...` addresses
 are accepted but segwit witness signatures will not yield `r` values. Hits
@@ -278,6 +291,7 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
 | Auto-pull stuck on `job running` | A stale busy marker older than `BUILD_DEADLINE_SECS + 600` (default 130 min) is cleared automatically; `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` forces it immediately |
+| Bulk nonce scan reports 0 hits but every line after N says `HTTP 429` | The old build counted rate-limited addresses as scanned. Update to the latest `main`: 429 now triggers a global cooldown, blocked addresses are retried and saved to `/var/lib/btc-hunt/nonce_retry.txt`, and the job shows `partial`. Raise `ESPLORA_MIN_INTERVAL` or add `ESPLORA_URLS` |
 | Lots of `★★★ HIT` lines but every address has 0 BTC | These are Bloom false positives. `sudo journalctl -u btc-hunt -f` shows the FP rate; set `BLOOM_FP_RATE=0.000001` (default now), rebuild the bloom on `/data`, and use **Check balances** on `/results` to flag never-funded hits |
 | New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |
 | `dataset build exceeded its time budget` | Raise `BUILD_DEADLINE_SECS` in `/etc/btc-hunt.env` and `sudo systemctl restart btc-hunt`; the cached `.gz` is reused, so no re-download is needed. Defaults are now 2 h total / 30 min download |

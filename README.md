@@ -66,9 +66,12 @@ required for the health check and the public URL to work.
 | `DATASET_VERIFY_CHECKSUM` | `0` | Set to `1` to verify Base58Check checksums on untrusted dumps (slower) |
 | `DATASET_MIN_BALANCE` | `0` | Skip TSV rows with balance ≤ this value; `-1` disables filtering |
 | `DATASET_PREFER_BALANCE_TSV` | `1` | Prefer LoyceV dated balance TSVs; set to `0` to prefer smaller text dumps |
-| `ESPLORA_MIN_INTERVAL` | `0.15` | Minimum seconds between Esplora requests in a bulk nonce scan; `0` disables pacing |
-| `ESPLORA_MAX_RETRIES` | `2` | Extra attempts on HTTP 429/5xx, with short backoff |
+| `ESPLORA_URLS` | `ESPLORA_URL` | Comma-separated **mainnet** Esplora base URLs; rotated after a 429 |
+| `ESPLORA_MIN_INTERVAL` | `0.3` | Minimum seconds between Esplora requests; `0` disables pacing. Doubled on 429 up to `ESPLORA_PACE_MAX_SECS` |
+| `ESPLORA_MAX_RETRIES` | `2` | Extra attempts on HTTP 429/5xx, after the shared cooldown |
 | `ESPLORA_CACHE_SIZE` | `4096` | Bounded in-memory cache of Esplora responses per process |
+| `ESPLORA_MAX_BACKOFF_SECS` | `60` | Cap on the global cooldown after a 429 (or `Retry-After`, if larger) |
+| `ESPLORA_PACE_MAX_SECS` | `2` | Cap on the adaptive inter-request spacing after repeated 429s |
 | `NONCE_MAX_ADDRESSES` | `5000` | Cap on addresses in one bulk upload |
 | `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
 | `BLOOM_FP_RATE` | `0.000001` | Bloom false-positive target; lower = fewer false hits, larger/slower build. Rebuild the bloom after changing it |
@@ -115,13 +118,42 @@ containing `0`.
 
 The scan uses the same `nonce` job as a single-address scan, so the progress
 bar, live log and **Stop** button all work, and only one nonce job can run at a
-time. Requests are paced by `ESPLORA_MIN_INTERVAL`, cached in a bounded
-in-memory LRU and retried on 429/5xx; raise the interval if your Esplora
-instance rate-limits you. A few thousand addresses against the public API
-takes minutes, not seconds. Only **legacy P2PKH spends** are parsed — segwit
-witness signatures are not supported yet. A recovered private key that does
-not reproduce the target address is logged but not saved, so `/results` is not
-flooded with bogus recoveries.
+time. Only **legacy P2PKH spends** are parsed — segwit witness and taproot
+signatures are not supported yet. Esplora's `/address/{addr}/txs` also returns
+just the most recent 25 transactions by default, so heavily used addresses are
+only partly covered. A recovered private key that does not reproduce the target
+address is logged but not saved, so `/results` is not flooded with bogus
+recoveries.
+
+### Rate limiting (HTTP 429)
+
+Each address costs 1 `/address/{addr}/txs` call plus 1 `/tx/{txid}/hex` call
+for every transaction that has a legacy `scriptSig`; 29 addresses × ~26 calls
+is already ~750 requests. Public Esplora instances rate-limit that quickly.
+The client now:
+
+- paces every request with `ESPLORA_MIN_INTERVAL` (default `0.3` s) and caches
+  responses in a bounded LRU;
+- on 429/5xx sets a **process-wide cooldown** (honouring `Retry-After`,
+  otherwise exponential, capped by `ESPLORA_MAX_BACKOFF_SECS`), so one rate
+  limit pauses the whole scan instead of producing thousands of instant
+  failures; doubles the spacing up to `ESPLORA_PACE_MAX_SECS`, then decays it
+  back on success;
+- optionally rotates through `ESPLORA_URLS` (e.g.
+  `https://blockstream.info/api,https://mempool.space/api`) — **mainnet only**;
+  never add a testnet endpoint here;
+- keeps **Stop** responsive during those waits;
+- **never reports a rate-limited address as "0 hits"**. Blocked addresses are
+  retried once after the cooldown; any that still fail are written to
+  `DISK_PATH/nonce_retry.txt` for re-upload, the job is flagged `partial`, and
+  the progress bar stops short of 100%.
+
+A few thousand addresses against the public API takes **hours**, not minutes.
+Raise `ESPLORA_MIN_INTERVAL` or add a second endpoint if you still see 429s.
+For a large list, a local Bitcoin Core node or a paid RPC endpoint is the only
+way to scan it quickly; the public APIs are shared and rate-limited. Modern
+wallets use RFC 6979 deterministic nonces, so reused `r` values are extremely
+rare regardless of throughput.
 
 `/results` shows the newest 500 hits. Use **Download all (JSONL)** or
 **Download nonce results (JSONL)** there to export every hit.

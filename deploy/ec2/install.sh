@@ -147,9 +147,15 @@ PYTHONUNBUFFERED=1
 # Bulk nonce-reuse scans: pace public Esplora requests, cache responses and
 # cap one uploaded address file. Defaults: 0.15 s, 2 retries, 4096 entries,
 # 5000 addresses, 2 MB of text.
-#ESPLORA_MIN_INTERVAL=0.15
+# Optional comma-separated MAINNET Esplora endpoints, rotated after a 429.
+# Never put a testnet endpoint here.
+#ESPLORA_URLS=https://blockstream.info/api,https://mempool.space/api
+#ESPLORA_MIN_INTERVAL=0.3
 #ESPLORA_MAX_RETRIES=2
 #ESPLORA_CACHE_SIZE=4096
+# Global 429 cooldown cap and adaptive spacing cap (seconds).
+#ESPLORA_MAX_BACKOFF_SECS=60
+#ESPLORA_PACE_MAX_SECS=2
 #NONCE_MAX_ADDRESSES=5000
 #NONCE_MAX_UPLOAD_BYTES=2000000
 

