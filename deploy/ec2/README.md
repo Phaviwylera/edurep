@@ -166,23 +166,25 @@ venv, and `requirements.txt` pins the dependencies.
 
 ## Dataset mirrors
 
-`/data` tries, in order: any `DATASET_URLS` you configured, up to six recent
-dated snapshots discovered from the `addresses.loyce.club` HTML index, the
-`privatekeyfinder.io` dumps, then the official (throttled)
-`gz.blockchair.com` dump. LoyceV is first because it is the source proven to
-work from EC2; Cloudflare may 403 `privatekeyfinder.io` from AWS IPs. LoyceV's
-`LATEST` aliases were disabled in 2026 in favour of torrents; the app does not
-run a BitTorrent client, it uses the dated HTTP links from the index. Override
-with a comma-separated `DATASET_URLS=` in `/etc/btc-hunt.env` (then
+`/data` tries, in order: any `DATASET_URLS` you configured, up to four recent
+dated **balance TSVs** discovered from the `addresses.loyce.club` HTML index,
+up to two dated text dumps as fallback, the `privatekeyfinder.io` dumps, then
+the official (throttled) `gz.blockchair.com` dump. LoyceV is first because it
+is the source proven to work from EC2; Cloudflare may 403
+`privatekeyfinder.io` from AWS IPs. LoyceV's `LATEST` aliases were disabled in
+2026 in favour of torrents; the app does not run a BitTorrent client, it uses
+the dated HTTP links from the index. Override with a comma-separated
+`DATASET_URLS=` in `/etc/btc-hunt.env` (then
 `sudo systemctl restart btc-hunt`), or paste one URL into the **Dataset URL**
 box on `/data`. Any gzip containing addresses, `address<TAB>balance` TSV rows,
 `balance<TAB>address` rows, or 40-character hash160 hex lines works. Rows with
 a detected balance ≤ `DATASET_MIN_BALANCE` (default `0`) are skipped; both
 column orders are accepted, and text-only/hex dumps with no balance column are
-kept as-is.
+kept as-is. Set `DATASET_PREFER_BALANCE_TSV=0` in `/etc/btc-hunt.env` and
+restart to prefer the smaller text dump instead.
 
-A ~1.47 GB / ~51M-row LoyceV dump downloads in one piece and then needs two
-CPU-heavy parse passes. Defaults are `DOWNLOAD_DEADLINE_SECS=1800` (30 min)
+A ~1.7 GB / ~51M-row LoyceV balance TSV downloads in one piece and then needs
+two CPU-heavy parse passes. Defaults are `DOWNLOAD_DEADLINE_SECS=1800` (30 min)
 and `BUILD_DEADLINE_SECS=7200` (2 h); raise them in `/etc/btc-hunt.env` and
 restart if your instance is slower. `DATASET_VERIFY_CHECKSUM=1` re-enables
 per-row Base58Check verification for untrusted files. Set
