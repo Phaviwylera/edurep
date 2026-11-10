@@ -143,6 +143,15 @@ PYTHONUNBUFFERED=1
 # Prefer LoyceV dated balance TSVs (default 1). Set to 0 to prefer the
 # smaller text-only dumps. Restart after changing this file.
 #DATASET_PREFER_BALANCE_TSV=1
+
+# Bulk nonce-reuse scans: pace public Esplora requests, cache responses and
+# cap one uploaded address file. Defaults: 0.15 s, 2 retries, 4096 entries,
+# 5000 addresses, 2 MB of text.
+#ESPLORA_MIN_INTERVAL=0.15
+#ESPLORA_MAX_RETRIES=2
+#ESPLORA_CACHE_SIZE=4096
+#NONCE_MAX_ADDRESSES=5000
+#NONCE_MAX_UPLOAD_BYTES=2000000
 EOF
   chmod 0600 "$ENV_FILE"
   log "created $ENV_FILE (add APP_USER / APP_PASSWORD there to require login)"

@@ -66,6 +66,11 @@ required for the health check and the public URL to work.
 | `DATASET_VERIFY_CHECKSUM` | `0` | Set to `1` to verify Base58Check checksums on untrusted dumps (slower) |
 | `DATASET_MIN_BALANCE` | `0` | Skip TSV rows with balance ≤ this value; `-1` disables filtering |
 | `DATASET_PREFER_BALANCE_TSV` | `1` | Prefer LoyceV dated balance TSVs; set to `0` to prefer smaller text dumps |
+| `ESPLORA_MIN_INTERVAL` | `0.15` | Minimum seconds between Esplora requests in a bulk nonce scan; `0` disables pacing |
+| `ESPLORA_MAX_RETRIES` | `2` | Extra attempts on HTTP 429/5xx, with short backoff |
+| `ESPLORA_CACHE_SIZE` | `4096` | Bounded in-memory cache of Esplora responses per process |
+| `NONCE_MAX_ADDRESSES` | `5000` | Cap on addresses in one bulk upload |
+| `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
 | `PORT` | set by Render | Do not override |
 
 `Procfile` contains the same start command for Heroku-style platforms; Render
@@ -94,6 +99,29 @@ uses `startCommand` from the Blueprint.
 
 Data lives on the disk, so it survives redeploys. It does **not** survive
 deleting the service or detaching the disk.
+
+## Bulk nonce-reuse scans
+
+The **Nonce Reuse** tab accepts a `.txt` file with one mainnet address per
+line (a CSV/TSV's first column also works). Blank lines, `#` comments,
+duplicates and anything after the first column (balance, label, ...) are
+ignored; the status message reports how many invalid/duplicate lines were
+skipped. Both legacy `1...`/`3...` and bech32 `bc1...` addresses are accepted —
+the old `[1-9A-HJ-NP-Za-km-z]{2,90}` regex wrongly rejected bech32 addresses
+containing `0`.
+
+The scan uses the same `nonce` job as a single-address scan, so the progress
+bar, live log and **Stop** button all work, and only one nonce job can run at a
+time. Requests are paced by `ESPLORA_MIN_INTERVAL`, cached in a bounded
+in-memory LRU and retried on 429/5xx; raise the interval if your Esplora
+instance rate-limits you. A few thousand addresses against the public API
+takes minutes, not seconds. Only **legacy P2PKH spends** are parsed — segwit
+witness signatures are not supported yet. A recovered private key that does
+not reproduce the target address is logged but not saved, so `/results` is not
+flooded with bogus recoveries.
+
+`/results` shows the newest 500 hits. Use **Download all (JSONL)** or
+**Download nonce results (JSONL)** there to export every hit.
 
 ## Run locally
 
