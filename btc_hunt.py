@@ -232,6 +232,11 @@ ETH_MAX_STEPS       = max(1000, _env_int("ETH_MAX_STEPS", 5_000_000, 1000))
 ETH_MAX_TOTAL_STEPS = max(ETH_MAX_STEPS,
                           _env_int("ETH_MAX_TOTAL_STEPS", 20_000_000, 1000))
 ETH_MAX_WEAK_KEYS   = _env_int("ETH_MAX_WEAK_KEYS", 2_000_000, 1)
+# Default slice of each era taken by one "Era batch" run. The era windows are
+# billions of timestamps wide (Era 3 alone is 63 billion ms), so a batch run
+# sweeps this many steps from the start of each selected era — or from
+# `offset` steps in, which is how a run is resumed after a Stop.
+ETH_ERA_STEPS       = max(1000, _env_int("ETH_ERA_STEPS", 1_000_000, 1000))
 # BIP-39 English wordlist (vendored from bitcoin/bips, sha256 2f5eed53…).
 BIP39_WORDLIST_PATH = Path(os.environ.get(
     "BIP39_WORDLIST_PATH",
@@ -1808,7 +1813,7 @@ def attack_nonce_reuse_bulk(addresses, log, job):
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify",
-             "eth_ts", "eth_weak", "eth_verify", "eth_retry")
+             "eth_ts", "eth_weak", "eth_verify", "eth_retry", "eth_era")
 
 _HITS_FILE = None  # set in worker mode: append-only JSONL of hits
 
@@ -2280,45 +2285,255 @@ def health():
 
 PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
-<title>BTC Hunt</title><style>
-*{box-sizing:border-box;margin:0}body{background:#0b0f14;color:#d8dee9;
-font-family:ui-monospace,Menlo,monospace;padding:20px;max-width:1100px;margin:auto}
-h1{color:#88c0d0;border-bottom:2px solid #3b4252;padding-bottom:8px;margin-bottom:16px}
-h2{color:#81a1c1;margin:16px 0 8px}
-a{color:#88c0d0;text-decoration:none;margin-right:12px}
-a:hover{color:#8fbcbb}
-.card{background:#1e242c;border:1px solid #3b4252;border-radius:6px;padding:14px;
-margin:10px 0}
-.btn{background:#5e81ac;color:#eceff4;border:none;padding:8px 16px;
-border-radius:4px;cursor:pointer;font-family:inherit;font-size:14px}
-.btn:hover{background:#81a1c1}.btn.danger{background:#bf616a}
-input,textarea{background:#2e3440;color:#d8dee9;border:1px solid #4c566a;
-padding:8px;border-radius:4px;width:100%;font-family:inherit;margin:4px 0}
-label{color:#88c0d0;font-size:13px;display:block;margin-top:6px}
-pre{background:#0b0f14;padding:10px;border-radius:4px;overflow:auto;
-max-height:320px;font-size:12px;border:1px solid #3b4252}
-.bar{background:#2e3440;border-radius:4px;height:12px;overflow:hidden;margin:6px 0}
-.bar>div{background:#a3be8c;height:100%;transition:width .3s}
-.hit{color:#ebcb8b;font-weight:bold}
-.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;
-font-weight:bold;border:1px solid}
-.badge.ok{background:#2e3b2b;color:#a3be8c;border-color:#a3be8c}
-.badge.bad{background:#3b2629;color:#bf616a;border-color:#bf616a}
-.badge.warn{background:#3b3326;color:#ebcb8b;border-color:#ebcb8b}
-select{background:#2e3440;color:#d8dee9;border:1px solid #4c566a;padding:8px;
-border-radius:4px;width:100%;font-family:inherit;margin:4px 0}
-.recipes{display:grid;gap:6px;margin:6px 0}
-label.rec{border:1px solid #3b4252;border-radius:6px;padding:8px;background:#141a21;
-color:#d8dee9;font-size:13px;margin-top:0}
-label.rec input{width:auto;margin:0 6px 0 0;vertical-align:middle}
-label.rec b{color:#88c0d0}
-.muted{color:#7b8794;font-size:13px}
-.status-ok{color:#a3be8c}.status-bad{color:#bf616a}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
-.msg{padding:10px;border-radius:4px;margin:10px 0;font-size:13px}
+<title>BTC Hunt — weak-key attack dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+/* ── palette ─────────────────────────────────────────────────────────── */
+:root{
+  --bg:#080b10; --bg2:#0d1219; --panel:#151c25; --panel2:#111821;
+  --line:#26313f; --line2:#334154; --ink:#dce4ee; --dim:#8b9bad;
+  --cy:#63d3e8; --bl:#5b8fd6; --gr:#79d17f; --am:#f0c14b; --rd:#f0687a;
+  --vio:#a98cf0;
+  --r:14px;
+  /* height the locked card headers stick below; refreshSticky() measures the
+     real .topbar and overwrites this, because it wraps with the window width */
+  --stick:112px;
+}
+*{box-sizing:border-box;margin:0}
+html{scroll-behavior:smooth}
+body{
+  background:
+    radial-gradient(1100px 520px at 12% -8%, rgba(99,211,232,.10), transparent 60%),
+    radial-gradient(900px 480px at 92% 4%, rgba(169,140,240,.09), transparent 62%),
+    radial-gradient(700px 700px at 50% 110%, rgba(121,209,127,.06), transparent 60%),
+    linear-gradient(180deg,var(--bg2),var(--bg) 40%);
+  background-attachment:fixed;
+  color:var(--ink); padding:0 20px 40px; max-width:1180px; margin:0 auto;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:14px; line-height:1.55; -webkit-font-smoothing:antialiased;
+}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);
+  background-size:44px 44px;mask-image:radial-gradient(circle at 50% 0%,#000,transparent 78%)}
+a{color:var(--cy);text-decoration:none}
+a:hover{color:#a8ecf8;text-shadow:0 0 12px rgba(99,211,232,.45)}
+hr{border:0;border-top:1px solid var(--line);margin:16px 0}
+code{background:#0a0f15;border:1px solid var(--line);border-radius:5px;
+  padding:1px 5px;color:var(--am);font-size:.92em}
+::selection{background:rgba(99,211,232,.28)}
+
+/* ── sticky, locked header ───────────────────────────────────────────── */
+.topbar{position:sticky;top:0;z-index:60;margin:0 -20px 18px;padding:12px 20px 10px;
+  background:linear-gradient(180deg,rgba(10,14,20,.96),rgba(10,14,20,.80));
+  backdrop-filter:blur(14px) saturate(140%);-webkit-backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--line2);
+  box-shadow:0 12px 30px rgba(0,0,0,.55),0 1px 0 rgba(255,255,255,.05) inset}
+.toprow{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+h1{font-size:19px;letter-spacing:.4px;color:#eaf3fb;
+  text-shadow:0 0 18px rgba(99,211,232,.35),0 2px 0 rgba(0,0,0,.6)}
+h1 .sub{display:block;font-size:11px;font-weight:400;color:var(--dim);
+  letter-spacing:.8px;text-transform:uppercase;text-shadow:none;margin-top:2px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto;align-items:center}
+.chip{font-size:11px;color:var(--dim);background:#0c121a;border:1px solid var(--line);
+  border-radius:999px;padding:3px 9px;white-space:nowrap;
+  box-shadow:0 1px 2px rgba(0,0,0,.5) inset}
+.chip b{color:var(--cy);font-weight:600}
+.chip.warn b{color:var(--am)}
+.nav{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;align-items:center}
+.nav a{position:relative;padding:6px 13px;border-radius:999px;font-size:12.5px;
+  color:#c3d0de;background:linear-gradient(180deg,#1b2431,#141c26);
+  border:1px solid var(--line);text-decoration:none;margin:0;
+  box-shadow:0 2px 5px rgba(0,0,0,.45),0 1px 0 rgba(255,255,255,.06) inset;
+  transition:transform .09s,box-shadow .15s,color .15s,border-color .15s}
+.nav a:hover{transform:translateY(-1px);color:#fff;border-color:var(--line2);
+  box-shadow:0 5px 14px rgba(0,0,0,.55),0 0 0 1px rgba(99,211,232,.22)}
+.nav a:active{transform:translateY(1px)}
+.nav a.on{color:#04121a;font-weight:700;border-color:#8ee6f6;
+  background:linear-gradient(180deg,#8ee6f6,#3fb9d4);
+  box-shadow:0 3px 10px rgba(63,185,212,.4),0 1px 0 rgba(255,255,255,.5) inset;
+  text-shadow:none}
+.nav .spacer{margin-left:auto}
+
+/* ── cards / widgets ─────────────────────────────────────────────────── */
+.card{position:relative;z-index:1;scroll-margin-top:calc(var(--stick) + 14px);
+  background:linear-gradient(180deg,var(--panel),var(--panel2));
+  border:1px solid var(--line);border-radius:var(--r);padding:18px 18px 16px;
+  margin:16px 0;box-shadow:0 14px 34px rgba(0,0,0,.42),
+  0 1px 0 rgba(255,255,255,.045) inset;transition:border-color .2s,box-shadow .2s}
+.card:hover{border-color:var(--line2);box-shadow:0 18px 44px rgba(0,0,0,.5),
+  0 1px 0 rgba(255,255,255,.06) inset}
+.card::before{content:"";position:absolute;left:14px;right:14px;top:0;height:2px;
+  border-radius:0 0 4px 4px;background:linear-gradient(90deg,var(--cy),var(--vio),var(--gr));
+  opacity:.55}
+.card.accent-red::before{background:linear-gradient(90deg,var(--rd),var(--am))}
+.card.accent-green::before{background:linear-gradient(90deg,var(--gr),var(--cy))}
+h2{position:sticky;top:var(--stick);z-index:5;margin:-4px -6px 12px;padding:8px 6px 7px;
+  font-size:14.5px;letter-spacing:.5px;color:#e6f2fb;text-transform:uppercase;
+  background:linear-gradient(180deg,rgba(21,28,37,.98),rgba(21,28,37,.86));
+  backdrop-filter:blur(6px);border-bottom:1px solid var(--line);
+  border-radius:8px 8px 0 0;text-shadow:0 1px 0 rgba(0,0,0,.6)}
+h2 .tag{float:right;font-size:10.5px;letter-spacing:.6px;color:var(--dim);
+  text-transform:none;border:1px solid var(--line);border-radius:999px;padding:2px 8px;
+  background:#0c121a}
+h3{font-size:13px;color:var(--cy);margin:14px 0 6px;letter-spacing:.3px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.muted{color:var(--dim);font-size:12.8px}
+.tiny{color:var(--dim);font-size:11.5px}
+.hit{color:var(--am);font-weight:bold;text-shadow:0 0 14px rgba(240,193,75,.4)}
+.status-ok{color:var(--gr)}.status-bad{color:var(--rd)}
+
+/* ── 3D buttons ──────────────────────────────────────────────────────── */
+.btn{position:relative;display:inline-flex;align-items:center;gap:7px;
+  font-family:inherit;font-size:13px;font-weight:700;letter-spacing:.3px;
+  color:#eef4fb;padding:9px 16px;margin:4px 6px 4px 0;border-radius:11px;
+  border:1px solid #7fa6d8;cursor:pointer;text-shadow:0 1px 1px rgba(0,0,0,.5);
+  background:linear-gradient(180deg,#6f9ad0 0%,#4d78ad 48%,#3d6391 100%);
+  box-shadow:0 1px 0 rgba(255,255,255,.35) inset,0 -2px 0 rgba(0,0,0,.32) inset,
+    0 5px 12px rgba(0,0,0,.5),0 2px 3px rgba(0,0,0,.4);
+  transition:transform .08s ease,box-shadow .15s ease,filter .15s ease}
+.btn:hover{filter:brightness(1.13) saturate(1.08);transform:translateY(-1px);
+  box-shadow:0 1px 0 rgba(255,255,255,.4) inset,0 -2px 0 rgba(0,0,0,.32) inset,
+    0 9px 20px rgba(0,0,0,.55),0 0 0 1px rgba(142,230,246,.35)}
+.btn:active{transform:translateY(2px);filter:brightness(.96);
+  box-shadow:0 1px 0 rgba(255,255,255,.18) inset,0 2px 6px rgba(0,0,0,.6)}
+.btn:focus-visible{outline:2px solid var(--cy);outline-offset:2px}
+.btn.danger{border-color:#e08a95;
+  background:linear-gradient(180deg,#d9707f 0%,#b94f5f 48%,#98384a 100%)}
+.btn.go{border-color:#8fdc9a;
+  background:linear-gradient(180deg,#6fbf7a 0%,#4c9c5c 48%,#3a7c49 100%);color:#06170b;
+  text-shadow:0 1px 0 rgba(255,255,255,.28)}
+.btn.gold{border-color:#e8cd85;
+  background:linear-gradient(180deg,#e6c46a 0%,#c9a243 48%,#a5812f 100%);color:#1b1305;
+  text-shadow:0 1px 0 rgba(255,255,255,.3)}
+.btn.ghost{background:linear-gradient(180deg,#1d2734,#151d27);border-color:var(--line2);
+  color:#c9d6e4;text-shadow:none}
+.btn.ghost:hover{border-color:var(--cy);color:#fff}
+.btn.sm{padding:5px 11px;font-size:11.5px;border-radius:9px;margin:2px 4px 2px 0}
+.btn[disabled]{opacity:.45;cursor:not-allowed;transform:none;filter:grayscale(.5)}
+
+/* ── inputs ──────────────────────────────────────────────────────────── */
+label{display:block;color:var(--cy);font-size:11.5px;letter-spacing:.5px;
+  text-transform:uppercase;margin:12px 0 2px}
+input,textarea,select{width:100%;font-family:inherit;font-size:13.5px;color:var(--ink);
+  background:linear-gradient(180deg,#0b1118,#0e151d);border:1px solid var(--line2);
+  border-radius:9px;padding:9px 10px;margin:3px 0;
+  box-shadow:0 2px 5px rgba(0,0,0,.5) inset,0 1px 0 rgba(255,255,255,.04);
+  transition:border-color .15s,box-shadow .15s}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--cy);
+  box-shadow:0 0 0 3px rgba(99,211,232,.18),0 2px 5px rgba(0,0,0,.5) inset}
+input[type=checkbox]{width:auto;margin:0}
+textarea{resize:vertical;min-height:64px}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--cy) 50%),
+  linear-gradient(135deg,var(--cy) 50%,transparent 50%);
+  background-position:calc(100% - 16px) 55%,calc(100% - 11px) 55%;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.inline{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+
+/* ── era widget ──────────────────────────────────────────────────────── */
+.eras{display:grid;gap:10px;margin:10px 0}
+.era{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;
+  align-items:start;padding:12px 14px;border-radius:12px;
+  border:1px solid var(--line);background:linear-gradient(180deg,#131b24,#0f161e);
+  box-shadow:0 6px 16px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.04) inset;
+  transition:border-color .18s,transform .12s,box-shadow .18s}
+.era:hover{border-color:var(--line2);transform:translateY(-1px)}
+.era.on{border-color:rgba(99,211,232,.55);
+  box-shadow:0 6px 18px rgba(0,0,0,.4),0 0 0 1px rgba(99,211,232,.22),
+  0 1px 0 rgba(255,255,255,.05) inset}
+.era.off{opacity:.62}
+.era>input[type=checkbox]{margin-top:5px;width:17px;height:17px;accent-color:var(--cy)}
+.era .tt{font-weight:700;color:#e8f2fb;font-size:13.5px}
+.era .nn{font-size:11px;letter-spacing:.7px;text-transform:uppercase;color:var(--vio)}
+.era .win{color:var(--dim);font-size:12px}
+.era .ctl{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-top:8px}
+.era .ctl>div{min-width:132px;flex:1 1 132px}
+.era .ctl label{margin:0 0 2px;font-size:10px}
+.era .ctl input{padding:6px 8px;font-size:12.5px}
+.pill{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.4px;
+  padding:2px 8px;border-radius:999px;border:1px solid;margin:2px 4px 2px 0}
+.pill.ok{color:var(--gr);border-color:rgba(121,209,127,.5);background:rgba(121,209,127,.10)}
+.pill.warn{color:var(--am);border-color:rgba(240,193,75,.5);background:rgba(240,193,75,.10)}
+.pill.bad{color:var(--rd);border-color:rgba(240,104,122,.5);background:rgba(240,104,122,.10)}
+.pill.info{color:var(--cy);border-color:rgba(99,211,232,.45);background:rgba(99,211,232,.10)}
+details{margin:6px 0 0;border-top:1px dashed var(--line);padding-top:6px}
+summary{cursor:pointer;color:var(--cy);font-size:11.5px;letter-spacing:.4px;
+  text-transform:uppercase;list-style:none}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"▸ ";color:var(--dim)}
+details[open] summary::before{content:"▾ "}
+details .muted{margin-top:6px}
+
+/* ── recipes ─────────────────────────────────────────────────────────── */
+.recipes{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+  gap:9px;margin:10px 0}
+label.rec{display:block;margin:0;padding:11px 12px;border-radius:11px;text-transform:none;
+  letter-spacing:0;font-size:12.6px;color:var(--ink);border:1px solid var(--line);
+  background:linear-gradient(180deg,#131b24,#0f161e);cursor:pointer;
+  box-shadow:0 4px 12px rgba(0,0,0,.32),0 1px 0 rgba(255,255,255,.04) inset;
+  transition:border-color .18s,opacity .18s,transform .12s}
+label.rec:hover{border-color:var(--line2);transform:translateY(-1px)}
+label.rec.sel{border-color:rgba(121,209,127,.6);
+  box-shadow:0 4px 14px rgba(0,0,0,.35),0 0 0 1px rgba(121,209,127,.22)}
+label.rec.dim{opacity:.45}
+label.rec input{width:auto;margin:0 7px 0 0;vertical-align:middle;accent-color:var(--gr)}
+label.rec b{color:#e8f2fb}
+
+/* ── progress + logs ─────────────────────────────────────────────────── */
+.bar{position:relative;height:15px;border-radius:999px;margin:9px 0 6px;overflow:hidden;
+  background:linear-gradient(180deg,#080d13,#0c1219);border:1px solid var(--line);
+  box-shadow:0 2px 6px rgba(0,0,0,.6) inset}
+.bar>div{height:100%;width:0;border-radius:999px;position:relative;
+  background:linear-gradient(90deg,#3f8f52,#79d17f 55%,#63d3e8);
+  box-shadow:0 0 14px rgba(121,209,127,.5);transition:width .4s ease}
+.bar>div::after{content:"";position:absolute;inset:0;border-radius:999px;
+  background-image:repeating-linear-gradient(115deg,rgba(255,255,255,.20) 0 9px,
+    transparent 9px 18px);background-size:200% 100%;animation:slide 1.1s linear infinite}
+@keyframes slide{from{background-position:0 0}to{background-position:-36px 0}}
+pre{position:relative;background:linear-gradient(180deg,#070b10,#0a0f15);color:#c6d3e0;
+  border:1px solid var(--line);border-radius:11px;padding:11px 12px;margin:8px 0 0;
+  overflow:auto;max-height:340px;font-size:12px;line-height:1.5;
+  box-shadow:0 6px 18px rgba(0,0,0,.45) inset;white-space:pre-wrap;word-break:break-word}
+pre::-webkit-scrollbar{width:10px;height:10px}
+pre::-webkit-scrollbar-thumb{background:#26313f;border-radius:99px;border:2px solid #0a0f15}
+pre::-webkit-scrollbar-thumb:hover{background:#3a4a5e}
+pre::-webkit-scrollbar-track{background:#0a0f15}
+body::-webkit-scrollbar{width:12px}
+body::-webkit-scrollbar-thumb{background:#222c39;border-radius:99px;border:3px solid var(--bg)}
+body::-webkit-scrollbar-track{background:var(--bg)}
+
+/* ── badges + messages ───────────────────────────────────────────────── */
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;
+  font-weight:700;border:1px solid;letter-spacing:.2px}
+.badge.ok{color:#b6f0bb;border-color:rgba(121,209,127,.6);background:rgba(121,209,127,.13);
+  box-shadow:0 0 14px rgba(121,209,127,.18)}
+.badge.bad{color:#ffc9d1;border-color:rgba(240,104,122,.6);background:rgba(240,104,122,.13);
+  box-shadow:0 0 14px rgba(240,104,122,.16)}
+.badge.warn{color:#ffe6a8;border-color:rgba(240,193,75,.6);background:rgba(240,193,75,.13);
+  box-shadow:0 0 14px rgba(240,193,75,.16)}
+.msg{padding:11px 13px;border-radius:11px;margin:12px 0;font-size:13px;
+  border:1px solid transparent;box-shadow:0 6px 18px rgba(0,0,0,.35)}
 .msg:empty{display:none}
-.msg.ok{background:#2e3b2b;color:#a3be8c;border:1px solid #a3be8c}
-.msg.err{background:#3b2629;color:#bf616a;border:1px solid #bf616a}
+.msg.ok{color:#c8f5cd;background:linear-gradient(180deg,rgba(121,209,127,.16),rgba(121,209,127,.07));
+  border-color:rgba(121,209,127,.5)}
+.msg.err{color:#ffd7dd;background:linear-gradient(180deg,rgba(240,104,122,.16),rgba(240,104,122,.07));
+  border-color:rgba(240,104,122,.5)}
+.footer{color:var(--dim);font-size:11.5px;text-align:center;padding-top:6px}
+.footer b{color:var(--cy)}
+
+@media (max-width:760px){
+  body{padding:0 12px 28px}
+  .topbar{margin:0 -12px 14px;padding:10px 12px 8px}
+  :root{--stick:158px}
+  .chips{margin-left:0;width:100%}
+  .grid,.recipes{grid-template-columns:1fr}
+  .era{grid-template-columns:auto minmax(0,1fr)}
+}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *{animation:none!important;transition:none!important}
+}
 </style>
 <script>
 // Short JSON polls instead of long-lived SSE streams. SSE generators used to
@@ -2351,6 +2566,30 @@ function killAll(){
     if(d.ok && !d.restarting) location.reload();
   });
 }
+// The card headers lock to the bottom edge of the sticky bar, so --stick has
+// to be that bar's real height: it wraps differently per page and per width.
+function refreshSticky(){
+  const bar=document.querySelector('.topbar');
+  if(bar) document.documentElement.style.setProperty(
+    '--stick', (bar.offsetHeight+10)+'px');
+}
+refreshSticky();
+window.addEventListener('resize', refreshSticky);
+window.addEventListener('load', refreshSticky);
+// Sticky-header status chip: how many jobs are alive, on every page.
+function refreshChip(){
+  fetch('/api/jobs',{cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      const el=document.querySelector('#jobs-chip b');
+      if(!el) return;
+      const jobs=d.jobs||{}; let n=0;
+      Object.keys(jobs).forEach(function(k){ if(jobs[k].alive) n++; });
+      el.textContent=n?(n+' running'):'idle';
+      el.style.color=n?'#f0c14b':'#79d17f';
+    }).catch(function(){});
+}
+refreshChip(); setInterval(refreshChip, 3000);
 function watch(name, sfx){
   sfx=sfx||'';
   let since=0, lines=[], delay=1000;
@@ -2383,19 +2622,46 @@ function watch(name, sfx){
 }
 </script>
 </head><body>
-<h1>₿ BTC Hunt — pre-2015 attack dashboard</h1>
-<p><a href="/">home</a><a href="/data">dataset</a>
-<a href="/randstorm">randstorm</a><a href="/brain">brainwallet</a>
-<a href="/nonce">nonce reuse</a><a href="/eth">ethereum</a>
-<a href="/results">results</a>
-<button class="btn danger" style="float:right;padding:4px 10px;font-size:12px" onclick="killAll()">Kill all jobs</button></p>
-<hr style="border-color:#3b4252;margin:14px 0">
+<header class="topbar">
+<div class="toprow">
+<h1>₿ BTC Hunt<span class="sub">weak-key &amp; timestamp attack dashboard ·
+BTC + ETH</span></h1>
+<div class="chips">
+<span class="chip">build <b>{build_id}</b></span>
+<span class="chip">ec <b>{ec_backend}</b></span>
+<span class="chip">keccak <b>{keccak_backend}</b></span>
+<span class="chip" id="jobs-chip">jobs <b>…</b></span>
+</div>
+</div>
+<nav class="nav">{nav}<span class="spacer"></span>
+<button class="btn danger sm" onclick="killAll()">⏻ Kill all jobs</button></nav>
+</header>
 <div id="msg" class="msg"></div>
 {body}
-<hr style="border-color:#3b4252;margin:14px 0">
-<p class="muted">build {build_id} · started {started_at} · EC {ec_backend}{deploy_note}</p>
+<hr>
+<p class="footer">build <b>{build_id}</b> · started {started_at} · EC
+{ec_backend} · keccak {keccak_backend}{deploy_note}</p>
 </body></html>
 """
+
+NAV_ITEMS = (("/", "home"), ("/data", "dataset"), ("/randstorm", "randstorm"),
+             ("/brain", "brainwallet"), ("/nonce", "nonce reuse"),
+             ("/eth", "ethereum"), ("/results", "results"))
+
+
+def _nav_html():
+    """Nav pills with the current page marked, so the locked header orients."""
+    try:
+        here = request.path or "/"
+    except Exception:
+        here = "/"
+    out = []
+    for path, label in NAV_ITEMS:
+        on = (here == path) or (path != "/" and here.startswith(path + "/"))
+        out.append('<a href="%s"%s>%s</a>'
+                   % (path, ' class="on"' if on else "", html.escape(label)))
+    return "".join(out)
+
 
 def page(body):
     note = ""
@@ -2407,9 +2673,11 @@ def page(body):
         except OSError:
             note = " · auto-deploy deferred while a job runs"
     return (PAGE.replace("{body}", body)
+                .replace("{nav}", _nav_html())
                 .replace("{build_id}", html.escape(BUILD_ID))
                 .replace("{started_at}", html.escape(STARTED_AT))
                 .replace("{ec_backend}", html.escape(EC_BACKEND))
+                .replace("{keccak_backend}", html.escape(ETH_HASH_BACKEND))
                 .replace("{deploy_note}", note))
 
 @app.after_request
@@ -2423,6 +2691,61 @@ def _html_no_store(resp):
 @app.route("/")
 def home():
     dataset = BLOOM_PATH.exists()
+    # Built outside the f-string so the JS braces do not need doubling.
+    era_rows = []
+    for e in ETH_ERAS:
+        span = e["end"] - e["start"] + 1
+        tag = ("<span class='pill bad'>not privkey-recoverable</span>"
+               if not e.get("scannable", True) else
+               ("<span class='pill warn'>%s</span>" % html.escape(e["warn"])
+                if e.get("warn") else
+                "<span class='pill ok'>scannable</span>"))
+        era_rows.append(
+            "<div class='era%s'><div><div class='nn'>%s · unit %s · %s wide"
+            "</div><div class='tt'>%s</div><div class='win'>%s &nbsp;·&nbsp; "
+            "<code>%d</code> → <code>%d</code> %s</div></div></div>" % (
+                " on" if e["default"] else " off", html.escape(e["era"]),
+                html.escape(e["unit"]), format(span, ","),
+                html.escape(e["label"]), html.escape(e["window"]),
+                e["start"], e["end"], tag))
+    default_eras = [e["id"] for e in ETH_ERAS if e["default"]]
+    default_recs = [r for r, v in ETH_RECIPES.items() if v["default"]]
+    era_home = """
+<div class="card accent-green"><h2>Ethereum era batch <span class="tag">fixed
+windows · one job</span></h2>
+<p class="muted">The documented weak-key eras as fixed scan values.
+<b>%(defl)s</b> run in one job, one after another, %(steps)s timestamps each
+(<code>ETH_ERA_STEPS</code>) — a <i>slice</i> of each era, never the whole
+window: Era 3 alone is %(span3)s timestamps wide. Tick, budget and offset each
+era on <a href="/eth#era">/eth</a>.</p>
+<div class="eras">%(rows)s</div>
+<div class="row">
+<button class="btn go" onclick="startEraHome()">▶ Start era batch</button>
+<button class="btn danger" onclick="stop('eth_era')">■ Stop</button>
+<a class="btn ghost sm" href="/eth#era">configure eras</a>
+<span class="tiny">%(neras)s eras · recipes %(recs)s · cap %(cap)s steps/run</span>
+</div>
+<div class="bar"><div id="barEraH" style="width:0%%"></div></div>
+<p id="detailEraH" class="muted"></p><pre id="logEraH"></pre>
+</div>
+<script>
+function startEraHome(){
+  post('/api/eth/era',{eras:%(eras_json)s, recipes:%(recs_json)s,
+                       steps:%(steps_raw)s});
+}
+watch('eth_era','EraH');
+</script>""" % {
+        "defl": html.escape(", ".join(default_eras)),
+        "neras": len(ETH_ERAS),
+        "steps": format(ETH_ERA_STEPS, ","),
+        "steps_raw": ETH_ERA_STEPS,
+        "span3": format(ETH_ERAS[2]["end"] - ETH_ERAS[2]["start"] + 1, ","),
+        "rows": "".join(era_rows),
+        "recs": html.escape(", ".join(default_recs)),
+        "cap": format(ETH_MAX_TOTAL_STEPS, ","),
+        "eras_json": json.dumps(default_eras),
+        "recs_json": json.dumps(default_recs),
+    }
     body = f"""
 <div class="card">
 <h2>Dataset</h2>
@@ -2459,6 +2782,7 @@ candidates are checked live over batched JSON-RPC. Timestamp sweeps
 Mersenne-Twister seed, plus sequential/weak private keys.</p>
 <a class="btn" href="/eth">Open</a></div>
 </div>
+{era_home}
 <script>
 function refreshJobs(){{
   fetch('/api/jobs',{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(function(d){{
@@ -3364,29 +3688,72 @@ ETH_RECIPES = {
 }
 
 # Documented windows, for the preset buttons. Values are exact UTC epochs.
-ETH_PRESETS = [
-    {"id": "tw", "unit": "s", "start": 1669248000, "end": 1671753599,
-     "label": "Trust Wallet ext v2.68 (2022-11-24 → 2022-12-22)",
-     "note": "2,505,600 one-second seeds. The real timestamp-seeded Ethereum "
-             "window; use with the tw_bip39_s / mt19937_s recipes."},
-    {"id": "frontier", "unit": "ms", "start": 1438214400000, "end": 1451606399000,
-     "label": "Frontier era (2015-07-30 → 2015-12-31)",
-     "note": "Weak/brainwallet key generation in the first months of Ethereum. "
-             "13.4 billion ms timestamps — sweep a slice, not the whole thing."},
-    {"id": "cryptojs", "unit": "s", "start": 1514764800, "end": 1577836799,
-     "label": "CryptoJS < 4.2 era (2018 → 2020)",
-     "note": "Wallets whose entropy came from CryptoJS's Math.random-based "
-             "WordArray.random. NOTE: recovering those needs the browser "
-             "PRNG state, not a timestamp sweep — a timestamp recipe will only "
-             "find keys that were also seeded from the clock."},
-    {"id": "presale", "unit": "ms", "start": 1405987200000, "end": 1409702399000,
-     "label": "2014 presale (2014-07-22 → 2014-09-02)",
-     "note": "CAUTION: presale private keys were generated with a real CSPRNG. "
-             "The documented weakness is in the ENCRYPTED KEYSTORE (weak "
-             "password / IV), so a private-key timestamp sweep will not "
-             "recover a presale wallet. Kept here only so the window is not "
-             "mistaken for a scannable one."},
+# Fixed, documented windows. `scannable: False` means the window is listed for
+# completeness but a private-key timestamp sweep CANNOT recover it — the page and
+# the log say so every time, because the alternative is letting someone burn a
+# week of CPU on a window that was never keyed from a clock.
+#
+# Two corrections to the widely copy-pasted era table, kept here so the numbers
+# in this file are the ones actually used:
+#   * Era 3's end is 1577836800000 (2020-01-01 UTC). The circulating value
+#     15778368000000 has one digit too many and lands in the year 2471.
+#   * The CryptoJS bug is CVE-2023-46233 (WordArray.random falling back to
+#     Math.random, fixed in 4.2.0). "CVE-2026-71851" does not exist.
+ETH_ERAS = [
+    {"id": "presale", "era": "Era 1", "unit": "ms",
+     "start": 1405987200000, "end": 1409702399000,
+     "label": "The 2014 presale / ICO genesis",
+     "window": "2014-07-22 → 2014-09-02 (42 days)",
+     "recipes": ["sha256_dec", "keccak_dec", "raw"],
+     "default": False, "scannable": False,
+     "warn": "Will NOT recover a presale wallet",
+     "note": "Presale private keys came from a real CSPRNG. The documented "
+             "weakness is in the ENCRYPTED KEYSTORE (weak password, IV reuse), "
+             "so a browser PRNG that collapsed to a millisecond timestamp "
+             "yields the keystore password/IV — not a private key. Listed so "
+             "the window is not mistaken for a scannable one; sweep it only to "
+             "confirm that it produces nothing."},
+    {"id": "frontier", "era": "Era 2", "unit": "ms",
+     "start": 1438214400000, "end": 1451606399000,
+     "label": "The 2015 Frontier era",
+     "window": "2015-07-30 → 2015-12-31",
+     "recipes": ["sha256_dec", "keccak_dec", "sha256_be8", "raw"],
+     "default": True, "scannable": True, "warn": "",
+     "note": "Weak key generation and early miner/script wallets seeded from "
+             "low-entropy sources, including the clock. 13.4 billion ms "
+             "timestamps: a batch run takes a slice (ETH_ERA_STEPS) from the "
+             "start or from an offset. Note that the keys actually drained in "
+             "2015-2016 were mostly SEQUENTIAL and dictionary keys — that is "
+             "the weak-key card, not this one."},
+    {"id": "cryptojs", "era": "Era 3", "unit": "ms",
+     "start": 1514764800000, "end": 1577836800000,
+     "label": "The CryptoJS Math.random era",
+     "window": "2018-01-01 → 2020-01-01",
+     "recipes": ["sha256_dec", "keccak_dec", "mt19937_s"],
+     "default": True, "scannable": True,
+     "warn": "Timestamp recipes only find clock-seeded keys",
+     "note": "CVE-2023-46233: CryptoJS < 4.2.0 made WordArray.random fall back "
+             "to Math.random, so seed phrases came from the browser PRNG. "
+             "Recovering those wallets means reconstructing the PRNG STATE "
+             "(V8 xorshift128+, or MWC1616 in older engines), which is a "
+             "different attack — a timestamp sweep only finds wallets whose "
+             "entropy was ALSO the clock. The often-quoted id "
+             "\"CVE-2026-71851\" does not exist, and the often-quoted end "
+             "15778368000000 is one digit too many (year 2471)."},
+    {"id": "tw", "era": "Era 4", "unit": "s",
+     "start": 1669248000, "end": 1671753599,
+     "label": "Trust Wallet Extension v2.68",
+     "window": "2022-11-24 → 2022-12-22",
+     "recipes": ["tw_bip39_s", "mt19937_s"],
+     "default": True, "scannable": True, "warn": "",
+     "note": "The one documented timestamp-seeded Ethereum bug: MT19937 seeded "
+             "with Unix SECONDS instead of a CSPRNG. 2,505,600 candidate seeds "
+             "— the only window here that fits in a single run. The exact order "
+             "in which the vulnerable library consumed MT output is not "
+             "publicly documented, so a miss means \"this recipe shape did not "
+             "match\", not \"the window is safe\"."},
 ]
+ETH_PRESETS = ETH_ERAS          # older name, same table
 
 _range_chunks = _randstorm_chunks        # generic inclusive chunker
 
@@ -4024,8 +4391,20 @@ def _eth_candidate(rid, priv, extra, attack, ts=None, unit=None):
     return hit
 
 
-def attack_eth_timestamp(start, end, unit, recipe_ids, log, job):
-    """Sweep a timestamp range through the selected weak-generator recipes."""
+def attack_eth_timestamp(start, end, unit, recipe_ids, log, job,
+                         p_base=0.0, p_span=1.0, label=""):
+    """Sweep a timestamp range through the selected weak-generator recipes.
+
+    `p_base`/`p_span` map this range onto a slice of the job's progress bar so
+    the era batch can sweep several windows in one run, and `label` prefixes
+    every log line so a batch run stays readable.
+    """
+    if label:
+        _outer_log = log
+
+        def log(msg, _o=_outer_log, _p=label):
+            _o(_p + msg)
+
     ids = [r for r in (recipe_ids or [])
            if r in ETH_RECIPES and unit in ETH_RECIPES[r]["units"]]
     if not ids:
@@ -4096,7 +4475,8 @@ def attack_eth_timestamp(start, end, unit, recipe_ids, log, job):
                 elapsed = max(time.time() - t0, 0.001)
                 rate = (base_done + i + 1) / elapsed
                 left = total - (base_done + i + 1)
-                job["progress"] = min(1.0, (base_done + i + 1) / total)
+                job["progress"] = min(1.0, p_base + p_span *
+                                      (base_done + i + 1) / total)
                 job["detail"] = ("%s/%s ts  chunk %d/%d  %.0f ts/s  %d "
                                  "recipe(s)  hits=%d  queued=%s  throttled=%s  "
                                  "batch=%d  eta ~%.1f min"
@@ -4122,6 +4502,99 @@ def attack_eth_timestamp(start, end, unit, recipe_ids, log, job):
            format(job.get("eth_queued", 0), ","), _eth_pending_path(),
            format(job.get("eth_dropped", 0), ","),
            format(job.get("eth_unchecked", 0), ",")))
+    return hits
+
+
+def attack_eth_eras(specs, recipe_ids, log, job):
+    """Sweep several fixed era windows in one run, one after another.
+
+    `specs` is a list of {"id", "steps", "offset"} from the UI. Eras run
+    SEQUENTIALLY inside this job on purpose: the RPC endpoint — not the CPU — is
+    the bottleneck, so parallel era jobs would multiply 429s without finding
+    anything faster, and one job keeps one progress bar, one Stop button and one
+    retry queue.
+    """
+    by_id = {e["id"]: e for e in ETH_ERAS}
+    picked = []
+    for s in specs or []:
+        e = by_id.get(str(s.get("id") or ""))
+        if not e:
+            log("[era] unknown era id %r — skipped" % (s.get("id"),))
+            continue
+        try:
+            steps = max(1, int(s.get("steps") or ETH_ERA_STEPS))
+            offset = max(0, int(s.get("offset") or 0))
+        except (TypeError, ValueError):
+            log("[era] %s: steps/offset must be integers — skipped" % e["id"])
+            continue
+        picked.append((e, steps, offset))
+    if not picked:
+        log("[era] no eras selected — nothing to do")
+        job["detail"] = "no eras selected"
+        return []
+    n = len(picked)
+    ids = [r for r in (recipe_ids or []) if r in ETH_RECIPES]
+    log("[era] batch of %d era(s), recipes: %s  EC: %s  hash: %s"
+        % (n, ", ".join(ids) or "none", EC_BACKEND, ETH_HASH_BACKEND))
+    log("[era] eras run one after another in this job: the RPC endpoint is the "
+        "bottleneck, so parallel eras would only multiply 429s.")
+    hits = []
+    done_eras = 0
+    broke = False
+    for k, (e, steps, offset) in enumerate(picked, 1):
+        if job["stop"]:
+            log("[era] stopped before %s" % e["id"])
+            break
+        label = "[era %d/%d · %s %s] " % (k, n, e["era"], e["id"])
+        usable = [r for r in ids if e["unit"] in ETH_RECIPES[r]["units"]]
+        if not usable:
+            log("%sno selected recipe accepts unit=%s — skipped (recipes for "
+                "this era: %s)" % (label, e["unit"], ", ".join(e["recipes"])))
+            continue
+        start = e["start"] + offset
+        if start > e["end"]:
+            log("%soffset %s is past the end of the window — skipped"
+                % (label, format(offset, ",")))
+            continue
+        end = min(e["end"], start + steps - 1)
+        span = e["end"] - e["start"] + 1
+        covered = end - start + 1
+        log("%s%s — %s" % (label, e["label"], e["window"]))
+        log("%s%d..%d %s: %s of %s timestamps in this era (%.6f%% of the "
+            "window), offset %s"
+            % (label, start, end, e["unit"], format(covered, ","),
+               format(span, ","), 100.0 * covered / span, format(offset, ",")))
+        if e.get("warn"):
+            log("%s⚠ %s — %s" % (label, e["warn"], e["note"]))
+        if not e.get("scannable", True):
+            log("%s⚠ this window is NOT recoverable by a private-key sweep; it "
+                "is scanned only to demonstrate that." % label)
+        hits += attack_eth_timestamp(start, end, e["unit"], usable, log, job,
+                                     p_base=(k - 1) / n, p_span=1.0 / n,
+                                     label=label)
+        # keep the era visible in the job detail the sticky header chip shows
+        job["detail"] = "%s %s" % (e["era"], job.get("detail") or "")
+        done_eras += 1
+        # Both signals mean the same thing: nothing could be checked. `eth_no_rpc`
+        # is set when every endpoint refuses mid-batch; `eth_rpc_alive == 0` when
+        # the pre-flight probe found none answering at all.
+        if job.get("eth_no_rpc") or job.get("eth_rpc_alive") == 0:
+            broke = True
+            log("[era] stopping the batch: no RPC endpoint answered — the "
+                "remaining era(s) would only derive candidates nobody can "
+                "check. Anything already derived is in %s."
+                % _eth_pending_path())
+            break
+    if job["stop"] or broke:
+        # Not finished: leave the bar where the run actually got to.
+        job["progress"] = min(1.0, max(job.get("progress", 0.0), done_eras / n))
+    else:
+        job["progress"] = 1.0
+    log("[era] batch done — %d of %d era(s) swept, %d hit(s), %s empty skipped, "
+        "%s queued for re-check in %s%s"
+        % (done_eras, n, len(hits), format(job.get("eth_skipped", 0), ","),
+           format(job.get("eth_queued", 0), ","), _eth_pending_path(),
+           "" if not broke else "  (stopped early: no RPC endpoint)"))
     return hits
 
 
@@ -4391,63 +4864,168 @@ def _eth_ping_base(base):
 
 @app.route("/eth")
 def eth_page():
+    # ── recipe widget (shared by the era batch and the manual sweep) ──────
     rec = []
     for rid, r in ETH_RECIPES.items():
         rec.append(
-            "<label class='rec' data-units='%s'><input type='checkbox' "
-            "name='eth_recipe' value='%s'%s> <b>%s</b> "
-            "<span class='muted'>[%s]</span><br><span class='muted'>%s</span>"
-            "</label>" % (
+            "<label class='rec%s' data-units='%s' data-rid='%s'>"
+            "<input type='checkbox' name='eth_recipe' value='%s'%s>"
+            "<b>%s</b> <span class='pill info'>%s</span>"
+            "<div class='muted'>%s</div></label>" % (
+                " sel" if r["default"] else "",
                 html.escape(",".join(r["units"])), html.escape(rid),
-                " checked" if r["default"] else "", html.escape(r["label"]),
-                html.escape("/".join(r["units"])), html.escape(r["note"])))
+                html.escape(rid), " checked" if r["default"] else "",
+                html.escape(r["label"]), html.escape("/".join(r["units"])),
+                html.escape(r["note"])))
+
+    # ── era widget rows ───────────────────────────────────────────────────
+    eras = []
+    for e in ETH_ERAS:
+        span = e["end"] - e["start"] + 1
+        if not e.get("scannable", True):
+            warn = "<span class='pill bad'>%s</span>" % html.escape(e["warn"])
+        elif e.get("warn"):
+            warn = "<span class='pill warn'>%s</span>" % html.escape(e["warn"])
+        else:
+            warn = "<span class='pill ok'>timestamp-seeded — scannable</span>"
+        eras.append(
+            "<div class='era%s' id='era-%s'>"
+            "<input type='checkbox' class='erack' id='ck-%s' value='%s'%s "
+            "onchange='eraToggle()'>"
+            "<div>"
+            "<div class='nn'>%s · unit %s · <b>%s</b> timestamps wide</div>"
+            "<div class='tt'>%s</div>"
+            "<div class='win'>%s &nbsp;·&nbsp; %s → %s</div>"
+            "<div>%s</div>"
+            "<div class='ctl'>"
+            "<div><label>steps for this era</label>"
+            "<input id='st-%s' value='%d' oninput='eraTotal()'></div>"
+            "<div><label>offset into the era</label>"
+            "<input id='of-%s' value='0' oninput='eraTotal()'></div>"
+            "<div><label>load into manual sweep</label>"
+            "<button class='btn ghost sm' onclick=\"eraManual('%s')\">"
+            "↳ manual fields</button>"
+            "<button class='btn ghost sm' onclick=\"eraWhole('%s')\">"
+            "whole era</button></div>"
+            "</div>"
+            "<details><summary>what this window can and cannot find</summary>"
+            "<div class='muted'>%s</div></details>"
+            "</div></div>" % (
+                "" if e["default"] else " off", html.escape(e["id"]),
+                html.escape(e["id"]), html.escape(e["id"]),
+                " checked" if e["default"] else "",
+                html.escape(e["era"]), html.escape(e["unit"]),
+                format(span, ","), html.escape(e["label"]),
+                html.escape(e["window"]), format(e["start"], ","),
+                format(e["end"], ","), warn,
+                html.escape(e["id"]), ETH_ERA_STEPS, html.escape(e["id"]),
+                html.escape(e["id"]), html.escape(e["id"]),
+                html.escape(e["note"])))
+
+    # ── quick presets for the manual sweep ────────────────────────────────
     presets = []
-    for p in ETH_PRESETS:
+    for p in ETH_ERAS:
         presets.append(
-            "<button class='btn' onclick=\"preset('%s','%s',%d,%d)\" "
-            "title='%s'>%s</button>" % (
+            "<button class='btn ghost sm' onclick=\"preset('%s','%s',%d,%d)\" "
+            "title='%s — loads into Start/End/Unit below'>%s · %s</button>" % (
                 p["id"], p["unit"], p["start"], p["end"],
-                html.escape(p["note"]), html.escape(p["label"])))
+                html.escape(p["window"]), html.escape(p["era"]),
+                html.escape(p["label"])))
+
     body = """
-<div class="card"><h2>Ethereum — timestamp sweep</h2>
-<p class="muted">Ethereum uses the same curve as Bitcoin (secp256k1), so a weak
-key generator is swept the same way — but there is <b>no bloom filter</b> here:
-every derived address is checked live over JSON-RPC, batched
-{batch} addresses ({calls} calls) per request. A timestamp is a <b>seed for a
-broken generator, never a private key</b>: pick the recipe that reproduces the
-generator you are sweeping. Unit matters — the Trust Wallet bug was seeded in
-<b>seconds</b>, BitcoinJS-lib in <b>milliseconds</b>.</p>
-<label>Unit</label>
+<div class="card accent-green" id="era"><h2>1 · Era batch — fixed windows
+<span class="tag">one job, eras in sequence</span></h2>
+<p class="muted">The documented weak-key eras, as fixed scan values. Tick the
+eras you want, give each one a <b>steps</b> budget (how many timestamps to take,
+from <b>offset</b> steps into the window), pick the recipes below, and press
+<b>Start era batch</b>. All selected eras run inside <b>one</b> job, one after
+another: the RPC endpoint — not the CPU — is the bottleneck, so parallel era
+jobs would only multiply 429s, and one job means one progress bar, one Stop
+button and one retry queue.</p>
+<p class="muted"><b>Be honest with yourself about scale.</b> Era 1 is
+{span1} timestamps wide, Era 2 {span2} and Era 3 {span3}. A batch run takes
+<i>steps</i> from each era, not the whole era: the default {erasteps} steps per
+era is one timestamp in {ratio3} of Era 3 ({cover3}%). The whole of Era 3 is <b>{days3} days of pure
+CPU</b> at ~{rate} candidates/s, and it would need <b>{reqs3} batch
+requests</b> — about {rpcyears3} years at a sustainable 5 requests/s from a
+public endpoint. That is why <code>ETH_MAX_TOTAL_STEPS</code> ({maxtotal})
+exists, and why the log prints the exact slice and the percentage of the window
+each run covered. Use the batch to <i>sample</i> an era, and the offset field to
+walk through it run by run: <code>offset + steps</code> is where the next run
+starts.</p>
+<div class="eras">{eras}</div>
+<div class="row">
+<button class="btn go" onclick="startEra()">▶ Start era batch</button>
+<button class="btn danger" onclick="stop('eth_era')">■ Stop</button>
+<button class="btn ghost sm" onclick="selScannable()">select scannable</button>
+<button class="btn ghost sm" onclick="clearEras()">clear</button>
+<button class="btn ghost sm" onclick="allSteps({erasteps})">steps = {erasteps}</button>
+<span id="eraTotal" class="pill ok">0 steps total</span>
+<span class="tiny">cap {maxtotal} steps per run (<code>ETH_MAX_TOTAL_STEPS</code>)</span>
+</div>
+<div class="bar"><div id="barEra" style="width:0%"></div></div>
+<p id="detailEra" class="muted"></p><pre id="logEra"></pre>
+</div>
+
+<div class="card"><h2>2 · Recipes — what a timestamp is fed into
+<span class="tag">shared by every ETH run</span></h2>
+<p class="muted">A timestamp is a <b>seed for a broken generator, never a private
+key</b>. Each recipe reproduces one specific generator and declares the unit it
+was fed; the era batch filters them per era automatically (Era 1–3 are
+milliseconds, the Trust Wallet window is seconds), and the manual sweep dims the
+ones that do not accept its unit.</p>
+<div class="recipes">{recipes}</div>
+</div>
+
+<div class="card" id="manualcard"><h2>3 · Manual timestamp sweep
+<span class="tag">any range, any unit</span></h2>
+<p class="muted">Same curve as Bitcoin (secp256k1), Keccak-256 addresses, and
+<b>no bloom filter</b>: every derived address is checked live over JSON-RPC,
+batched {batch} addresses ({calls} calls) per request. Use this for a range that
+is not one of the fixed eras, or after loading an era with
+<b>↳ manual fields</b>.</p>
+<div class="inline">
+<div><label>Unit</label>
 <select id="unit" onchange="unitChanged()">
 <option value="s">seconds</option>
 <option value="ms">milliseconds</option>
-</select>
-<label>Start</label><input id="s" value="1669248000">
-<label>End</label><input id="e" value="1671753599">
-<p>{presets}</p>
-<p class="muted">One run may span at most {maxtotal} steps
-({maxsteps} per chunk, split automatically). Recipes:</p>
-<div class="recipes">{recipes}</div>
-<button class="btn" onclick="startTs()">Start</button>
-<button class="btn danger" onclick="stop('eth_ts')">Stop</button>
+</select></div>
+<div><label>Start</label><input id="s" value="1669248000"></div>
+<div><label>End</label><input id="e" value="1671753599"></div>
+</div>
+<p class="row">{presets}</p>
+<p class="muted">One run may span at most {maxtotal} steps ({maxsteps} per
+chunk, split automatically).</p>
+<div class="row">
+<button class="btn go" onclick="startTs()">▶ Start</button>
+<button class="btn danger" onclick="stop('eth_ts')">■ Stop</button>
+</div>
 <div class="bar"><div id="barTs" style="width:0%"></div></div>
 <p id="detailTs" class="muted"></p><pre id="logTs"></pre>
 </div>
-<div class="card"><h2>Ethereum — weak &amp; sequential keys</h2>
-<p class="muted">The 2015–2016 "ethercombing" vector: private keys that are
-small integers (1, 2, 3, …) or trivial values, drained en masse by an automated
-scanner. No timestamp is involved. Sequential keys cost one derivation each
-(~2,300/s with native Keccak), so 100,000 keys is about a minute of work plus
-RPC time.</p>
-<label>Sequential keys to try (1..N)</label><input id="n" value="10000">
+
+<div class="card accent-red"><h2>4 · Weak &amp; sequential keys
+<span class="tag">the ethercombing vector</span></h2>
+<p class="muted">The 2015–2016 "ethercombing" drain used private keys that are
+<b>small integers</b> (1, 2, 3, …) or trivial values — no timestamp involved, and
+it is the only Ethereum vector on this page known to have actually paid out.
+Sequential keys cost one derivation each (~{weakrate}/s with native Keccak), so
+100,000 keys is about a minute of work plus RPC time.</p>
+<div class="inline">
+<div><label>Sequential keys to try (1..N)</label><input id="n" value="10000"></div>
+</div>
 <label>Extra private keys (one hex per line, optional)</label>
 <textarea id="keys" rows="4" placeholder="0x1&#10;deadbeef…"></textarea>
-<button class="btn" onclick="startWk()">Start</button>
-<button class="btn danger" onclick="stop('eth_weak')">Stop</button>
+<div class="row">
+<button class="btn go" onclick="startWk()">▶ Start</button>
+<button class="btn danger" onclick="stop('eth_weak')">■ Stop</button>
+</div>
 <div class="bar"><div id="barWk" style="width:0%"></div></div>
 <p id="detailWk" class="muted"></p><pre id="logWk"></pre>
 </div>
-<div class="card"><h2>RPC endpoints</h2>
+
+<div class="card"><h2>5 · RPC endpoints <span class="tag">the real
+bottleneck</span></h2>
 <p class="muted">Balances come from {bases}. Every run starts with a
 <b>pre-flight probe</b> of those endpoints and uses only the ones that answer:
 public endpoints reject datacenter traffic with HTTP 403 about as readily as
@@ -4456,15 +5034,21 @@ they rate-limit it. A 429/5xx parks that endpoint and fails over to the next; a
 <b>stops</b> instead of deriving candidates nobody can check. Batches start at
 {batch} addresses ({calls} calls) and halve automatically when an endpoint
 refuses arrays or a large batch. Set <code>ETH_RPC_URLS</code> to your own node —
-that is the only way to sweep millions of candidates quickly. Test them first:</p>
-<button class="btn" onclick="pingRpc()">Test RPC</button>
+that is the only way to sweep millions of candidates quickly. Test them
+first:</p>
+<div class="row"><button class="btn" onclick="pingRpc()">⇄ Test RPC</button>
+<span class="tiny">eth_blockNumber + a small batch probe per endpoint</span></div>
 <pre id="rpc">not tested</pre>
-<p class="muted">EC backend: {ec} · Keccak: {hashb} · min balance to save:
-{minwei} wei · batch now: <span id="batchNow">{batch}</span> addresses ·
-endpoints: <span id="rpcState">{rpcstate}</span> · verify on:
+<p class="muted">EC backend: <span class="pill info">{ec}</span> Keccak:
+<span class="pill info">{hashb}</span> min balance to save:
+<span class="pill info">{minwei} wei</span> batch now:
+<span class="pill info"><span id="batchNow">{batch}</span> addresses</span>
+endpoints: <span id="rpcState">{rpcstate}</span> · saved hits are re-checked on
 <a href="/results">/results</a> (Check ETH balances)</p>
 </div>
-<div class="card"><h2>Queued candidates</h2>
+
+<div class="card"><h2>6 · Queued candidates <span class="tag">never
+dropped</span></h2>
 <p class="muted">A batch that cannot be checked — throttled, refused, or caught
 by a Stop mid-run — is <b>appended to <code>{pendingfile}</code> instead of
 being thrown away</b>. Derivation is the expensive part (up to ~2.7 ms per
@@ -4474,26 +5058,85 @@ payload a live sweep would have produced. <b><span
 id="pendingN">{pendingn}</span></b> candidate(s) are queued now (cap
 {pendingmax}, <code>ETH_PENDING_MAX</code>; beyond it, candidates are counted as
 dropped and the log says so).</p>
-<button class="btn" onclick="retryQueued()">Re-check queued candidates</button>
-<button class="btn danger" onclick="stop('eth_retry')">Stop</button>
-<button class="btn" onclick="refreshPending()">Refresh count</button>
+<div class="row">
+<button class="btn gold" onclick="retryQueued()">↻ Re-check queued
+candidates</button>
+<button class="btn danger" onclick="stop('eth_retry')">■ Stop</button>
+<button class="btn ghost sm" onclick="refreshPending()">refresh count</button>
+</div>
 <div class="bar"><div id="barQ" style="width:0%"></div></div>
 <p id="detailQ" class="muted"></p><pre id="logQ"></pre>
 </div>
 <script>
+const ERAS={eras_json};
+const CAP={maxtotal_raw};
+const NL=String.fromCharCode(10);
+function fmt(n){ return (n||0).toLocaleString('en-US'); }
+function $(id){ return document.getElementById(id); }
+function each(sel,fn){ Array.prototype.slice.call(document.querySelectorAll(sel)).forEach(fn); }
+function eraToggle(){
+  each('.erack',function(c){
+    const row=$('era-'+c.value);
+    if(row){ row.classList.toggle('on',c.checked); row.classList.toggle('off',!c.checked); }
+  });
+  eraTotal();
+}
+function eraTotal(){
+  let sum=0;
+  each('.erack:checked',function(c){
+    sum += parseInt(($('st-'+c.value)||{}).value||'0',10)||0;
+  });
+  const el=$('eraTotal');
+  if(el){ el.textContent=fmt(sum)+' steps total'+(sum>CAP?' — OVER CAP':'');
+          el.className='pill '+(sum>CAP?'bad':(sum?'ok':'warn')); }
+}
+function allSteps(n){
+  each('.erack',function(c){ const el=$('st-'+c.value); if(el) el.value=n; });
+  eraTotal();
+}
+function selScannable(){
+  each('.erack',function(c){
+    const e=ERAS[c.value]; c.checked = !!(e && e.scannable);
+  });
+  eraToggle();
+}
+function clearEras(){ each('.erack',function(c){ c.checked=false; }); eraToggle(); }
+function eraWhole(id){
+  const e=ERAS[id]; if(!e) return;
+  const el=$('st-'+id); if(el) el.value=e.span;
+  eraTotal();
+  notify('whole '+e.era+' = '+fmt(e.span)+' steps'+
+    (e.span>CAP?' — over the '+fmt(CAP)+' cap, so select fewer eras or raise ETH_MAX_TOTAL_STEPS':''),
+    e.span<=CAP);
+}
+function eraManual(id){
+  const e=ERAS[id]; if(!e) return;
+  $('unit').value=e.unit; $('s').value=e.start; $('e').value=e.end;
+  each('input[name=eth_recipe]',function(c){
+    const units=((c.parentNode.getAttribute('data-units'))||'').split(',');
+    if(e.recipes.indexOf(c.value)>=0 && units.indexOf(e.unit)>=0) c.checked=true;
+  });
+  recSel(); unitChanged();
+  const card=$('manualcard');
+  if(card) card.scrollIntoView({behavior:'smooth',block:'start'});
+  notify(e.era+' ('+id+') loaded into the manual sweep — unit '+e.unit, true);
+}
 function preset(id,unit,s,e){
-  document.getElementById('unit').value=unit;
-  document.getElementById('s').value=s;
-  document.getElementById('e').value=e;
-  unitChanged();
+  $('unit').value=unit; $('s').value=s; $('e').value=e; unitChanged();
+  const card=$('manualcard');
+  if(card) card.scrollIntoView({behavior:'smooth',block:'start'});
 }
 function unitChanged(){
-  const u=document.getElementById('unit').value;
-  document.querySelectorAll('label.rec').forEach(function(l){
+  const u=$('unit').value;
+  each('label.rec',function(l){
     const units=(l.getAttribute('data-units')||'').split(',');
+    l.classList.toggle('dim', units.indexOf(u)<0);
+  });
+}
+function recSel(){
+  each('label.rec',function(l){
     const box=l.querySelector('input');
-    if(units.indexOf(u)<0){ box.checked=false; box.disabled=true; l.style.opacity=0.4; }
-    else { box.disabled=false; l.style.opacity=1; }
+    l.classList.toggle('sel', !!(box && box.checked));
   });
 }
 function recipes(){
@@ -4501,27 +5144,36 @@ function recipes(){
     document.querySelectorAll('input[name=eth_recipe]:checked'))
     .map(function(b){return b.value;});
 }
+function startEra(){
+  const eras=[];
+  each('.erack:checked',function(c){
+    eras.push({id:c.value,
+      steps:(($('st-'+c.value)||{}).value||'').trim(),
+      offset:(($('of-'+c.value)||{}).value||'').trim()});
+  });
+  if(!eras.length){ notify('tick at least one era',false); return; }
+  const r=recipes();
+  if(!r.length){ notify('pick at least one recipe',false); return; }
+  post('/api/eth/era',{eras:eras,recipes:r});
+}
 function startTs(){
   const r=recipes();
   if(!r.length){ notify('pick at least one recipe',false); return; }
-  post('/api/eth/timestamp',{start:document.getElementById('s').value,
-    end:document.getElementById('e').value,
-    unit:document.getElementById('unit').value, recipes:r});
+  post('/api/eth/timestamp',{start:$('s').value, end:$('e').value,
+    unit:$('unit').value, recipes:r});
 }
 function startWk(){
-  post('/api/eth/weakkeys',{count:document.getElementById('n').value,
-    keys:document.getElementById('keys').value});
+  post('/api/eth/weakkeys',{count:$('n').value, keys:$('keys').value});
 }
 function pingRpc(){
-  document.getElementById('rpc').textContent='testing…';
+  $('rpc').textContent='testing…';
   post('/api/eth/ping',{}).then(function(d){
-    const el=document.getElementById('rpc');
-    if(!el) return;
+    const el=$('rpc'); if(!el) return;
     el.textContent=(d.bases||[]).map(function(b){
       return (b.ok?'ok  ':'FAIL')+' '+b.host+'  block='+b.block+
              '  batch='+(b.batch?'yes':'no')+'  '+b.ms+'ms'+
              (b.error?'  '+b.error:'');
-    }).join(String.fromCharCode(10)) || 'no endpoints configured';
+    }).join(NL) || 'no endpoints configured';
   });
 }
 function retryQueued(){ post('/api/eth/retry',{}); }
@@ -4529,33 +5181,61 @@ function refreshPending(){
   fetch('/api/eth/pending',{cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(d){
-      const NL=String.fromCharCode(10);
-      const n=document.getElementById('pendingN');
-      if(n) n.textContent=(d.queued||0).toLocaleString('en-US');
-      const bn=document.getElementById('batchNow');
-      if(bn) bn.textContent=d.batch_size||'';
-      const st=document.getElementById('rpcState');
-      if(st) st.textContent=d.rpc||'';
-      const dq=document.getElementById('detailQ');
+      const n=$('pendingN'); if(n) n.textContent=fmt(d.queued);
+      const bn=$('batchNow'); if(bn) bn.textContent=d.batch_size||'';
+      const st=$('rpcState'); if(st) st.textContent=d.rpc||'';
+      const dq=$('detailQ');
       if(dq) dq.textContent=d.queued
-        ? d.queued.toLocaleString('en-US')+' candidate(s) queued in '+d.file
-        : 'queue empty ('+d.file+')';
-      const lq=document.getElementById('logQ');
+        ? fmt(d.queued)+' candidate(s) queued in '+d.file : 'queue empty ('+d.file+')';
+      const lq=$('logQ');
       if(lq && !lq.textContent && d.sample && d.sample.length){
         lq.textContent='next queued: '+d.sample.join(', ');
       }
     }).catch(function(){});
 }
-unitChanged();
+each('input[name=eth_recipe]',function(c){
+  c.addEventListener('change', recSel);
+});
+eraToggle(); unitChanged(); recSel();
+watch('eth_era','Era');
 watch('eth_ts','Ts');
 watch('eth_weak','Wk');
 watch('eth_retry','Q');
 refreshPending();
 setInterval(refreshPending, 15000);
 </script>"""
+    e1, e2, e3 = (e["end"] - e["start"] + 1 for e in ETH_ERAS[:3])
+    rate = 24000          # measured sha256_dec candidates/s, both accelerators
     body = (body
             .replace("{recipes}", "".join(rec))
+            .replace("{eras}", "".join(eras))
             .replace("{presets}", "".join(presets))
+            .replace("{eras_json}", json.dumps(
+                {e["id"]: {"era": e["era"], "unit": e["unit"],
+                           "start": e["start"], "end": e["end"],
+                           "span": e["end"] - e["start"] + 1,
+                           "recipes": list(e["recipes"]),
+                           "scannable": e.get("scannable", True)}
+                 for e in ETH_ERAS}))
+            .replace("{maxtotal_raw}", str(ETH_MAX_TOTAL_STEPS))
+            .replace("{span1}", format(e1, ","))
+            .replace("{span2}", format(e2, ","))
+            .replace("{span3}", format(e3, ","))
+            # adaptive precision: a 1,000-step slice of Era 3 is 1.59e-05%, and
+            # "%.4f" would print that as a dishonest-looking 0.0000%.
+            .replace("{cover3}", ("%.4f" % (100.0 * ETH_ERA_STEPS / e3))
+                     if 100.0 * ETH_ERA_STEPS / e3 >= 0.001
+                     else ("%.3g" % (100.0 * ETH_ERA_STEPS / e3)))
+            .replace("{ratio3}", format(max(1, int(e3 / ETH_ERA_STEPS)), ","))
+            # 63.1e9 candidates at ~24k/s is weeks of CPU, but 1.26e9 batch
+            # requests at a sustainable 5 req/s is years — the RPC is the wall.
+            .replace("{days3}", "%.0f" % (e3 / rate / 86400))
+            .replace("{reqs3}", "{:,}".format(int(e3 / ETH_RPC_BATCH)))
+            .replace("{rpcyears3}", "%.0f"
+                     % (e3 / ETH_RPC_BATCH / 5 / 86400 / 365))
+            .replace("{rate}", format(rate, ","))
+            .replace("{weakrate}", format(rate, ","))
+            .replace("{erasteps}", format(ETH_ERA_STEPS, ","))
             .replace("{batch}", "{:,}".format(ETH_RPC_BATCH))
             .replace("{calls}", "{:,}".format(ETH_RPC_BATCH * 2))
             .replace("{maxtotal}", "{:,}".format(ETH_MAX_TOTAL_STEPS))
@@ -4579,7 +5259,9 @@ def api_eth_recipes():
     return {"recipes": [{"id": rid, "label": r["label"], "units": list(r["units"]),
                          "note": r["note"], "default": r["default"]}
                         for rid, r in ETH_RECIPES.items()],
-            "presets": ETH_PRESETS,
+            "presets": [_era_public(e) for e in ETH_ERAS],
+            "eras": [_era_public(e) for e in ETH_ERAS],
+            "era_steps": ETH_ERA_STEPS,
             "rpc_bases": [{"url": u, "host": _esplora_host(u)}
                           for u in _ETH_RPC_BASES],
             "rpc_status": _esplora_status(_ETH_RPC_BASES),
@@ -4600,6 +5282,95 @@ def api_eth_recipes():
             "ec_backend": EC_BACKEND,
             "hash_backend": ETH_HASH_BACKEND,
             "wordlist": str(BIP39_WORDLIST_PATH)}
+
+
+def _era_public(e):
+    """One era as the UI/API sees it (span computed, nothing internal)."""
+    return {"id": e["id"], "era": e["era"], "label": e["label"],
+            "window": e["window"], "unit": e["unit"], "start": e["start"],
+            "end": e["end"], "span": e["end"] - e["start"] + 1,
+            "recipes": list(e["recipes"]), "default": e["default"],
+            "scannable": e.get("scannable", True), "warn": e.get("warn", ""),
+            "note": e["note"], "default_steps": ETH_ERA_STEPS}
+
+
+@app.route("/api/eth/eras")
+def api_eth_eras():
+    """The fixed era windows, with their honesty notes and default slice."""
+    return {"ok": True, "eras": [_era_public(e) for e in ETH_ERAS],
+            "era_steps": ETH_ERA_STEPS,
+            "max_total_steps": ETH_MAX_TOTAL_STEPS,
+            "max_steps_per_run": ETH_MAX_STEPS,
+            "recipes": [{"id": r, "label": v["label"], "units": list(v["units"])}
+                        for r, v in ETH_RECIPES.items()]}
+
+
+@app.route("/api/eth/era", methods=["POST"])
+def api_eth_era():
+    """Start ONE job that sweeps several era windows in sequence.
+
+    Accepts either {"eras": ["frontier","cryptojs"], "steps": N, "offset": M}
+    or a per-era list {"eras": [{"id": ..., "steps": ..., "offset": ...}]}.
+    """
+    j = request.get_json(silent=True) or {}
+    raw = j.get("eras") or []
+    if not isinstance(raw, list):
+        raw = [raw]
+    try:
+        g_steps = int(str(j.get("steps") or ETH_ERA_STEPS).replace(",", ""))
+        g_offset = int(str(j.get("offset") or 0).replace(",", ""))
+    except (TypeError, ValueError):
+        return {"ok": False, "msg": "steps and offset must be integers"}
+    specs = []
+    for item in raw:
+        if isinstance(item, dict):
+            specs.append({"id": str(item.get("id") or ""),
+                          "steps": item.get("steps") or g_steps,
+                          "offset": item.get("offset") or g_offset})
+        else:
+            specs.append({"id": str(item), "steps": g_steps,
+                          "offset": g_offset})
+    by_id = {e["id"]: e for e in ETH_ERAS}
+    unknown = [s["id"] for s in specs if s["id"] not in by_id]
+    if unknown:
+        return {"ok": False,
+                "msg": "unknown era(s): %s — available: %s"
+                       % (", ".join(unknown), ", ".join(by_id))}
+    if not specs:
+        return {"ok": False, "msg": "select at least one era"}
+    try:
+        for s in specs:
+            s["steps"] = max(1, int(str(s["steps"]).replace(",", "")))
+            s["offset"] = max(0, int(str(s["offset"]).replace(",", "")))
+    except (TypeError, ValueError):
+        return {"ok": False, "msg": "steps and offset must be integers"}
+    total = sum(s["steps"] for s in specs)
+    if total > ETH_MAX_TOTAL_STEPS:
+        return {"ok": False,
+                "msg": ("%s steps across %d era(s) is over the %s cap — lower "
+                        "the per-era steps, select fewer eras, or raise "
+                        "ETH_MAX_TOTAL_STEPS"
+                        % (format(total, ","), len(specs),
+                           format(ETH_MAX_TOTAL_STEPS, ",")))}
+    ids = j.get("recipes") or []
+    if not isinstance(ids, list):
+        ids = [str(ids)]
+    ids = [str(x) for x in ids if x in ETH_RECIPES]
+    if not ids:
+        return {"ok": False, "msg": "pick at least one recipe"}
+    units = {by_id[s["id"]]["unit"] for s in specs}
+    if not any(u in ETH_RECIPES[r]["units"] for u in units for r in ids):
+        return {"ok": False,
+                "msg": ("no selected recipe accepts the unit of any selected "
+                        "era (%s)" % ", ".join(sorted(units)))}
+    skipped = [by_id[s["id"]]["id"] for s in specs
+               if not by_id[s["id"]].get("scannable", True)]
+    ok, msg = _start_job("eth_era", attack_eth_eras, specs, ids)
+    if ok and skipped:
+        msg = ("%s — note: %s cannot be recovered by a private-key sweep and is "
+               "scanned only to demonstrate that" % (msg, ", ".join(skipped)))
+    return {"ok": ok, "msg": msg, "eras": [s["id"] for s in specs],
+            "recipes": ids, "steps": total}
 
 
 @app.route("/api/eth/timestamp", methods=["POST"])
@@ -4715,6 +5486,15 @@ if __name__ == "__main__":
     ap.add_argument("--recipes", default="sha256_dec",
                     help="comma-separated ETH recipes for --cli-eth, e.g. "
                          "tw_bip39_s,sha256_dec")
+    ap.add_argument("--cli-eth-era", metavar="ERA[:STEPS[@OFFSET]][,…]",
+                    help="headless era batch: sweep several fixed windows in "
+                         "sequence, e.g. frontier:50000,cryptojs:50000@2000000 "
+                         "(available eras: %s)"
+                         % ", ".join(e["id"] for e in ETH_ERAS))
+    ap.add_argument("--steps", type=int, default=ETH_ERA_STEPS,
+                    help="default per-era steps for --cli-eth-era")
+    ap.add_argument("--list-eras", action="store_true",
+                    help="print the fixed era windows and exit")
     ap.add_argument("--worker", choices=["randstorm", "brainwallet"],
                     help="run a single shard of an attack and exit (cluster worker mode)")
     ap.add_argument("--shard", metavar="IDX/N", help="0-based shard index / total shards, e.g. 3/10")
@@ -4730,6 +5510,61 @@ if __name__ == "__main__":
         bf = BloomFilter.load(BLOOM_PATH)
         attack_randstorm(args.cli_randstorm[0], args.cli_randstorm[1],
                          bf, print, {"stop": False, "progress": 0, "detail": ""})
+        sys.exit(0)
+
+    if args.list_eras:
+        for e in ETH_ERAS:
+            print("%-9s %-7s %-4s %20d .. %-20d  %15s wide  %s%s"
+                  % (e["id"], e["era"], e["unit"], e["start"], e["end"],
+                     format(e["end"] - e["start"] + 1, ","), e["window"],
+                     "" if e.get("scannable", True)
+                     else "  [NOT recoverable by a privkey sweep]"))
+            print("           %s" % e["note"])
+        print("default per-era steps: %s  (ETH_ERA_STEPS)  cap per run: %s"
+              % (format(ETH_ERA_STEPS, ","), format(ETH_MAX_TOTAL_STEPS, ",")))
+        sys.exit(0)
+
+    if args.cli_eth_era:
+        job = {"stop": False, "progress": 0, "detail": ""}
+        ids = [r.strip() for r in args.recipes.split(",") if r.strip()]
+        bad = [r for r in ids if r not in ETH_RECIPES]
+        if bad:
+            sys.exit("unknown recipe(s): %s — available: %s"
+                     % (", ".join(bad), ", ".join(ETH_RECIPES)))
+        specs, errs = [], []
+        for tok in args.cli_eth_era.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            eid, _, rest = tok.partition(":")
+            steps, offset = args.steps, 0
+            if rest:
+                steps_s, _, off_s = rest.partition("@")
+                try:
+                    if steps_s:
+                        steps = int(steps_s.replace(",", ""))
+                    if off_s:
+                        offset = int(off_s.replace(",", ""))
+                except ValueError:
+                    errs.append("%s: steps/offset must be integers" % tok)
+                    continue
+            specs.append({"id": eid.strip(), "steps": steps, "offset": offset})
+        if errs:
+            sys.exit("\n".join(errs))
+        known = [e["id"] for e in ETH_ERAS]
+        bad = [s["id"] for s in specs if s["id"] not in known]
+        if bad:
+            sys.exit("unknown era(s): %s — available: %s (--list-eras)"
+                     % (", ".join(bad), ", ".join(known)))
+        if not specs:
+            sys.exit("--cli-eth-era needs at least one era id")
+        over = sum(s["steps"] for s in specs) - ETH_MAX_TOTAL_STEPS
+        if over > 0:
+            sys.exit("%s steps across %d era(s) is over the %s cap "
+                     "(ETH_MAX_TOTAL_STEPS)"
+                     % (format(sum(s["steps"] for s in specs), ","),
+                        len(specs), format(ETH_MAX_TOTAL_STEPS, ",")))
+        attack_eth_eras(specs, ids, print, job)
         sys.exit(0)
 
     if args.cli_eth:
