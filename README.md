@@ -77,6 +77,7 @@ required for the health check and the public URL to work.
 | `BLOOM_FP_RATE` | `0.000001` | Bloom false-positive target; lower = fewer false hits, larger/slower build. Rebuild the bloom after changing it |
 | `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
+| `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
 | `PORT` | set by Render | Do not override |
 
 `Procfile` contains the same start command for Heroku-style platforms; Render
@@ -218,6 +219,37 @@ service restart succeed, so a failed install is retried on the next 2-minute
 tick instead of leaving the old process running forever. Dashboard HTML is
 served with `Cache-Control: no-store`, but an already-open tab can still show
 the previous layout until you hard-refresh (Ctrl+Shift+R).
+
+## Kill all jobs / fresh start
+
+The **Kill all jobs** button in the header of every page (and
+`POST /api/jobs/kill-all`) stops `dataset`, `randstorm`, `brainwallet`,
+`nonce` and `verify` jobs at once, clears both `.btc-hunt-busy` and
+`.btc-hunt-busy.pid`, and — when Basic auth is configured and the app runs
+under Gunicorn — sends SIGTERM/SIGKILL to the current worker so the master
+starts a replacement with an empty `_JOBS` dict. `GET /api/jobs` reports all
+five slots. Saved hits, the Bloom filter and the cached `.gz` are **not**
+deleted; this is a process/job reset, not a data wipe. Set
+`BTC_HUNT_WORKER_RESTART=0` to disable the worker restart.
+
+On EC2 the equivalent one-command fresh start is:
+
+```bash
+sudo btc-hunt-reset
+```
+
+It stops `btc-hunt.service`, removes both deploy markers, forces
+`btc-hunt-update` to fetch `main`, reinstalls, restarts and checks `/health`.
+`sudo btc-hunt-reset --no-deploy` just restarts the service from the current
+checkout. Until the build containing `btc-hunt-reset` has propagated, the
+existing one-liner does the same job:
+
+```bash
+sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update
+```
+
+Either command intentionally kills any running job. Stop a long scan from the
+UI first if you want it to finish cleanly.
 
 ## Run locally
 

@@ -154,6 +154,7 @@ review them without touching the host.
 | Restart | `sudo systemctl restart btc-hunt` |
 | nginx config check | `sudo nginx -t` |
 | **Deploy (pull latest `main`, reconfigure, restart, health check)** | `sudo btc-hunt-update` |
+| **Kill all jobs / fresh start** | `sudo btc-hunt-reset` |
 | Auto-deploy logs | `sudo journalctl -u btc-hunt-autopull.service -f` |
 | Data usage | `df -h /var/lib/btc-hunt` |
 | Backup | EBS snapshot of the data volume (stop `btc-hunt` first for a consistent SQLite file) |
@@ -177,12 +178,34 @@ curl http://127.0.0.1/health
 If `build` is missing or stale after a merge to `main`, check
 `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager` and
 `sudo systemctl status btc-hunt-autopull.timer`. A **running job** creates
-`.btc-hunt-busy` and legitimately defers the restart; the footer shows that
-too. `btc-hunt-update` now records `.btc-hunt-deployed` only after a
-successful `install.sh` + restart, so a failed install is retried on the next
-tick instead of being mistaken for "already up to date".
+`.btc-hunt-busy` plus `.btc-hunt-busy.pid` and legitimately defers the
+restart; the footer shows that too. If the worker died, `update.sh` sees the
+dead PID and clears both markers immediately instead of waiting 130 minutes.
+`btc-hunt-update` now records `.btc-hunt-deployed` only after a successful
+`install.sh` + restart, so a failed install is retried on the next tick
+instead of being mistaken for "already up to date".
 `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` redeploys immediately, but
 it **kills any running job** — only use it when no job is active.
+
+## Kill all jobs / fresh start
+
+The dashboard header now has a **Kill all jobs** button: it stops all five job
+slots, clears `.btc-hunt-busy` / `.btc-hunt-busy.pid` and replaces the Gunicorn
+worker, giving an empty `_JOBS` dict without deleting hits or the dataset.
+`GET /api/jobs` lists the slots; `POST /api/jobs/kill-all` performs the reset.
+
+From SSH, `sudo btc-hunt-reset` is the hard reset:
+
+```bash
+sudo btc-hunt-reset              # kill jobs, force-deploy main, restart, health check
+sudo btc-hunt-reset --no-deploy  # kill jobs and restart current checkout only
+```
+
+It stops `btc-hunt.service` first (so no thread survives), removes both busy
+markers, then runs `BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update`. Use it when a
+long bulk scan left a busy marker and auto-pull keeps deferring. Both forms
+kill any running job; saved results, `funded.bloom` and the cached `.gz` are
+kept.
 
 ## Bulk nonce-reuse scans
 
@@ -290,7 +313,7 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | `/health` times out | Security group inbound rules; `sudo systemctl status btc-hunt`; `sudo nginx -t`; bootstrap log |
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
-| Auto-pull stuck on `job running` | A stale busy marker older than `BUILD_DEADLINE_SECS + 600` (default 130 min) is cleared automatically; `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` forces it immediately |
+| Auto-pull stuck on `job running` | New builds write `.btc-hunt-busy.pid`; `update.sh` clears the marker as soon as that worker is gone. For an immediate hard reset `sudo btc-hunt-reset` kills all jobs, clears both markers and force-deploys `main`. On older builds use `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` |
 | Bulk nonce scan reports 0 hits but every line after N says `HTTP 429` | The old build counted rate-limited addresses as scanned. Update to the latest `main`: 429 now triggers a global cooldown, blocked addresses are retried and saved to `/var/lib/btc-hunt/nonce_retry.txt`, and the job shows `partial`. Raise `ESPLORA_MIN_INTERVAL` or add `ESPLORA_URLS` |
 | Lots of `★★★ HIT` lines but every address has 0 BTC | These are Bloom false positives. `sudo journalctl -u btc-hunt -f` shows the FP rate; set `BLOOM_FP_RATE=0.000001` (default now), rebuild the bloom on `/data`, and use **Check balances** on `/results` to flag never-funded hits |
 | New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |

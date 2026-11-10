@@ -183,6 +183,7 @@ sudo git -C /opt/btc-hunt log -1 --oneline
 | Task | Command |
 | --- | --- |
 | **Deploy latest `main` now** | `sudo btc-hunt-update` |
+| **Kill all jobs / fresh start** | `sudo btc-hunt-reset` |
 | Trigger the workflow by hand | `gh workflow run deploy-ec2.yml --repo Phaviwylera/edurep` |
 | Check last deploy (Option A) | `sudo journalctl -u btc-hunt-autopull.service -n 50` |
 | Check last deploy (Option B) | `gh run list --workflow deploy-ec2.yml --repo Phaviwylera/edurep` |
@@ -220,5 +221,5 @@ re-installs its own newest version on every deploy.
 | SSM command stays `Pending` | Instance not SSM-managed: check the instance profile and `snap.amazon-ssm-agent.amazon-ssm-agent.service` |
 | Deploy fails with `Failed` | Workflow prints `StandardErrorContent`; on the instance `sudo btc-hunt-update` to reproduce |
 | Auto-pull timer does nothing | `systemctl status btc-hunt-autopull.timer`; `sudo journalctl -u btc-hunt-autopull.service -n 50` |
-| Deploy deferred (`job running`) | By design: a restart would kill the in-progress build/scan. The next 2-minute tick deploys once it finishes. A marker older than `BUILD_DEADLINE_SECS + 600` (default 130 min) is cleared automatically as stale. To force immediately: `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` |
+| Deploy deferred (`job running`) | By design: a restart would kill the in-progress build/scan. The next 2-minute tick deploys once it finishes. New builds also write `.btc-hunt-busy.pid`, so a dead worker clears the marker immediately; otherwise a marker older than `BUILD_DEADLINE_SECS + 600` (default 130 min) is stale. For an immediate hard reset: `sudo btc-hunt-reset`; on older builds `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` |
 | `/health` still 502 | `sudo systemctl status btc-hunt nginx`, `sudo nginx -t` |
