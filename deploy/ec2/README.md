@@ -256,14 +256,24 @@ timestamps × 3 derived addresses. Change it in `/etc/btc-hunt.env`, restart,
 then rebuild the bloom on `/data` — **Download & build bloom** reuses the
 cached `.gz`, so no 1.7 GB re-download is needed.
 
+By default (`AUTO_VERIFY_HITS=1`), every `★★★` candidate is now checked live
+against Esplora **before** it is saved. `AUTO_VERIFY_MIN_SATS=1` skips
+zero-balance addresses entirely: the log shows `[-] skipped ... 0 BTC · never
+funded` instead of a hit, and `/results` stays clean. Saved hits include
+`balance_sats`, `balance_tx_count`, `balance_checked_at`, `balance_error` and
+`balance_verdict`. This adds one paced request per candidate; set
+`AUTO_VERIFY_HITS=0` in `/etc/btc-hunt.env` and restart to restore the old
+hot-loop-free behaviour, or `AUTO_VERIFY_MIN_SATS=0` to keep zero-balance hits
+with badges. Explorer failures are saved with `balance_error`, never dropped.
+
 Open `/results` and click **Check balances** (or **Force re-check** to clear
-the in-process Esplora cache). The job is paced by `ESPLORA_MIN_INTERVAL`,
-stoppable, checks up to `VERIFY_MAX_ADDRESSES` (default 5000) unique
-addresses, and stores results in `btc_hunt.sqlite`. Each hit gets a badge:
-`likely Bloom false positive` when the chain shows `tx_count=0` and 0 sats,
-`spent / empty`, or a BTC amount to verify manually with a block explorer.
-The JSONL downloads on `/results` include the same fields. Verification never
-calls the explorer from inside the attack loop.
+the in-process Esplora cache) to refresh stored balances later. The job is
+paced by `ESPLORA_MIN_INTERVAL`, stoppable, checks up to
+`VERIFY_MAX_ADDRESSES` (default 5000) unique addresses, and stores results in
+`btc_hunt.sqlite`. Each hit gets a badge: `likely Bloom false positive` when
+the chain shows `tx_count=0` and 0 sats, `spent / empty`, or a BTC amount to
+verify manually with a block explorer. The JSONL downloads on `/results`
+include the same fields.
 
 ## Dataset mirrors
 
@@ -315,7 +325,7 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
 | Auto-pull stuck on `job running` | New builds write `.btc-hunt-busy.pid`; `update.sh` clears the marker as soon as that worker is gone. For an immediate hard reset `sudo btc-hunt-reset` kills all jobs, clears both markers and force-deploys `main`. On older builds use `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` |
 | Bulk nonce scan reports 0 hits but every line after N says `HTTP 429` | The old build counted rate-limited addresses as scanned. Update to the latest `main`: 429 now triggers a global cooldown, blocked addresses are retried and saved to `/var/lib/btc-hunt/nonce_retry.txt`, and the job shows `partial`. Raise `ESPLORA_MIN_INTERVAL` or add `ESPLORA_URLS` |
-| Lots of `★★★ HIT` lines but every address has 0 BTC | These are Bloom false positives. `sudo journalctl -u btc-hunt -f` shows the FP rate; set `BLOOM_FP_RATE=0.000001` (default now), rebuild the bloom on `/data`, and use **Check balances** on `/results` to flag never-funded hits |
+| Lots of `★★★ HIT` lines but every address has 0 BTC | On the current build this should not happen with `AUTO_VERIFY_HITS=1` (default): zero-balance candidates are skipped before saving. Hard-refresh and check `/health` for the new build; `AUTO_VERIFY_MIN_SATS=0` intentionally keeps them. Older builds need **Check balances** on `/results`; these are Bloom false positives, so set `BLOOM_FP_RATE=0.000001` (default now) and rebuild from the cached `.gz` |
 | New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |
 | `dataset build exceeded its time budget` | Raise `BUILD_DEADLINE_SECS` in `/etc/btc-hunt.env` and `sudo systemctl restart btc-hunt`; the cached `.gz` is reused, so no re-download is needed. Defaults are now 2 h total / 30 min download |
 | All dataset mirrors failed | LoyceV disabled its `LATEST` direct download (torrent-only); the app now discovers dated snapshots from its index. Paste a working `.gz` URL into the Dataset URL field, set `DATASET_URLS` in `/etc/btc-hunt.env`, or `sudo cp` a dump to `/var/lib/btc-hunt/blockchair.tsv.gz` |

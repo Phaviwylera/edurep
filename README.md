@@ -76,6 +76,8 @@ required for the health check and the public URL to work.
 | `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
 | `BLOOM_FP_RATE` | `0.000001` | Bloom false-positive target; lower = fewer false hits, larger/slower build. Rebuild the bloom after changing it |
 | `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run |
+| `AUTO_VERIFY_HITS` | `1` | Live-check every Bloom candidate before saving; `0` restores save-candidate-only mode |
+| `AUTO_VERIFY_MIN_SATS` | `1` | Minimum chain+mempool sats to save a hit; `0` keeps zero-balance hits with balance fields |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
 | `PORT` | set by Render | Do not override |
@@ -173,10 +175,33 @@ the cached `.gz` (no re-download), or use **Re-download & rebuild** to replace
 the dump too. An existing `funded.bloom` still loads fine: its own `m`/`k` are
 stored in the file header.
 
-`/results` now has **Check balances** / **Force re-check**. It starts a paced,
-stoppable job that queries `ESPLORA_URL` for every saved hit address and stores
-the result in SQLite — deliberately **not** inside `_save_result`, so no network
-call ever stalls an attack in the hot loop. Badges:
+### Automatic live balance gate
+
+By default (`AUTO_VERIFY_HITS=1`), every Bloom candidate — Randstorm,
+brainwallet or nonce reuse — is checked live against `ESPLORA_URL` **before**
+it is saved or logged as a hit. The lookup uses the same paced/cache/429-cooldown
+`_esplora_get()` as the rest of the app, honours **Stop**, and stores the result
+in SQLite. `_save_result()` itself still performs only local SQLite / JSONL
+writes; the network call is in the attack loop's candidate gate.
+
+`AUTO_VERIFY_MIN_SATS=1` (default) skips zero-balance candidates: the log shows
+`[-] skipped <addr>: 0 BTC · never funded (Bloom false positive)` instead of
+`★★★ HIT`, and nothing is written to `/results`. Set
+`AUTO_VERIFY_MIN_SATS=0` to keep every candidate with balance fields, or
+`AUTO_VERIFY_HITS=0` to restore the old "save candidate, verify later" mode.
+If the explorer fails, the hit is still saved with `balance_error` and
+`balance_verdict=check_failed`; it is never silently discarded.
+
+Saved hits carry `balance_sats`, `balance_tx_count`, `balance_checked_at`,
+`balance_error` and `balance_verdict` directly in the result payload, and
+`/results` badges populate immediately. This adds one paced API request per
+candidate, so very large scans are slower; use `ESPLORA_URLS` or a private
+Esplora endpoint if needed.
+
+`/results` also keeps **Check balances** / **Force re-check** for refreshing
+stored balances later. It starts a paced, stoppable job that queries
+`ESPLORA_URL` for every saved hit address and stores the result in SQLite.
+Badges:
 
 - `0 BTC · never funded — likely Bloom false positive` (chain `tx_count == 0`)
 - `0 BTC · spent / empty`
