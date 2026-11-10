@@ -173,6 +173,11 @@ PYTHONUNBUFFERED=1
 #AUTO_VERIFY_HITS=1
 #AUTO_VERIFY_MIN_SATS=1
 
+# Randstorm range chunking: split large ranges automatically and cap one
+# accepted run. Defaults: 5,000,000 ms per chunk, 50,000,000 ms total.
+#RANDSTORM_MAX_MS=5000000
+#RANDSTORM_MAX_TOTAL_MS=50000000
+
 # Allow the dashboard's Kill all jobs button to replace this Gunicorn worker.
 # Set to 0 to only stop jobs without restarting the worker.
 #BTC_HUNT_WORKER_RESTART=1

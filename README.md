@@ -78,6 +78,8 @@ required for the health check and the public URL to work.
 | `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run |
 | `AUTO_VERIFY_HITS` | `1` | Live-check every Bloom candidate before saving; `0` restores save-candidate-only mode |
 | `AUTO_VERIFY_MIN_SATS` | `1` | Minimum chain+mempool sats to save a hit; `0` keeps zero-balance hits with balance fields |
+| `RANDSTORM_MAX_MS` | `5000000` | Automatic Randstorm chunk size in ms; large `/randstorm` ranges are split into sequential chunks |
+| `RANDSTORM_MAX_TOTAL_MS` | `50000000` | Total ms accepted by `/api/randstorm`; raise it to run longer ranges |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
 | `PORT` | set by Render | Do not override |
