@@ -131,7 +131,11 @@ keys, no inbound firewall rules for GitHub runners.
    `AmazonSSMManagedInstanceCore` instance profile to your EC2 instance, and
    sets the three repository variables (`AWS_REGION`, `AWS_ROLE_ARN`,
    `EC2_INSTANCE_ID`). It prints the `gh variable set` commands if `gh` is not
-   available. Safe to re-run.
+   available, and falls back to the REST API on older `gh` releases. Safe to
+   re-run.
+
+   **Until those variables exist the workflow is skipped, not failed** — so if
+   you chose Option A you never see a red X and need no GitHub setup at all.
 
 3. **Verify the instance is SSM-managed** (can take a minute after attaching
    the profile):
@@ -209,7 +213,8 @@ re-installs its own newest version on every deploy.
 
 | Symptom | Fix |
 | --- | --- |
-| Workflow skipped | The workflow file is not on `main` yet — merge the PR. Also check `paths-ignore: '**/*.md'` |
+| Workflow shows `skipped` | The three repo variables are not set yet — run `setup-autodeploy.sh` (Option B), or ignore it entirely if you use Option A |
+| Workflow does not appear at all | The workflow file is not on `main` yet — merge the PR. Also check `paths-ignore: '**/*.md'` |
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Re-run `setup-autodeploy.sh`; confirm the repo/branch in the trust policy and `id-token: write` in the workflow |
 | Missing repository variable | `gh variable set AWS_REGION --body us-east-1 --repo Phaviwylera/edurep` (same for `AWS_ROLE_ARN`, `EC2_INSTANCE_ID`) |
 | SSM command stays `Pending` | Instance not SSM-managed: check the instance profile and `snap.amazon-ssm-agent.amazon-ssm-agent.service` |

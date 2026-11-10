@@ -28,6 +28,9 @@ permissions:
 
 jobs:
   deploy:
+    # Skipped (not failed) until setup-autodeploy.sh sets the three repository
+    # variables. Option A (auto-pull timer) needs no GitHub setup at all.
+    if: ${{ vars.AWS_REGION != '' && vars.AWS_ROLE_ARN != '' && vars.EC2_INSTANCE_ID != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

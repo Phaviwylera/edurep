@@ -148,10 +148,25 @@ fi
 ROLE_ARN="$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)"
 
 # 4. GitHub repository variables (NOT secrets — no credentials involved) -----
+set_gh_var() {
+  local name="$1" value="$2"
+  # gh >= 2.40 has `gh variable`; older releases need the REST API.
+  if gh variable set "$name" --body "$value" --repo "$REPO" >/dev/null 2>&1; then
+    return 0
+  fi
+  if gh api -X POST "repos/$REPO/actions/variables" \
+       -f name="$name" -f value="$value" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Already exists -> update it.
+  gh api -X PATCH "repos/$REPO/actions/variables/$name" \
+       -f name="$name" -f value="$value" >/dev/null 2>&1
+}
+
 set_gh_vars() {
-  gh variable set AWS_REGION --body "$REGION" --repo "$REPO" >/dev/null &&
-  gh variable set AWS_ROLE_ARN --body "$ROLE_ARN" --repo "$REPO" >/dev/null &&
-  gh variable set EC2_INSTANCE_ID --body "$INSTANCE_ID" --repo "$REPO" >/dev/null
+  set_gh_var AWS_REGION      "$REGION" &&
+  set_gh_var AWS_ROLE_ARN    "$ROLE_ARN" &&
+  set_gh_var EC2_INSTANCE_ID "$INSTANCE_ID"
 }
 
 echo
