@@ -71,7 +71,7 @@ uses `startCommand` from the Blueprint.
 2. Open `/` → `/data` → **Download & build bloom**. This downloads the address
    dump (HTTPS first, then the two fallback mirrors), then parses it twice to
    build `funded.bloom` on the persistent disk. It is a large download and a
-   CPU-heavy job; watch progress through the SSE log on that page. If a
+   CPU-heavy job; watch progress through the live log on that page. If a
    download is interrupted it is written to a `.part` file and retried, so a
    truncated dump is never treated as complete.
 3. Once `funded.bloom` exists, the Randstorm / brainwallet / nonce-reuse pages
@@ -85,7 +85,7 @@ deleting the service or detaching the disk.
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 PORT=10000 DISK_PATH=./local-data .venv/bin/gunicorn btc_hunt:app \
-  --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --threads 8
+  --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --threads 16
 # or: .venv/bin/python btc_hunt.py --port 10000
 ```
 
@@ -98,7 +98,7 @@ The dashboard has unauthenticated `POST` endpoints that start long-running
 jobs, and a Render web service is reachable by anyone on the internet. Set
 `APP_USER` and `APP_PASSWORD` (Blueprint prompts for both) to put HTTP Basic
 auth in front of every route except `/health`; browsers will prompt for the
-credentials and the SSE streams will reuse them. Leaving them blank keeps the
+credentials and the progress polls will reuse them. Leaving them blank keeps the
 original open behaviour — do not do that on a public URL. Render's IP allow
 list is only available on Scale/Enterprise plans, so the in-app auth is the
 practical option on smaller plans.

@@ -22,7 +22,8 @@ Internet ──(SG: 80/443)──> nginx :80 ──> gunicorn 127.0.0.1:8000 ─
 ```
 
 - Gunicorn listens on **loopback only** — port 8000 is never exposed.
-- nginx is the public entry point, with buffering disabled for the SSE streams.
+- nginx is the public entry point; progress is served as short, cache-free
+  JSON polls rather than long-lived SSE streams, so no connection is held open.
 - `systemd` supervises the app (`btc-hunt.service`), reading `/etc/btc-hunt.env`.
 - `DISK_PATH` points at the EBS-backed data directory, so the dataset and
   results survive reboots. Keep `DeleteOnTermination=false` on that volume.
@@ -140,7 +141,7 @@ review them without touching the host.
    sudo apt-get install -y certbot python3-certbot-nginx
    sudo certbot --nginx -d dashboard.example.com
    ```
-   certbot rewrites the nginx site; the SSE settings in the template are kept.
+   certbot rewrites the nginx site; the proxy settings in the template are kept.
 4. **Build the dataset:** open `/` → `/data` → *Download & build bloom*. The
    ~1.5 GB dump, `funded.bloom` and the SQLite DB land in `DISK_PATH`
    (`/var/lib/btc-hunt`). The installer's two-pass builder keeps memory low.
@@ -167,9 +168,11 @@ venv, and `requirements.txt` pins the dependencies.
 
 | Symptom | Check |
 | --- | --- |
+| Start button does nothing | The page shows the server message in a banner — usually `bloom not built`: build it at `/data` first |
+| Dataset build shows no progress | Refresh `/data` after a deploy; the live log and progress bar poll `/api/job/dataset` |
 | `/health` times out | Security group inbound rules; `sudo systemctl status btc-hunt`; `sudo nginx -t`; bootstrap log |
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
-| SSE progress never updates | `proxy_buffering off` and the 3600 s timeouts must be present in the nginx site |
+| Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
 | Dataset build fails | Outbound HTTPS to `addresses.loyce.club` / `3xpl.com`; `df -h`; check the job log on `/data` |
 | 401 after enabling auth | Restart the service; `/etc/btc-hunt.env` is read once at process start |
 | Data gone after reboot | Verify `UUID=... /var/lib/btc-hunt` is in `/etc/fstab` and the volume is still attached |

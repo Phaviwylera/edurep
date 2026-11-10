@@ -25,8 +25,8 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
 
-        # Job progress/log pages use Server-Sent Events. Buffering, gzip or a
-        # short read timeout will make them appear stuck.
+        # Job progress uses short JSON polls. These settings also keep any
+        # long-running request (e.g. a CLI-driven scan) from being buffered.
         proxy_buffering off;
         proxy_cache off;
         proxy_request_buffering off;
