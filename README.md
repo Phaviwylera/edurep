@@ -89,9 +89,15 @@ required for the health check and the public URL to work.
 | `RANDSTORM_MAX_MS` | `5000000` | Automatic Randstorm chunk size in ms; large `/randstorm` ranges are split into sequential chunks |
 | `RANDSTORM_MAX_TOTAL_MS` | `4000000000` | Total ms accepted by one `/api/randstorm` run — 4,000,000,000 ms ≈ 46.3 days ≈ 800 default chunks. Raise it to run longer ranges. See [Scan speed](#scan-speed-and-the-ec-backend) for what that costs in wall-clock time |
 | `EC_BACKEND` | `auto` | `auto` uses libsecp256k1 (`coincurve`) when importable, otherwise the pure-Python windowed path. Force one with `libsecp256k1` or `python`; shown by `/health` and the page footer |
-| `ETH_RPC_URLS` | `ethereum-rpc.publicnode.com,eth.drpc.org,1rpc.io/eth,rpc.flashbots.net` | Comma-separated Ethereum JSON-RPC endpoints for `/eth` balance checks. Each keeps its own 429 cooldown; requests fail over. Point this at your own node for any serious sweep |
-| `ETH_RPC_BATCH` | `50` | Addresses per JSON-RPC batch request (two calls each). Endpoints that refuse batches are detected and switched to one request per call |
+| `ETH_RPC_URLS` | `ethereum-rpc.publicnode.com,eth.drpc.org,rpc.flashbots.net,ethereum.blockpi.network/v1/rpc/public` | Comma-separated Ethereum JSON-RPC endpoints for `/eth` balance checks. Each keeps its own cooldown; requests fail over. Point this at your own node for any serious sweep |
+| `ETH_RPC_BATCH` | `50` | Addresses per JSON-RPC batch request (two calls each). This is the **starting** size: it halves when an endpoint refuses arrays or a large batch, and grows back after 20 clean requests |
 | `ETH_RPC_TIMEOUT` | `25` | Seconds per RPC request |
+| `ETH_PREFLIGHT` | `1` | Probe every endpoint (`eth_blockNumber` + a small batch) before deriving anything and use only the ones that answer. `0` skips the probe |
+| `ETH_DEAD_COOL_SECS` | `3600` | How long an endpoint that answered **401/403** is parked. A refusal is not a rate limit — it means "we will not answer this host" |
+| `ETH_ERROR_COOL_SECS` | `30` | Park time after a timeout, connection error or other 4xx |
+| `ETH_RPC_ROUNDS` | `3` | Full rounds over the usable endpoints that one batch gets before it is queued for a later re-check |
+| `ETH_PENDING_MAX` | `200000` | Cap on `eth_pending.jsonl` (unchecked candidates). Beyond it, candidates are counted as `dropped` and the log warns once |
+| `ETH_RPC_USER_AGENT` | the Esplora-style agent | Override the `User-Agent` sent to RPC endpoints; some gateways 403 an unidentified client |
 | `ETH_MIN_WEI` | `1` | Minimum balance (wei) to save an Ethereum hit; `0` also saves never-used and emptied addresses |
 | `ETH_VERIFY_BALANCES` | `1` | Live-check derived addresses before saving. `0` skips verification entirely and only counts candidates as `unchecked` |
 | `ETH_MAX_STEPS` | `5000000` | Timestamps per chunk on `/eth`; larger ranges split automatically |
@@ -363,8 +369,10 @@ Every batch is checked before anything is saved:
 - `wei == 0, nonce == 0` → **skipped** (never used), counted in the job detail.
   Set `ETH_MIN_WEI=0` to save them anyway.
 - `wei == 0, nonce > 0` → used and emptied; logged, not saved as a hit.
-- Transport failure or HTTP 429 → the batch stores **nothing** and is counted
-  as `throttled`. A rate limit is not a verdict; re-run the check later.
+- Transport failure or HTTP 429 → the batch stores **nothing** (a rate limit is
+  not a verdict), is counted as `throttled`, and is **appended to
+  `eth_pending.jsonl`** so the derivation work is not lost. Drain it later with
+  **Re-check queued candidates** on `/eth`.
 - A per-call RPC error (one item in the batch) stores an error row and saves
   the candidate fail-open, rather than dropping a possible hit.
 
@@ -376,23 +384,45 @@ whole **gwei**, `mempool_sats` holds the remaining **wei**
 address in batches with retry passes, and **Download Ethereum results
 (JSONL)** exports every `eth_*` bucket.
 
-### Endpoints and rate limits
+### Endpoints: three failure modes, three different responses
 
 Four public, keyless endpoints are configured by default
-(`ethereum-rpc.publicnode.com`, `eth.drpc.org`, `1rpc.io/eth`,
-`rpc.flashbots.net`); set `ETH_RPC_URLS` (comma-separated) to replace them.
-That list was chosen from third-party measurements in October 2026 of which
-public endpoints still answer without a key — Ankr now needs one and
-`eth.llamarpc.com` was returning 525/403 — but **none of them could be reached
-from the sandbox that built this**, so treat the list as unverified and use the
-page's **Test RPC** button
-(`POST /api/eth/ping`) to see which ones answer from your host, their block
-height and whether they accept batch requests. An endpoint that answers a batch
-with a single object is remembered and gets one request per call instead.
+(`ethereum-rpc.publicnode.com`, `eth.drpc.org`, `rpc.flashbots.net`,
+`ethereum.blockpi.network/v1/rpc/public`); set `ETH_RPC_URLS` (comma-separated)
+to replace them. **Public endpoints reject datacenter traffic.** `1rpc.io/eth`
+answered an EC2 host in `ap-south-1` with `HTTP 403 Forbidden`, and
+`eth.llamarpc.com` was returning 525/403 in October 2026 measurements, so
+neither ships as a default any more. Treat any built-in list as unverified: use
+**Test RPC** (`POST /api/eth/ping`) or, better, your own node.
 
-429/5xx handling is shared with the Esplora client: the endpoint that failed is
-parked for a cooldown (honouring `Retry-After`), the request fails over to the
-next one, and adaptive spacing applies globally.
+| What comes back | What the client does |
+| --- | --- |
+| `429` / `5xx` | Parks **that** endpoint for an escalating cooldown (honouring `Retry-After`), fails over to the next one, and slows the global spacing. When nothing is left standing it **waits** for a cooldown to expire and retries the same batch — it does not drop it |
+| `401` / `403` | Parks that endpoint for `ETH_DEAD_COOL_SECS` (1 h) and marks it *refusing*. If **every** endpoint refuses, the run **stops** with an explicit message instead of deriving candidates nobody can check — continuing would only grow the queue |
+| `400` / `413`, or a single object instead of an array | "We do not take arrays" or "that batch is too big": the endpoint is remembered as batch-less, the batch size **halves** for later batches (growing back after 20 clean requests), and the current batch is answered with single calls |
+| timeout / connection error / non-JSON | Parks the endpoint for `ETH_ERROR_COOL_SECS` and fails over |
+
+Every job starts with a **pre-flight probe** (`ETH_PREFLIGHT=1`): one parallel
+round of `eth_blockNumber` plus a small batch probe per endpoint, logged with
+block height, latency and batch support. Only the endpoints that answer are used
+for the run; if none answer, the job stops before deriving anything. That probe
+costs about a second and is what turns "two hours of `403` lines" into one
+readable message.
+
+### The retry queue: nothing derived is thrown away
+
+Deriving a candidate costs up to ~2.7 ms (PBKDF2 dominates), so a batch that
+cannot be checked is **appended to `eth_pending.jsonl`** on the data disk —
+address, private key, recipe, timestamp and the reason it was queued. That
+covers throttling, refusals, and a **Stop** pressed mid-run (whatever is still
+in the buffer is queued, not dropped). `ETH_PENDING_MAX` caps the file; past the
+cap, candidates are counted as `dropped` and the log warns once.
+
+**Re-check queued candidates** on `/eth` (`POST /api/eth/retry`) drains the file
+in batches — no re-derivation — saves funded addresses with exactly the payload
+a live sweep would have produced, and rewrites the file with whatever is still
+unchecked. `GET /api/eth/pending` reports the count, the path, the current batch
+size and the endpoint states.
 
 ### Measured speed (this matters less than your RPC)
 
@@ -514,6 +544,18 @@ PORT=10000 DISK_PATH=./local-data .venv/bin/gunicorn btc_hunt:app \
 Worker/CLI modes are unchanged, e.g. `python btc_hunt.py --build-bloom` or
 `python btc_hunt.py --worker randstorm --shard 3/10`.
 
+## Tests
+
+```bash
+python tests/test_eth.py       # no pytest, no network: requests is monkeypatched
+```
+
+23 groups: published vectors for every Ethereum primitive, the recipes, the
+JSON-RPC client (batching, per-item errors, batch refusal, 429 failover, 403
+parking, pre-flight probe, adaptive batch size), the sweeps, the retry queue and
+its drainer, routes and export, plus a Bitcoin regression group. It writes only
+to a temporary `DISK_PATH`.
+
 ## Security
 
 The dashboard has unauthenticated `POST` endpoints that start long-running
@@ -544,7 +586,9 @@ practical option on smaller plans.
   re-downloading.
 - **Ethereum has no local dataset.** Every `/eth` candidate is checked over
   JSON-RPC, so public endpoints — not the CPU — set the sweep rate, and a
-  large window needs your own node or a paid provider. See
+  large window needs your own node or a paid provider. Public endpoints also
+  reject datacenter IPs outright (HTTP 403), which the pre-flight probe reports
+  before a run wastes hours. See
   [Ethereum](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
 - **Single instance only.** Job state (`_JOBS`) and the SQLite DB are in-process
   and on a local disk. Do not set `numInstances` > 1 or add autoscaling.
