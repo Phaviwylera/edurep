@@ -144,18 +144,24 @@ PYTHONUNBUFFERED=1
 # smaller text-only dumps. Restart after changing this file.
 #DATASET_PREFER_BALANCE_TSV=1
 
-# Bulk nonce-reuse scans: pace public Esplora requests, cache responses and
-# cap one uploaded address file. Defaults: 0.15 s, 2 retries, 4096 entries,
-# 5000 addresses, 2 MB of text.
-# Optional comma-separated MAINNET Esplora endpoints, rotated after a 429.
-# Never put a testnet endpoint here.
+# Esplora access for nonce-reuse scans, the automatic balance gate and the
+# /results balance checks: pace requests, cache responses, cap one uploaded
+# address file. Defaults: 0.3 s spacing, 2 retries, 4096 entries, 5000
+# addresses, 2 MB of text.
+# TWO mainnet endpoints are used by default (ESPLORA_URL plus
+# https://mempool.space/api). On HTTP 429 the endpoint that answered is parked
+# for a cooldown and the request fails over to the other one. Setting
+# ESPLORA_URLS replaces that list entirely - never put a testnet endpoint here.
 #ESPLORA_URLS=https://blockstream.info/api,https://mempool.space/api
 #ESPLORA_MIN_INTERVAL=0.3
 #ESPLORA_MAX_RETRIES=2
 #ESPLORA_CACHE_SIZE=4096
-# Global 429 cooldown cap and adaptive spacing cap (seconds).
+# Per-endpoint 429 cooldown cap and adaptive spacing cap (seconds).
 #ESPLORA_MAX_BACKOFF_SECS=60
 #ESPLORA_PACE_MAX_SECS=2
+# User-Agent sent to Esplora. Public instances throttle the stock
+# python-requests agent harder than an identified one.
+#ESPLORA_USER_AGENT=btc-hunt (github.com/Phaviwylera/edurep)
 #NONCE_MAX_ADDRESSES=5000
 #NONCE_MAX_UPLOAD_BYTES=2000000
 
@@ -164,8 +170,11 @@ PYTHONUNBUFFERED=1
 # reuses the cached .gz). Lower = fewer false HITs, larger/slower build.
 #BLOOM_FP_RATE=0.000001
 
-# Max unique hit addresses checked by one /results "Check balances" run.
+# Max unique hit addresses checked by one /results "Check balances" run, and
+# how many extra passes to make over addresses that were still throttled
+# (HTTP 429) when a pass ended.
 #VERIFY_MAX_ADDRESSES=5000
+#VERIFY_RETRY_PASSES=3
 
 # Live-check every Bloom candidate at hit time and skip 0-BTC addresses.
 # Set AUTO_VERIFY_HITS=0 for the old save-candidate-first behaviour;

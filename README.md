@@ -57,7 +57,7 @@ required for the health check and the public URL to work.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `DISK_PATH` | `/data` (set by Blueprint) | All persistent files go here |
-| `ESPLORA_URL` | `https://blockstream.info/api` | Used by the nonce-reuse attack |
+| `ESPLORA_URL` | `https://blockstream.info/api` | Primary Esplora base URL: nonce reuse, the automatic balance gate and `/results` balance checks |
 | `PYTHONUNBUFFERED` | `1` | Unbuffered logs |
 | `APP_USER` / `APP_PASSWORD` | empty | Optional HTTP Basic auth; **both** must be set to enable it |
 | `DATASET_URLS` | unset | Comma-separated `.gz` mirror URLs tried before the built-in defaults |
@@ -66,16 +66,18 @@ required for the health check and the public URL to work.
 | `DATASET_VERIFY_CHECKSUM` | `0` | Set to `1` to verify Base58Check checksums on untrusted dumps (slower) |
 | `DATASET_MIN_BALANCE` | `0` | Skip TSV rows with balance ≤ this value; `-1` disables filtering |
 | `DATASET_PREFER_BALANCE_TSV` | `1` | Prefer LoyceV dated balance TSVs; set to `0` to prefer smaller text dumps |
-| `ESPLORA_URLS` | `ESPLORA_URL` | Comma-separated **mainnet** Esplora base URLs; rotated after a 429 |
+| `ESPLORA_URLS` | `ESPLORA_URL,https://mempool.space/api` | Comma-separated **mainnet** Esplora base URLs. Each keeps its own 429 cooldown and requests fail over to the next base that is still answering. Setting this replaces the default list entirely |
 | `ESPLORA_MIN_INTERVAL` | `0.3` | Minimum seconds between Esplora requests; `0` disables pacing. Doubled on 429 up to `ESPLORA_PACE_MAX_SECS` |
-| `ESPLORA_MAX_RETRIES` | `2` | Extra attempts on HTTP 429/5xx, after the shared cooldown |
+| `ESPLORA_MAX_RETRIES` | `2` | Extra attempts on HTTP 429/5xx, each on an endpoint that is not cooling down |
 | `ESPLORA_CACHE_SIZE` | `4096` | Bounded in-memory cache of Esplora responses per process |
-| `ESPLORA_MAX_BACKOFF_SECS` | `60` | Cap on the global cooldown after a 429 (or `Retry-After`, if larger) |
+| `ESPLORA_MAX_BACKOFF_SECS` | `60` | Cap on the **per-endpoint** cooldown after a 429 (or `Retry-After`, if larger) |
 | `ESPLORA_PACE_MAX_SECS` | `2` | Cap on the adaptive inter-request spacing after repeated 429s |
+| `ESPLORA_USER_AGENT` | `btc-hunt/<build> (github.com/Phaviwylera/edurep)` | `User-Agent` sent to Esplora; public instances throttle the stock `python-requests` agent harder |
 | `NONCE_MAX_ADDRESSES` | `5000` | Cap on addresses in one bulk upload |
 | `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
 | `BLOOM_FP_RATE` | `0.000001` | Bloom false-positive target; lower = fewer false hits, larger/slower build. Rebuild the bloom after changing it |
 | `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run |
+| `VERIFY_RETRY_PASSES` | `3` | Extra passes over addresses that were still throttled (HTTP 429) when a `/results` balance run ended |
 | `AUTO_VERIFY_HITS` | `1` | Live-check every Bloom candidate before saving; `0` restores save-candidate-only mode |
 | `AUTO_VERIFY_MIN_SATS` | `1` | Minimum chain+mempool sats to save a hit; `0` keeps zero-balance hits with balance fields |
 | `RANDSTORM_MAX_MS` | `5000000` | Automatic Randstorm chunk size in ms; large `/randstorm` ranges are split into sequential chunks |
@@ -139,14 +141,15 @@ The client now:
 
 - paces every request with `ESPLORA_MIN_INTERVAL` (default `0.3` s) and caches
   responses in a bounded LRU;
-- on 429/5xx sets a **process-wide cooldown** (honouring `Retry-After`,
-  otherwise exponential, capped by `ESPLORA_MAX_BACKOFF_SECS`), so one rate
-  limit pauses the whole scan instead of producing thousands of instant
-  failures; doubles the spacing up to `ESPLORA_PACE_MAX_SECS`, then decays it
-  back on success;
-- optionally rotates through `ESPLORA_URLS` (e.g.
-  `https://blockstream.info/api,https://mempool.space/api`) — **mainnet only**;
-  never add a testnet endpoint here;
+- on 429/5xx parks **that endpoint** for a cooldown (honouring `Retry-After`,
+  otherwise exponential, capped by `ESPLORA_MAX_BACKOFF_SECS`) and fails over
+  to the next base that is still answering, so one throttled public instance
+  no longer freezes the whole scan; the shared spacing also doubles up to
+  `ESPLORA_PACE_MAX_SECS`, then decays back on success;
+- uses two **mainnet** bases by default (`ESPLORA_URL` plus
+  `https://mempool.space/api`); override the list with `ESPLORA_URLS` —
+  **mainnet only**, never add a testnet endpoint here. `GET /api/esplora`
+  reports which base is cooling down and for how long;
 - keeps **Stop** responsive during those waits;
 - **never reports a rate-limited address as "0 hits"**. Blocked addresses are
   retried once after the cooldown; any that still fail are written to
@@ -154,7 +157,8 @@ The client now:
   the progress bar stops short of 100%.
 
 A few thousand addresses against the public API takes **hours**, not minutes.
-Raise `ESPLORA_MIN_INTERVAL` or add a second endpoint if you still see 429s.
+A second endpoint is now the default; raise `ESPLORA_MIN_INTERVAL`, or point
+`ESPLORA_URLS` at your own Esplora instance, if you still see 429s.
 For a large list, a local Bitcoin Core node or a paid RPC endpoint is the only
 way to scan it quickly; the public APIs are shared and rate-limited. Modern
 wallets use RFC 6979 deterministic nonces, so reused `r` values are extremely
@@ -180,10 +184,10 @@ stored in the file header.
 ### Automatic live balance gate
 
 By default (`AUTO_VERIFY_HITS=1`), every Bloom candidate — Randstorm,
-brainwallet or nonce reuse — is checked live against `ESPLORA_URL` **before**
-it is saved or logged as a hit. The lookup uses the same paced/cache/429-cooldown
-`_esplora_get()` as the rest of the app, honours **Stop**, and stores the result
-in SQLite. `_save_result()` itself still performs only local SQLite / JSONL
+brainwallet or nonce reuse — is checked live against the configured Esplora
+endpoints **before** it is saved or logged as a hit. The lookup uses the same
+paced/cached `_esplora_get()` as the rest of the app (per-endpoint 429
+cooldowns plus failover), honours **Stop**, and stores the result in SQLite. `_save_result()` itself still performs only local SQLite / JSONL
 writes; the network call is in the attack loop's candidate gate.
 
 `AUTO_VERIFY_MIN_SATS=1` (default) skips zero-balance candidates: the log shows
@@ -192,7 +196,11 @@ writes; the network call is in the attack loop's candidate gate.
 `AUTO_VERIFY_MIN_SATS=0` to keep every candidate with balance fields, or
 `AUTO_VERIFY_HITS=0` to restore the old "save candidate, verify later" mode.
 If the explorer fails, the hit is still saved with `balance_error` and
-`balance_verdict=check_failed`; it is never silently discarded.
+`balance_verdict=check_failed`; it is never silently discarded. An HTTP 429 is
+handled differently because it says nothing about the address: the hit is saved
+with `balance_verdict=check_failed_throttled` and `balance_retry=true`, no
+`balance_checks` row is written, and `/results` keeps showing *not checked yet*
+so the next **Check balances** run picks the address up again.
 
 Saved hits carry `balance_sats`, `balance_tx_count`, `balance_checked_at`,
 `balance_error` and `balance_verdict` directly in the result payload, and
@@ -201,9 +209,12 @@ candidate, so very large scans are slower; use `ESPLORA_URLS` or a private
 Esplora endpoint if needed.
 
 `/results` also keeps **Check balances** / **Force re-check** for refreshing
-stored balances later. It starts a paced, stoppable job that queries
-`ESPLORA_URL` for every saved hit address and stores the result in SQLite.
-Badges:
+stored balances later. It starts a paced, stoppable job that queries every
+saved hit address across the configured endpoints and stores the result in
+SQLite. Addresses that were still throttled when a pass ended are re-queued for
+up to `VERIFY_RETRY_PASSES` extra passes (with a growing wait) and are reported
+as `throttled` in the job detail instead of as errors; the progress bar stops
+short of 100% until they are resolved. Badges:
 
 - `0 BTC · never funded — likely Bloom false positive` (chain `tx_count == 0`)
 - `0 BTC · spent / empty`
