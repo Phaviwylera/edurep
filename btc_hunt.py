@@ -13,7 +13,6 @@ Deploy: gunicorn btc_hunt:app --bind 0.0.0.0:$PORT --timeout 180
 """
 
 import os, sys, io, re, csv, gzip, json, math, time, signal, base64, hmac, html
-import subprocess
 import sqlite3, threading, hashlib, struct, argparse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -124,17 +123,44 @@ CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
 # Visible build marker: tells you whether the running process is actually the
 # commit currently on main. Override with BTC_HUNT_BUILD_ID on platforms that
 # ship without a .git directory (e.g. a build from a tarball).
-def _detect_build_id():
+#
+# Read .git/HEAD directly instead of shelling out to `git`: the systemd unit
+# runs as the unprivileged btc-hunt user while /opt/btc-hunt is root-owned, so
+# `git rev-parse` reports "dubious ownership" and the build id came back as
+# "unknown" on EC2. Reading the files needs no git binary and no ownership
+# check. `base_dir` exists so this is testable without creating a real repo.
+def _detect_build_id(base_dir=None):
     forced = os.environ.get("BTC_HUNT_BUILD_ID", "").strip()
     if forced:
         return forced
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short=7", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent),
-            stderr=subprocess.DEVNULL, timeout=3).decode().strip()
-    except Exception:
-        return "unknown"
+        here = Path(base_dir) if base_dir else Path(__file__).resolve().parent
+        git_dir = here / ".git"
+        if git_dir.is_file():          # linked worktree / submodule
+            line = git_dir.read_text().strip()
+            if line.startswith("gitdir:"):
+                git_dir = Path(line[7:].strip())
+                if not git_dir.is_absolute():
+                    git_dir = (here / git_dir).resolve()
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref: "):
+            ref_name = head[5:].strip()
+            ref = git_dir / ref_name
+            if ref.exists():
+                return ref.read_text(encoding="utf-8").strip()[:7]
+            packed = git_dir / "packed-refs"
+            if packed.exists():
+                for line in packed.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("#") or line.startswith("^"):
+                        continue
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1] == ref_name:
+                        return parts[0][:7]
+        elif re.fullmatch(r"[0-9a-fA-F]{7,40}", head):
+            return head[:7]           # detached HEAD
+    except (OSError, ValueError):
+        pass
+    return "unknown"
 
 BUILD_ID = _detect_build_id()
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
