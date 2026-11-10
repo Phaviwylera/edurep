@@ -328,9 +328,13 @@ each a `steps` budget and an `offset` into its window, and one job sweeps them
 multiply 429s. Each era can also be loaded into the manual Start/End/Unit
 fields and edited.
 
-The defaults sample each era; they do not sweep it. `ETH_ERA_STEPS=1000000`
-covers 0.0016% of Era 3, and the sum over all selected eras must stay under
-`ETH_MAX_TOTAL_STEPS`. Use `offset` to walk through an era run by run:
+The defaults sample each era, but **no range is refused**: set an era's steps to
+its whole span (`whole era`) and it runs, split into batches of
+`ETH_MAX_STEPS=5000000` timestamps that go one after another — `chunk i/N` in
+the log, Stop honoured between batches, everything found so far kept.
+`ETH_MAX_TOTAL_STEPS` is only the threshold above which the start reply and the
+log add a wall-clock estimate (`ETH_ERA_STEPS=1000000` covers 0.0016% of Era 3).
+Use `offset` to walk through an era run by run:
 `offset + steps` is where the next run starts. Two eras in that table cannot be
 recovered by a private-key timestamp sweep at all — Era 1 (presale keys came
 from a CSPRNG; the weakness is the keystore password/IV) and the

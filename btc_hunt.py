@@ -168,6 +168,10 @@ AUTO_VERIFY_MIN_SATS = _env_int("AUTO_VERIFY_MIN_SATS", 1, 0)
 # 4,000,000,000 ms is ~46.3 days of timestamps = 800 default chunks. Stop is
 # honoured between and inside chunks, so a run that long can be abandoned at
 # any point and still keeps every hit it found.
+# Rate used only for the "this will take about N" note on huge ranges. It is
+# the measured randstorm throughput with libsecp256k1 on one vCPU; the real rate
+# in the job log is always the measured one.
+RANDSTORM_RATE          = max(1, _env_int("RANDSTORM_RATE", 6_000, 1))
 RANDSTORM_MAX_MS        = max(1000, _env_int("RANDSTORM_MAX_MS", 5_000_000, 1000))
 RANDSTORM_MAX_TOTAL_MS  = max(RANDSTORM_MAX_MS,
                               _env_int("RANDSTORM_MAX_TOTAL_MS",
@@ -226,8 +230,16 @@ ETH_PENDING_FILE    = "eth_pending.jsonl"
 ETH_PENDING_MAX     = _env_int("ETH_PENDING_MAX", 200_000, 0)
 # Some gateways reject an unidentified client with 403. Override if yours does.
 ETH_RPC_USER_AGENT  = os.environ.get("ETH_RPC_USER_AGENT", "").strip()
-# Timestamp-step caps, mirroring RANDSTORM_MAX_MS / RANDSTORM_MAX_TOTAL_MS.
+# Timestamp batching, mirroring RANDSTORM_MAX_MS / RANDSTORM_MAX_TOTAL_MS.
+# ETH_MAX_STEPS is the BATCH SIZE: every sweep, however large, is split into
+# batches of at most this many timestamps and the batches run one after another.
+# ETH_MAX_TOTAL_STEPS is only a WARN THRESHOLD — nothing is refused any more,
+# but past it the reply and the log spell out the batch count and the wall-clock
+# time, because "63 billion steps" reads as a number rather than as a month.
 # One "step" is one timestamp in the selected unit (ms or s).
+# Measured sha256_dec candidates/s with both accelerators on one vCPU; used only
+# for the "≈N days" note on huge ranges. The job log always shows the real rate.
+ETH_RATE            = max(1, _env_int("ETH_RATE", 24_000, 1))
 ETH_MAX_STEPS       = max(1000, _env_int("ETH_MAX_STEPS", 5_000_000, 1000))
 ETH_MAX_TOTAL_STEPS = max(ETH_MAX_STEPS,
                           _env_int("ETH_MAX_TOTAL_STEPS", 20_000_000, 1000))
@@ -1176,6 +1188,53 @@ def _randstorm_chunks(start_ms, end_ms, chunk_ms):
         end = min(int(end_ms), start + step - 1)
         yield start, end
         start = end + 1
+
+
+def _human_secs(secs):
+    """A duration a human can act on — including the absurd ones honestly."""
+    try:
+        secs = float(secs)
+    except (TypeError, ValueError):
+        return "?"
+    if secs != secs or secs in (float("inf"), float("-inf")):
+        return "?"
+    if secs < 90:
+        return "%.0f s" % secs
+    if secs < 5400:
+        return "%.1f min" % (secs / 60)
+    if secs < 129600:
+        return "%.1f h" % (secs / 3600)
+    if secs < 63072000:
+        return "%.1f days" % (secs / 86400)
+    years = secs / 31557600
+    return ("%s years" % format(int(round(years)), ",") if years < 1e6
+            else "%.3g years" % years)
+
+
+def _batch_count(total, batch):
+    """How many batches a run of `total` items needs at `batch` per batch."""
+    return max(1, -(-int(total) // max(1, int(batch))))
+
+
+def _batch_note(total, batch, noun="steps", rate=None):
+    """The sentence that replaces every "range too large" refusal.
+
+    No range is rejected any more. A run larger than one batch is split and the
+    batches run one after another — which is all the old cap ever bought, minus
+    the dead end. This says how many batches there are and, when a rate is
+    known, how long that will actually take, so the number is informative
+    instead of blocking.
+    """
+    total = int(total)
+    n = _batch_count(total, batch)
+    out = ("%s %s in %s batch%s of %s — batches run one after another; Stop "
+           "between them keeps everything found so far"
+           % (format(total, ","), noun, format(n, ","),
+              "" if n == 1 else "es", format(int(batch), ",")))
+    if rate:
+        out += " (≈%s at %s/s)" % (_human_secs(total / rate),
+                                   format(int(rate), ","))
+    return out
 
 
 def attack_randstorm(start_ms, end_ms, bf, log, job):
@@ -2172,6 +2231,15 @@ def _start_job(name, fn, *args):
                 if not was_killed:
                     if job["error"]:
                         job["detail"] = f"failed: {job['error']}"
+                    elif job.get("stop") and job.get("progress", 0.0) < 1.0:
+                        # Stopped before the end. Now that no range is refused
+                        # and huge runs are normal, a stopped run is the common
+                        # case — the bar must show where it actually got to, not
+                        # jump to a green 100% it never earned.
+                        job["partial"] = True
+                        job["detail"] = ("stopped at %.2f%% — everything found "
+                                         "so far is kept"
+                                         % (100.0 * job.get("progress", 0.0)))
                     else:
                         if not job.get("partial"):
                             job["progress"] = 1.0
@@ -2900,13 +2968,16 @@ def rs_page():
 <input id="s" value="1293840000000">
 <label>End (ms since epoch)</label>
 <input id="e" value="1293840001000">
-<p class="muted">2011-01-01 → 2015-01-01 is the vulnerable window, but that is
-126 billion timestamps and would take months. Larger ranges are split
-automatically into chunks of at most {chunk_ms} ms and run in order; one run may
-span up to {total_ms} ms (about {total_days} days, {total_chunks} chunks) by
-default — set RANDSTORM_MAX_TOTAL_MS to change that cap. A run that size takes
-many hours: progress, chunk number, hits and ETA stay visible, and Stop ends it
-cleanly between or inside a chunk while keeping everything found so far. Bloom
+<p class="muted">2011-01-01 → 2015-01-01 is the vulnerable window, and that is
+126 billion timestamps. <b>Any range is accepted</b> — nothing is refused. A run
+wider than {chunk_ms} ms is split into batches of at most {chunk_ms} ms
+(<code>RANDSTORM_MAX_MS</code>) and the batches run in order, each logging
+<code>chunk i/N</code>: 126 billion ms is {full_chunks} batches, about
+{full_eta} of CPU. Above {total_ms} ms (<code>RANDSTORM_MAX_TOTAL_MS</code>,
+≈{total_days} days, {total_chunks} batches) the start reply adds that estimate
+instead of blocking the run. Progress, chunk number, hits and ETA stay visible,
+and Stop ends it cleanly between or inside a batch while keeping everything
+found so far. Bloom
 candidates are live-checked for balance as found; zero-balance addresses are
 skipped by default. At BLOOM_FP_RATE=1e-6 expect roughly 3 false candidates per
 million timestamps, each costing one paced explorer request.</p>
@@ -2932,6 +3003,10 @@ watch('randstorm');
                      f"{-(-RANDSTORM_MAX_TOTAL_MS // max(1, RANDSTORM_MAX_MS)):,}")
             .replace("{total_days}",
                      f"{RANDSTORM_MAX_TOTAL_MS / _MS_PER_DAY:.1f}")
+            # 2011-01-01 -> 2015-01-01 is 1461 days = 126,230,400,000 ms.
+            .replace("{full_chunks}",
+                     f"{-(-126_230_400_000 // max(1, RANDSTORM_MAX_MS)):,}")
+            .replace("{full_eta}", _human_secs(126_230_400_000 / RANDSTORM_RATE))
             .replace("{total_ms}", f"{RANDSTORM_MAX_TOTAL_MS:,}"))
     return page(body)
 
@@ -2947,19 +3022,24 @@ def api_rs():
         return {"ok": False, "msg": "start and end must be integer ms timestamps"}
     if end < start:
         return {"ok": False, "msg": "end must be >= start"}
-    if end - start + 1 > RANDSTORM_MAX_TOTAL_MS:
-        return {"ok": False,
-                "msg": (f"range too large: {end - start + 1:,} ms is over the "
-                        f"{RANDSTORM_MAX_TOTAL_MS:,} ms cap "
-                        f"(\u2248{RANDSTORM_MAX_TOTAL_MS / _MS_PER_DAY:.1f} days); "
-                        "set RANDSTORM_MAX_TOTAL_MS to raise it, or run it in "
-                        "pieces — Stop keeps everything found so far")}
     try:
         bf = BloomFilter.load(BLOOM_PATH)
     except Exception as e:
         return {"ok": False, "msg": f"cannot load bloom filter: {e}"}
     ok, msg = _start_job("randstorm", attack_randstorm, start, end, bf)
-    return {"ok": ok, "msg": msg}
+    if ok:
+        # Every range is accepted now: big ones just run batch after batch.
+        # Past RANDSTORM_MAX_TOTAL_MS the reply also says what that means in
+        # wall-clock time, because "126 billion timestamps" is not a number
+        # anyone can picture.
+        span = end - start + 1
+        if span > RANDSTORM_MAX_TOTAL_MS:
+            msg = "%s — %s" % (msg, _batch_note(span, RANDSTORM_MAX_MS, "ms",
+                                                RANDSTORM_RATE))
+        elif span > RANDSTORM_MAX_MS:
+            msg = "%s — %s" % (msg, _batch_note(span, RANDSTORM_MAX_MS, "ms"))
+    return {"ok": ok, "msg": msg, "batches": _batch_count(
+        end - start + 1, RANDSTORM_MAX_MS)}
 
 @app.route("/brain")
 def brain_page():
@@ -4574,6 +4654,31 @@ def attack_eth_eras(specs, recipe_ids, log, job):
                                      label=label)
         # keep the era visible in the job detail the sticky header chip shows
         job["detail"] = "%s %s" % (e["era"], job.get("detail") or "")
+        if job["stop"]:
+            # Stop landed somewhere inside this era. Did the era itself finish?
+            # attack_eth_timestamp maps era k onto [k-1/n, k/n] of the bar, so
+            # reaching k/n means the era completed and only the *next* ones were
+            # never started. Anything less is an interrupted era, which must not
+            # be credited -- that is how a run stopped on its first timestamp
+            # used to end up showing a full green bar.
+            finished = job.get("progress", 0.0) >= (k / n) - 1e-9
+            if finished:
+                done_eras += 1
+                log("[era] stopped after %s completed — %d of %d era(s) swept; "
+                    "the rest were not started (%s empty skipped, %s queued in "
+                    "%s)"
+                    % (e["id"], done_eras, n,
+                       format(job.get("eth_skipped", 0), ","),
+                       format(job.get("eth_queued", 0), ","),
+                       _eth_pending_path()))
+            else:
+                log("[era] stopped during %s — %d of %d era(s) finished, %s "
+                    "empty skipped, %s queued in %s"
+                    % (e["id"], done_eras, n,
+                       format(job.get("eth_skipped", 0), ","),
+                       format(job.get("eth_queued", 0), ","),
+                       _eth_pending_path()))
+            break
         done_eras += 1
         # Both signals mean the same thing: nothing could be checked. `eth_no_rpc`
         # is set when every endpoint refuses mid-batch; `eth_rpc_alive == 0` when
@@ -4586,8 +4691,10 @@ def attack_eth_eras(specs, recipe_ids, log, job):
                 % _eth_pending_path())
             break
     if job["stop"] or broke:
-        # Not finished: leave the bar where the run actually got to.
-        job["progress"] = min(1.0, max(job.get("progress", 0.0), done_eras / n))
+        # Not finished: leave the bar exactly where the run got to. Never round
+        # it up -- a stopped run that shows 100% is how people lose track of
+        # which slice of an era they still owe themselves.
+        job["progress"] = min(1.0, max(0.0, job.get("progress", 0.0)))
     else:
         job["progress"] = 1.0
     log("[era] batch done — %d of %d era(s) swept, %d hit(s), %s empty skipped, "
@@ -4945,14 +5052,17 @@ button and one retry queue.</p>
 <p class="muted"><b>Be honest with yourself about scale.</b> Era 1 is
 {span1} timestamps wide, Era 2 {span2} and Era 3 {span3}. A batch run takes
 <i>steps</i> from each era, not the whole era: the default {erasteps} steps per
-era is one timestamp in {ratio3} of Era 3 ({cover3}%). The whole of Era 3 is <b>{days3} days of pure
-CPU</b> at ~{rate} candidates/s, and it would need <b>{reqs3} batch
-requests</b> — about {rpcyears3} years at a sustainable 5 requests/s from a
-public endpoint. That is why <code>ETH_MAX_TOTAL_STEPS</code> ({maxtotal})
-exists, and why the log prints the exact slice and the percentage of the window
-each run covered. Use the batch to <i>sample</i> an era, and the offset field to
-walk through it run by run: <code>offset + steps</code> is where the next run
-starts.</p>
+era is one timestamp in {ratio3} of Era 3 ({cover3}%). <b>Nothing here is
+refused:</b> ask for a whole era and it runs — split into batches of {maxsteps}
+timestamps that go one after another, each logging <code>chunk i/N</code>, with
+Stop honoured between batches and everything found so far kept. What the number
+buys you is time, not permission: the whole of Era 3 is <b>{days3} days of pure
+CPU</b> at ~{rate} candidates/s and <b>{reqs3} batch requests</b> — about
+{rpcyears3} years at a sustainable 5 requests/s from a public endpoint. Past
+{maxtotal} steps (<code>ETH_MAX_TOTAL_STEPS</code>) the reply and the log say so
+in wall-clock terms instead of blocking the run. Use <b>steps</b> to size a
+sample and <b>offset</b> to walk an era run by run: <code>offset + steps</code>
+is where the next run starts.</p>
 <div class="eras">{eras}</div>
 <div class="row">
 <button class="btn go" onclick="startEra()">▶ Start era batch</button>
@@ -4961,7 +5071,9 @@ starts.</p>
 <button class="btn ghost sm" onclick="clearEras()">clear</button>
 <button class="btn ghost sm" onclick="allSteps({erasteps})">steps = {erasteps}</button>
 <span id="eraTotal" class="pill ok">0 steps total</span>
-<span class="tiny">cap {maxtotal} steps per run (<code>ETH_MAX_TOTAL_STEPS</code>)</span>
+<span class="tiny">no cap — batches of {maxsteps} (<code>ETH_MAX_STEPS</code>),
+run in order; <code>ETH_MAX_TOTAL_STEPS</code>={maxtotal} is only where the ETA
+note kicks in</span>
 </div>
 <div class="bar"><div id="barEra" style="width:0%"></div></div>
 <p id="detailEra" class="muted"></p><pre id="logEra"></pre>
@@ -4994,8 +5106,12 @@ is not one of the fixed eras, or after loading an era with
 <div><label>End</label><input id="e" value="1671753599"></div>
 </div>
 <p class="row">{presets}</p>
-<p class="muted">One run may span at most {maxtotal} steps ({maxsteps} per
-chunk, split automatically).</p>
+<p class="muted"><b>Any range is accepted.</b> A run wider than {maxsteps} steps
+is split into batches of at most {maxsteps} (<code>ETH_MAX_STEPS</code>) and the
+batches run one after another — the log prints <code>chunk i/N</code> for each,
+Stop is honoured between and inside batches, and everything found so far is
+kept. Above {maxtotal} steps the start reply adds the batch count and an
+honest wall-clock estimate.</p>
 <div class="row">
 <button class="btn go" onclick="startTs()">▶ Start</button>
 <button class="btn danger" onclick="stop('eth_ts')">■ Stop</button>
@@ -5069,7 +5185,8 @@ candidates</button>
 </div>
 <script>
 const ERAS={eras_json};
-const CAP={maxtotal_raw};
+const CAP={maxtotal_raw};      // warn threshold only — nothing is refused
+const BATCH={maxsteps_raw};    // ETH_MAX_STEPS: timestamps per batch
 const NL=String.fromCharCode(10);
 function fmt(n){ return (n||0).toLocaleString('en-US'); }
 function $(id){ return document.getElementById(id); }
@@ -5087,8 +5204,12 @@ function eraTotal(){
     sum += parseInt(($('st-'+c.value)||{}).value||'0',10)||0;
   });
   const el=$('eraTotal');
-  if(el){ el.textContent=fmt(sum)+' steps total'+(sum>CAP?' — OVER CAP':'');
-          el.className='pill '+(sum>CAP?'bad':(sum?'ok':'warn')); }
+  if(el){
+    const n=sum?Math.max(1,Math.ceil(sum/BATCH)):0;
+    el.textContent=sum?(fmt(sum)+' steps total · '+fmt(n)+' batches'+
+      (sum>CAP?' · long run':'')):'0 steps total';
+    el.className='pill '+(sum?(sum>CAP?'warn':'ok'):'warn');
+  }
 }
 function allSteps(n){
   each('.erack',function(c){ const el=$('st-'+c.value); if(el) el.value=n; });
@@ -5105,9 +5226,10 @@ function eraWhole(id){
   const e=ERAS[id]; if(!e) return;
   const el=$('st-'+id); if(el) el.value=e.span;
   eraTotal();
-  notify('whole '+e.era+' = '+fmt(e.span)+' steps'+
-    (e.span>CAP?' — over the '+fmt(CAP)+' cap, so select fewer eras or raise ETH_MAX_TOTAL_STEPS':''),
-    e.span<=CAP);
+  const n=Math.max(1,Math.ceil(e.span/BATCH));
+  notify('whole '+e.era+' = '+fmt(e.span)+' steps = '+fmt(n)+' batches of '+
+    fmt(BATCH)+', run in order'+(e.span>CAP?' — that is a very long run; Stop any time and everything found is kept':''),
+    true);
 }
 function eraManual(id){
   const e=ERAS[id]; if(!e) return;
@@ -5218,6 +5340,7 @@ setInterval(refreshPending, 15000);
                            "scannable": e.get("scannable", True)}
                  for e in ETH_ERAS}))
             .replace("{maxtotal_raw}", str(ETH_MAX_TOTAL_STEPS))
+            .replace("{maxsteps_raw}", str(ETH_MAX_STEPS))
             .replace("{span1}", format(e1, ","))
             .replace("{span2}", format(e2, ","))
             .replace("{span3}", format(e3, ","))
@@ -5345,13 +5468,6 @@ def api_eth_era():
     except (TypeError, ValueError):
         return {"ok": False, "msg": "steps and offset must be integers"}
     total = sum(s["steps"] for s in specs)
-    if total > ETH_MAX_TOTAL_STEPS:
-        return {"ok": False,
-                "msg": ("%s steps across %d era(s) is over the %s cap — lower "
-                        "the per-era steps, select fewer eras, or raise "
-                        "ETH_MAX_TOTAL_STEPS"
-                        % (format(total, ","), len(specs),
-                           format(ETH_MAX_TOTAL_STEPS, ",")))}
     ids = j.get("recipes") or []
     if not isinstance(ids, list):
         ids = [str(ids)]
@@ -5369,8 +5485,14 @@ def api_eth_era():
     if ok and skipped:
         msg = ("%s — note: %s cannot be recovered by a private-key sweep and is "
                "scanned only to demonstrate that" % (msg, ", ".join(skipped)))
+    if ok and total > ETH_MAX_STEPS:
+        msg = "%s — %s" % (msg, _batch_note(
+            total, ETH_MAX_STEPS, "steps",
+            ETH_RATE / max(1, len(ids)) if total > ETH_MAX_TOTAL_STEPS else None))
     return {"ok": ok, "msg": msg, "eras": [s["id"] for s in specs],
-            "recipes": ids, "steps": total}
+            "recipes": ids, "steps": total,
+            "batches": _batch_count(total, ETH_MAX_STEPS),
+            "batch_steps": ETH_MAX_STEPS}
 
 
 @app.route("/api/eth/timestamp", methods=["POST"])
@@ -5386,11 +5508,6 @@ def api_eth_timestamp():
     if end < start:
         return {"ok": False, "msg": "end must be >= start"}
     span = end - start + 1
-    if span > ETH_MAX_TOTAL_STEPS:
-        return {"ok": False,
-                "msg": ("range too large: %s steps is over the %s cap; set "
-                        "ETH_MAX_TOTAL_STEPS to raise it, or sweep a slice"
-                        % (format(span, ","), format(ETH_MAX_TOTAL_STEPS, ",")))}
     ids = j.get("recipes") or []
     if not isinstance(ids, list):
         ids = [str(ids)]
@@ -5403,7 +5520,17 @@ def api_eth_timestamp():
                             r for r in ETH_RECIPES
                             if unit in ETH_RECIPES[r]["units"])))}
     ok, msg = _start_job("eth_ts", attack_eth_timestamp, start, end, unit, usable)
-    return {"ok": ok, "msg": msg, "recipes": usable}
+    if ok and span > ETH_MAX_STEPS:
+        # Accepted, not refused: the sweep splits into batches of ETH_MAX_STEPS
+        # and runs them in order. Past ETH_MAX_TOTAL_STEPS the note also carries
+        # the wall-clock estimate, since that is the part people misjudge.
+        msg = "%s — %s" % (msg, _batch_note(
+            span, ETH_MAX_STEPS, "steps",
+            ETH_RATE / max(1, len(usable)) if span > ETH_MAX_TOTAL_STEPS
+            else None))
+    return {"ok": ok, "msg": msg, "recipes": usable, "span": span,
+            "batches": _batch_count(span, ETH_MAX_STEPS),
+            "batch_steps": ETH_MAX_STEPS}
 
 
 @app.route("/api/eth/weakkeys", methods=["POST"])
@@ -5421,15 +5548,19 @@ def api_eth_weakkeys():
     lines = [x.strip() for x in lines if x and x.strip()]
     if count < 0:
         return {"ok": False, "msg": "count must be >= 0"}
-    if count + len(lines) > ETH_MAX_WEAK_KEYS:
-        return {"ok": False,
-                "msg": ("too many keys: %s is over ETH_MAX_WEAK_KEYS=%s"
-                        % (format(count + len(lines), ","),
-                           format(ETH_MAX_WEAK_KEYS, ",")))}
     if count + len(lines) == 0:
         return {"ok": False, "msg": "set a count or paste some keys"}
     ok, msg = _start_job("eth_weak", attack_eth_weakkeys, count, lines)
-    return {"ok": ok, "msg": msg}
+    if ok and count + len(lines) > ETH_MAX_WEAK_KEYS:
+        # Not refused: keys are streamed and flushed one RPC batch at a time, so
+        # a huge count simply runs longer. Past the warn threshold, say how long.
+        msg = ("%s — %s keys is past ETH_MAX_WEAK_KEYS=%s: they are checked one "
+               "RPC batch at a time, ≈%s at %s keys/s, and Stop keeps every hit"
+               % (msg, format(count + len(lines), ","),
+                  format(ETH_MAX_WEAK_KEYS, ","),
+                  _human_secs((count + len(lines)) / ETH_RATE),
+                  format(ETH_RATE, ",")))
+    return {"ok": ok, "msg": msg, "keys": count + len(lines)}
 
 
 @app.route("/api/eth/ping", methods=["POST", "GET"])
@@ -5520,8 +5651,11 @@ if __name__ == "__main__":
                      "" if e.get("scannable", True)
                      else "  [NOT recoverable by a privkey sweep]"))
             print("           %s" % e["note"])
-        print("default per-era steps: %s  (ETH_ERA_STEPS)  cap per run: %s"
-              % (format(ETH_ERA_STEPS, ","), format(ETH_MAX_TOTAL_STEPS, ",")))
+        print("default per-era steps: %s (ETH_ERA_STEPS)  batch size: %s "
+              "(ETH_MAX_STEPS)  warn above: %s (ETH_MAX_TOTAL_STEPS — nothing is "
+              "refused, large runs just take more batches)"
+              % (format(ETH_ERA_STEPS, ","), format(ETH_MAX_STEPS, ","),
+                 format(ETH_MAX_TOTAL_STEPS, ",")))
         sys.exit(0)
 
     if args.cli_eth_era:
@@ -5558,12 +5692,13 @@ if __name__ == "__main__":
                      % (", ".join(bad), ", ".join(known)))
         if not specs:
             sys.exit("--cli-eth-era needs at least one era id")
-        over = sum(s["steps"] for s in specs) - ETH_MAX_TOTAL_STEPS
-        if over > 0:
-            sys.exit("%s steps across %d era(s) is over the %s cap "
-                     "(ETH_MAX_TOTAL_STEPS)"
-                     % (format(sum(s["steps"] for s in specs), ","),
-                        len(specs), format(ETH_MAX_TOTAL_STEPS, ",")))
+        total = sum(s["steps"] for s in specs)
+        if total > ETH_MAX_TOTAL_STEPS:
+            # A warning, not a refusal: it still runs, batch after batch.
+            print("[era] note: %s" % _batch_note(total, ETH_MAX_STEPS, "steps",
+                                                 ETH_RATE / max(1, len(ids))))
+        elif total > ETH_MAX_STEPS:
+            print("[era] note: %s" % _batch_note(total, ETH_MAX_STEPS, "steps"))
         attack_eth_eras(specs, ids, print, job)
         sys.exit(0)
 

@@ -186,6 +186,8 @@ PYTHONUNBUFFERED=1
 # accepted run. Defaults: 5,000,000 ms per chunk, 4,000,000,000 ms total
 # (~46.3 days of timestamps, ~800 chunks, many hours of work). Stop keeps
 # everything found so far, so a long run can be abandoned at any point.
+# Batch size in ms for /randstorm: any range is split into batches of this many
+# ms and they run in order. RANDSTORM_MAX_TOTAL_MS is only the warn threshold.
 #RANDSTORM_MAX_MS=5000000
 #RANDSTORM_MAX_TOTAL_MS=4000000000
 
@@ -215,16 +217,22 @@ PYTHONUNBUFFERED=1
 #ETH_RPC_USER_AGENT=btc-hunt (github.com/Phaviwylera/edurep)
 #ETH_MIN_WEI=1
 #ETH_VERIFY_BALANCES=1
-# Per-chunk and per-run caps on timestamp steps (the Trust Wallet window is
-# 2,505,600 one-second seeds), and the cap on one weak-key run.
+# Batch size and warn threshold for timestamp steps. Nothing is refused: a run
+# of any size is split into batches of ETH_MAX_STEPS and the batches run one
+# after another (chunk i/N in the log, Stop honoured between them). Above
+# ETH_MAX_TOTAL_STEPS the start reply and the log also print the batch count and
+# a wall-clock estimate based on ETH_RATE candidates/s.
 #ETH_MAX_STEPS=5000000
 #ETH_MAX_TOTAL_STEPS=20000000
+#ETH_RATE=24000
 # The era batch (/eth "1 · Era batch", or --cli-eth-era) sweeps the fixed era
 # windows in sequence. Those windows are billions of timestamps wide, so this is
-# the slice taken from EACH era per run -- a sample, not a sweep. Raise it only
-# with a private RPC endpoint; the sum over all selected eras must stay under
-# ETH_MAX_TOTAL_STEPS.
+# the slice taken from EACH era per run -- a sample by default, not a sweep.
+# Raise it, or set an era's steps to its whole span in the UI, if you have a
+# private RPC endpoint and the patience.
 #ETH_ERA_STEPS=1000000
+# Warn threshold for one weak-key run (keys are streamed one RPC batch at a
+# time, so a larger count just runs longer).
 #ETH_MAX_WEAK_KEYS=2000000
 # Vendored 2048-word BIP-39 English list (sha256 2f5eed53...).
 #BIP39_WORDLIST_PATH=/opt/btc-hunt/data/bip39_english.txt
