@@ -29,10 +29,20 @@ ENV_FILE="${ENV_FILE:-/etc/btc-hunt.env}"
 DISK_PATH="$(sed -n 's/^DISK_PATH=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
 DISK_PATH="${DISK_PATH:-/var/lib/btc-hunt}"
 BUSY_MARKER="$DISK_PATH/.btc-hunt-busy"
+# A hard-killed process can leave the marker behind forever. The dataset job's
+# own deadline is 30 minutes, so 35 minutes is a safe "definitely stale" bound.
+BUSY_MAX_AGE_SECS="${BUSY_MAX_AGE_SECS:-2100}"
 if [ -f "$BUSY_MARKER" ] && [ "${BTC_HUNT_FORCE_UPDATE:-0}" != "1" ]; then
-  echo "[update] job running ($(cat "$BUSY_MARKER")) — deferring deploy until it finishes"
-  echo "[update] to override: sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update"
-  exit 0
+  MARKER_MTIME="$(stat -c %Y "$BUSY_MARKER" 2>/dev/null || echo 0)"
+  MARKER_AGE="$(( $(date +%s) - MARKER_MTIME ))"
+  if [ "$MARKER_AGE" -gt "$BUSY_MAX_AGE_SECS" ]; then
+    echo "[update] stale busy marker (${MARKER_AGE}s old) — clearing and deploying"
+    rm -f "$BUSY_MARKER"
+  else
+    echo "[update] job running ($(cat "$BUSY_MARKER")) — deferring deploy until it finishes"
+    echo "[update] to override: sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update"
+    exit 0
+  fi
 fi
 
 BEFORE="$(git -C "$APP_DIR" rev-parse HEAD)"

@@ -164,6 +164,31 @@ CPU, and a real persistent volume. Note `.python-version` is only used by
 Render; on EC2 the system Python (3.12 on Ubuntu 24.04) is used inside the
 venv, and `requirements.txt` pins the dependencies.
 
+## Dataset mirrors
+
+`/data` tries, in order: the `privatekeyfinder.io` hash160-hex dump (~470 MB),
+its address TSV dumps (~1.6 GB), up to six recent dated snapshots discovered
+from the `addresses.loyce.club` HTML index, then the official (throttled)
+`gz.blockchair.com` dump. LoyceV's `LATEST` aliases were disabled in 2026 in
+favour of torrents; the app does not run a BitTorrent client, it uses the
+dated HTTP links from the index. Override with a comma-separated
+`DATASET_URLS=` in `/etc/btc-hunt.env` (then `sudo systemctl restart btc-hunt`),
+or paste one URL into the **Dataset URL** box on `/data`. Any gzip containing
+addresses, `address<TAB>balance` TSV rows, or 40-character hash160 hex lines
+works.
+
+To place a file manually (useful when the instance cannot reach a mirror but
+your laptop can):
+
+```bash
+scp bitcoin.hex.gz ubuntu@<public-ip>:/tmp/bitcoin.hex.gz
+sudo cp /tmp/bitcoin.hex.gz /var/lib/btc-hunt/blockchair.tsv.gz
+sudo chown btc-hunt:btc-hunt /var/lib/btc-hunt/blockchair.tsv.gz
+```
+
+Then click **Download & build bloom** — the cached file is used as-is. Click
+**Re-download & rebuild** to discard it and fetch fresh data.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -173,6 +198,7 @@ venv, and `requirements.txt` pins the dependencies.
 | `/health` times out | Security group inbound rules; `sudo systemctl status btc-hunt`; `sudo nginx -t`; bootstrap log |
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
-| Dataset build fails | Outbound HTTPS to `addresses.loyce.club` / `3xpl.com`; `df -h`; check the job log on `/data` |
+| Auto-pull stuck on `job running` | A stale busy marker older than 35 minutes is now cleared automatically; `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` forces it immediately |
+| All dataset mirrors failed | LoyceV disabled its `LATEST` direct download (torrent-only); the app now discovers dated snapshots from its index. Paste a working `.gz` URL into the Dataset URL field, set `DATASET_URLS` in `/etc/btc-hunt.env`, or `sudo cp` a dump to `/var/lib/btc-hunt/blockchair.tsv.gz` |
 | 401 after enabling auth | Restart the service; `/etc/btc-hunt.env` is read once at process start |
 | Data gone after reboot | Verify `UUID=... /var/lib/btc-hunt` is in `/etc/fstab` and the volume is still attached |

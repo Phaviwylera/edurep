@@ -122,6 +122,11 @@ PYTHONUNBUFFERED=1
 # sudo systemctl restart btc-hunt
 #APP_USER=admin
 #APP_PASSWORD=change-me
+
+# Optional: comma-separated .gz mirror URLs, tried BEFORE the built-in
+# public mirrors. Leave commented to use the built-in defaults. Restart with
+# sudo systemctl restart btc-hunt after editing this file.
+#DATASET_URLS=https://my-mirror.example/bitcoin.hex.gz
 EOF
   chmod 0600 "$ENV_FILE"
   log "created $ENV_FILE (add APP_USER / APP_PASSWORD there to require login)"
