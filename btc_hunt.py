@@ -40,8 +40,12 @@ RESULTS    = DATA_DIR / "results.json"
 # would kill the job). Removed at import time in case a previous process died
 # without cleaning up.
 BUSY_FILE  = DATA_DIR / ".btc-hunt-busy"
+# btc-hunt-update uses this to tell a genuinely running job from a marker
+# left behind by a worker that was killed or restarted.
+BUSY_PID_FILE = DATA_DIR / ".btc-hunt-busy.pid"
 try:
     BUSY_FILE.unlink(missing_ok=True)
+    BUSY_PID_FILE.unlink(missing_ok=True)
 except OSError:
     pass
 
@@ -1362,6 +1366,7 @@ def attack_nonce_reuse_bulk(addresses, log, job):
 # ════════════════════════════════════════════════════════════════════
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
+JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify")
 
 _HITS_FILE = None  # set in worker mode: append-only JSONL of hits
 
@@ -1515,32 +1520,41 @@ def verify_result_balances(force, log, job):
         f"{errors:,} errors")
 
 def _sync_busy():
-    """Keep the deploy marker in sync with the set of live jobs."""
+    """Keep the deploy marker and its PID file in sync with the live jobs."""
     try:
         with _JOBS_LOCK:
             alive = sorted(n for n, j in _JOBS.items() if j["alive"])
         if alive:
             BUSY_FILE.write_text(",".join(alive), encoding="utf-8")
+            BUSY_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
         else:
             BUSY_FILE.unlink(missing_ok=True)
+            BUSY_PID_FILE.unlink(missing_ok=True)
     except OSError:
         pass
 
 
 def _start_job(name, fn, *args):
     with _JOBS_LOCK:
-        if name in _JOBS and _JOBS[name]["alive"]:
+        prev = _JOBS.get(name)
+        if prev and prev["alive"]:
             return False, "job already running"
+        if prev and prev.get("resetting"):
+            return False, "job is still shutting down after reset"
         job = {"progress": 0.0, "detail": "starting…", "alive": True,
                "stop": False, "log": [], "log_total": 0, "error": "",
+               "killed": False, "resetting": False,
                "started": datetime.now(timezone.utc).isoformat()}
         _JOBS[name] = job
     _sync_busy()
 
     def log(msg):
         # The log list is capped, but log_total is monotonic so clients can
-        # ask for "everything since N" without losing their place.
+        # ask for "everything since N" without losing their place. A killed
+        # job must not append "done" after the reset cleared its state.
         with _JOBS_LOCK:
+            if job.get("killed") and not msg.startswith("[reset]"):
+                return
             job["log"].append(msg)
             job["log_total"] += 1
             if len(job["log"]) > 500:
@@ -1551,20 +1565,89 @@ def _start_job(name, fn, *args):
         try:
             fn(*args, job=job, log=log)
         except Exception as e:
-            job["error"] = str(e)
-            log(f"[!] {name} crashed: {e}")
+            if not job.get("killed"):
+                job["error"] = str(e)
+                log(f"[!] {name} crashed: {e}")
         finally:
-            job["alive"] = False
-            if job["error"]:
-                job["detail"] = f"failed: {job['error']}"
-            else:
-                if not job.get("partial"):
-                    job["progress"] = 1.0
-                job["detail"] = job["detail"] or "done"
+            with _JOBS_LOCK:
+                job["alive"] = False
+                was_killed = bool(job.get("killed"))
+                # A reset removes the slot entirely once the thread unwinds.
+                if was_killed and _JOBS.get(name) is job:
+                    del _JOBS[name]
+                job["resetting"] = False
+                if not was_killed:
+                    if job["error"]:
+                        job["detail"] = f"failed: {job['error']}"
+                    else:
+                        if not job.get("partial"):
+                            job["progress"] = 1.0
+                        job["detail"] = job["detail"] or "done"
             _sync_busy()
 
     threading.Thread(target=runner, daemon=True).start()
     return True, "started"
+
+
+def _kill_all_jobs(reason="killed from dashboard"):
+    """Stop every job slot, clear its UI state and unblock auto-deploy.
+
+    Python cannot forcibly kill a thread, so alive threads are flagged and
+    removed from _JOBS once they unwind. The dashboard also offers a Gunicorn
+    worker restart, which kills any thread that ignores its stop flag.
+    """
+    killed = []
+    with _JOBS_LOCK:
+        for name, job in list(_JOBS.items()):
+            if not job["alive"] and not job.get("resetting"):
+                del _JOBS[name]          # forget completed jobs too
+                continue
+            job["stop"] = True
+            job["alive"] = False
+            job["killed"] = True
+            job["resetting"] = True
+            job["error"] = ""
+            job["progress"] = 0.0
+            job["detail"] = "killed — no jobs running"
+            job["partial"] = False
+            job["log"] = []
+            job["log_total"] = 0
+            killed.append(name)
+    try:
+        BUSY_FILE.unlink(missing_ok=True)
+        BUSY_PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return killed
+
+
+def _can_restart_worker():
+    """Only a Gunicorn worker can safely be replaced by its master."""
+    if os.environ.get("BTC_HUNT_WORKER_RESTART", "1") == "0":
+        return False
+    try:
+        cmd = (Path(f"/proc/{os.getppid()}/cmdline")
+               .read_bytes().replace(b"\0", b" ")
+               .decode("utf-8", "ignore"))
+    except OSError:
+        return False
+    return "gunicorn" in cmd and "btc_hunt:app" in cmd
+
+
+def _schedule_worker_restart():
+    """Let the HTTP response finish, then ask Gunicorn for a fresh worker."""
+    def die():
+        time.sleep(0.5)
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            os._exit(1)
+        time.sleep(1.0)
+        try:
+            os.kill(os.getpid(), signal.SIGKILL)
+        except Exception:
+            os._exit(1)
+    threading.Thread(target=die, daemon=True).start()
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1664,6 +1747,14 @@ function post(url, body){
     .catch(e=>{ notify('Request failed: '+e.message,false); return {ok:false,msg:e.message}; });
 }
 function stop(name){ post('/api/stop/'+encodeURIComponent(name), {}); }
+function killAll(){
+  if(!confirm('Stop every running job, clear the auto-deploy deferral, and restart the worker? Saved hits and the dataset are kept.')) return;
+  // Even if the worker dies before fetch() resolves, reload into the new one.
+  setTimeout(function(){ location.reload(); }, 2200);
+  post('/api/jobs/kill-all',{restart:true}).then(function(d){
+    if(d.ok && !d.restarting) location.reload();
+  });
+}
 function watch(name){
   let since=0, lines=[], delay=1000;
   const NL=String.fromCharCode(10);
@@ -1698,7 +1789,8 @@ function watch(name){
 <h1>₿ BTC Hunt — pre-2015 attack dashboard</h1>
 <p><a href="/">home</a><a href="/data">dataset</a>
 <a href="/randstorm">randstorm</a><a href="/brain">brainwallet</a>
-<a href="/nonce">nonce reuse</a><a href="/results">results</a></p>
+<a href="/nonce">nonce reuse</a><a href="/results">results</a>
+<button class="btn danger" style="float:right;padding:4px 10px;font-size:12px" onclick="killAll()">Kill all jobs</button></p>
 <hr style="border-color:#3b4252;margin:14px 0">
 <div id="msg" class="msg"></div>
 {body}
@@ -1738,6 +1830,13 @@ def home():
 <p>{'<span class="status-ok">✓ bloom filter ready</span>' if dataset else
 '<span class="status-bad">✗ no bloom — visit /data first</span>'}</p>
 </div>
+<div class="card"><h2>Jobs</h2>
+<p id="jobs-summary" class="muted">checking…</p>
+<p class="muted">The header <b>Kill all jobs</b> button stops dataset,
+Randstorm, brainwallet, nonce-reuse and balance-check jobs at once, clears the
+auto-deploy marker and restarts the Gunicorn worker for a clean slate. Saved
+hits, the Bloom filter and the cached .gz are <b>not</b> deleted.</p>
+</div>
 <div class="grid">
 <div class="card"><h2>1. Randstorm</h2>
 <p class="muted">BitcoinJS-lib v0.1.3 (2011–2015) used Math.random()
@@ -1754,7 +1853,20 @@ weak ones.</p>
 algebraically. Scan one address or upload a .txt list of thousands via
 Blockstream Esplora; hits are stored in SQLite.</p>
 <a class="btn" href="/nonce">Open</a></div>
-</div>"""
+</div>
+<script>
+function refreshJobs(){{
+  fetch('/api/jobs',{{cache:'no-store'}}).then(function(r){{return r.json();}}).then(function(d){{
+    var el=document.getElementById('jobs-summary'); if(!el)return;
+    var running=[], jobs=d.jobs||{{}};
+    Object.keys(jobs).forEach(function(k){{
+      if(jobs[k].alive) running.push(k+': '+(jobs[k].detail||'running'));
+    }});
+    el.textContent=running.length?running.join(' · '):'no jobs running';
+  }}).catch(function(){{}});
+}}
+refreshJobs(); setInterval(refreshJobs, 2000);
+</script>"""
     return page(body)
 
 @app.route("/data")
@@ -2191,6 +2303,49 @@ def api_job_status(name):
 @app.route("/api/log/<name>")
 def api_log_status(name):
     return api_job_status(name)
+
+
+@app.route("/api/jobs")
+def api_jobs():
+    """One no-store snapshot of every job slot; used by the home page."""
+    with _JOBS_LOCK:
+        jobs = {}
+        for name in JOB_NAMES:
+            j = _JOBS.get(name)
+            jobs[name] = {"alive": bool(j and j["alive"]),
+                          "detail": (j or {}).get("detail", "not started"),
+                          "progress": (j or {}).get("progress", 0.0),
+                          "error": (j or {}).get("error", "")}
+    payload = {"ok": True, "jobs": jobs, "busy": BUSY_FILE.exists(),
+               "pid": os.getpid()}
+    return Response(json.dumps(payload), mimetype="application/json",
+                    headers={"Cache-Control": "no-store, max-age=0"})
+
+
+@app.route("/api/jobs/kill-all", methods=["POST"])
+def api_kill_all():
+    """Stop all jobs, clear the deploy marker, optionally replace the worker."""
+    j = request.get_json(silent=True)
+    if not isinstance(j, dict):
+        j = {}
+    restart = bool(j.get("restart", False))
+    killed = _kill_all_jobs("killed from dashboard")
+    msg = (f"stopped {len(killed)} job(s); cleared deploy marker"
+           if killed else "no jobs were running; cleared deploy marker")
+    restart_ok = False
+    if restart:
+        if not (APP_USER and APP_PASSWORD):
+            msg += " — worker restart requires Basic auth to be configured"
+        elif not _can_restart_worker():
+            msg += " — worker restart unavailable in this process"
+        else:
+            _schedule_worker_restart()
+            restart_ok = True
+            msg += " — restarting worker"
+    payload = {"ok": True, "msg": msg, "killed": killed,
+               "restarting": restart_ok}
+    return Response(json.dumps(payload), mimetype="application/json",
+                    headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.route("/api/stop/<name>", methods=["POST"])

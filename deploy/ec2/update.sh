@@ -23,8 +23,9 @@ if ! git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 # Jobs live in the app process; restarting mid-job would kill a long dataset
-# build or scan. The app writes this marker while a job is alive. Defer the
-# whole deploy (do NOT fetch) so the next timer tick can pick it up later.
+# build or scan. The app writes .btc-hunt-busy plus .btc-hunt-busy.pid while a
+# job is alive. Defer the whole deploy (do NOT fetch) so the next timer tick
+# can pick it up later.
 ENV_FILE="${ENV_FILE:-/etc/btc-hunt.env}"
 DISK_PATH="$(sed -n 's/^DISK_PATH=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
 DISK_PATH="${DISK_PATH:-/var/lib/btc-hunt}"
@@ -34,16 +35,40 @@ BUSY_MARKER="$DISK_PATH/.btc-hunt-busy"
 BUILD_DEADLINE_SECS="$(sed -n 's/^BUILD_DEADLINE_SECS=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
 case "$BUILD_DEADLINE_SECS" in ''|*[!0-9]*) BUILD_DEADLINE_SECS=7200 ;; esac
 BUSY_MAX_AGE_SECS="${BUSY_MAX_AGE_SECS:-$((BUILD_DEADLINE_SECS + 600))}"
+BUSY_PID_FILE="$DISK_PATH/.btc-hunt-busy.pid"
+clear_busy_marker(){ rm -f "$BUSY_MARKER" "$BUSY_PID_FILE"; }
 if [ -f "$BUSY_MARKER" ] && [ "${BTC_HUNT_FORCE_UPDATE:-0}" != "1" ]; then
-  MARKER_MTIME="$(stat -c %Y "$BUSY_MARKER" 2>/dev/null || echo 0)"
-  MARKER_AGE="$(( $(date +%s) - MARKER_MTIME ))"
-  if [ "$MARKER_AGE" -gt "$BUSY_MAX_AGE_SECS" ]; then
-    echo "[update] stale busy marker (${MARKER_AGE}s old) — clearing and deploying"
-    rm -f "$BUSY_MARKER"
-  else
-    echo "[update] job running ($(cat "$BUSY_MARKER")) — deferring deploy until it finishes"
-    echo "[update] to override: sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update"
-    exit 0
+  # Newer builds write the worker PID next to the marker. If that process is
+  # gone (or the PID was reused by something else), the marker is stale —
+  # clear it now instead of waiting for the 130-minute age fallback.
+  if [ -f "$BUSY_PID_FILE" ]; then
+    BUSY_PID="$(cat "$BUSY_PID_FILE" 2>/dev/null || true)"
+    case "$BUSY_PID" in
+      ''|*[!0-9]*)
+        echo "[update] invalid busy PID file — clearing stale marker"
+        clear_busy_marker ;;
+      *)
+        if ! kill -0 "$BUSY_PID" 2>/dev/null; then
+          echo "[update] job process $BUSY_PID is gone — clearing stale marker"
+          clear_busy_marker
+        elif ! tr '\0' ' ' < "/proc/$BUSY_PID/cmdline" 2>/dev/null | grep -q "btc_hunt:app"; then
+          echo "[update] busy PID $BUSY_PID is no longer BTC Hunt — clearing stale marker"
+          clear_busy_marker
+        fi
+        ;;
+    esac
+  fi
+  if [ -f "$BUSY_MARKER" ]; then
+    MARKER_MTIME="$(stat -c %Y "$BUSY_MARKER" 2>/dev/null || echo 0)"
+    MARKER_AGE="$(( $(date +%s) - MARKER_MTIME ))"
+    if [ "$MARKER_AGE" -gt "$BUSY_MAX_AGE_SECS" ]; then
+      echo "[update] stale busy marker (${MARKER_AGE}s old) — clearing and deploying"
+      clear_busy_marker
+    else
+      echo "[update] job running ($(cat "$BUSY_MARKER")) — deferring deploy until it finishes"
+      echo "[update] to override: sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update"
+      exit 0
+    fi
   fi
 fi
 

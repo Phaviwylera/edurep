@@ -166,6 +166,10 @@ PYTHONUNBUFFERED=1
 
 # Max unique hit addresses checked by one /results "Check balances" run.
 #VERIFY_MAX_ADDRESSES=5000
+
+# Allow the dashboard's Kill all jobs button to replace this Gunicorn worker.
+# Set to 0 to only stop jobs without restarting the worker.
+#BTC_HUNT_WORKER_RESTART=1
 EOF
   chmod 0600 "$ENV_FILE"
   log "created $ENV_FILE (add APP_USER / APP_PASSWORD there to require login)"
@@ -186,6 +190,8 @@ chmod -R a+rX "$APP_DIR"
 # during an update cannot corrupt the script that is currently executing.
 install -m 0755 "$APP_DIR/deploy/ec2/update.sh" /usr/local/bin/btc-hunt-update
 log "installed /usr/local/bin/btc-hunt-update"
+install -m 0755 "$APP_DIR/deploy/ec2/reset.sh" /usr/local/bin/btc-hunt-reset
+log "installed /usr/local/bin/btc-hunt-reset"
 
 # 5. systemd unit ------------------------------------------------------------
 log "installing systemd unit"
