@@ -12,6 +12,10 @@ this is safe to run on a deploy box or in CI. It covers
   16-22 the failure modes that matter on a real host: HTTP 403 parking, the
         pre-flight probe, the durable retry queue and its drainer, adaptive
         batch sizing, the queue cap, and a mid-run Stop
+  24-29 the fixed era windows and the era batch: table values, route
+        validation, sequential sweeping with per-era steps/offset, Stop, the
+        unscannable-era warning, the era widget on /eth, the home-page
+        launcher, and the headless --cli-eth-era / --list-eras
 
 Every assertion that encodes a published test vector says so in a comment.
 """
@@ -32,7 +36,7 @@ os.environ.update({
     "ETH_RPC_BATCH": "4", "ETH_MAX_STEPS": "1000",
     "ETH_MAX_TOTAL_STEPS": "100000", "ETH_DEAD_COOL_SECS": "30",
     "ETH_ERROR_COOL_SECS": "1", "ETH_RPC_ROUNDS": "2",
-    "ETH_PENDING_MAX": "1000", "ETH_PREFLIGHT": "1",
+    "ETH_PENDING_MAX": "1000", "ETH_PREFLIGHT": "1", "ETH_ERA_STEPS": "20",
     "APP_USER": "", "APP_PASSWORD": "", "BTC_HUNT_BUILD_ID": "test-eth",
 })
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -437,7 +441,7 @@ print("12 ok  ETH verify stores exact balances, re-queues throttles")
 reset_rpc()
 txt = cl.get("/eth").get_data(as_text=True)
 assert cl.get("/eth").status_code == 200
-for frag in ("Ethereum — timestamp sweep", "Trust Wallet", "tw_bip39_s",
+for frag in ("Manual timestamp sweep", "Trust Wallet", "tw_bip39_s",
              "sha256_dec", "Test RPC", 'id="barTs"', 'id="barWk"', 'id="barQ"',
              "watch('eth_ts','Ts')", "watch('eth_retry','Q')",
              "no bloom filter", "Queued candidates", "eth_pending.jsonl",
@@ -714,7 +718,334 @@ assert rows[0]["balance_wei"] == str(9 * 10 ** 17)
 print("22 ok  /api/eth/pending + /api/eth/retry drain the queue end to end")
 
 # ══════════════════════════════════════════════════════════════════════
-# 23 — throughput, for the docs (informational)
+# 24 — the fixed era table: values, spans, and the two corrections
+# ══════════════════════════════════════════════════════════════════════
+by_id = {e["id"]: e for e in b.ETH_ERAS}
+assert [e["id"] for e in b.ETH_ERAS] == ["presale", "frontier", "cryptojs", "tw"]
+# Era 1 — 2014 presale window (published presale dates, UTC)
+e = by_id["presale"]
+assert (e["start"], e["end"], e["unit"]) == (1405987200000, 1409702399000, "ms")
+assert e["scannable"] is False and e["warn"], e
+assert "CSPRNG" in e["note"] and "password/IV" in e["note"].lower() \
+    or "keystore" in e["note"]
+assert e["default"] is False                  # never ticked by default
+# Era 2 — Frontier
+e = by_id["frontier"]
+assert (e["start"], e["end"], e["unit"]) == (1438214400000, 1451606399000, "ms")
+assert e["scannable"] is True and e["end"] - e["start"] + 1 == 13391999001
+# Era 3 — CryptoJS: the real CVE, and the 14-digit end corrected to 13 digits
+e = by_id["cryptojs"]
+assert e["end"] == 1577836800000, e["end"]    # NOT 15778368000000 (year 2471)
+assert e["end"] - e["start"] + 1 == 63072000001
+assert "CVE-2023-46233" in e["note"] and "CVE-2026-71851" in e["note"]
+assert e["start"] == 1514764800000            # 2018-01-01T00:00:00Z
+# Era 4 — the only genuine timestamp-seeded Ethereum window
+e = by_id["tw"]
+assert (e["start"], e["end"], e["unit"]) == (1669248000, 1671753599, "s")
+assert e["end"] - e["start"] + 1 == 2505600
+assert "sha256_dec" in by_id["cryptojs"]["recipes"]
+assert all(r in b.ETH_RECIPES for e2 in b.ETH_ERAS for r in e2["recipes"])
+# every era's declared recipes must accept that era's unit
+for e2 in b.ETH_ERAS:
+    assert any(e2["unit"] in b.ETH_RECIPES[r]["units"] for r in e2["recipes"]), e2
+assert b.ETH_PRESETS is b.ETH_ERAS            # the older name still resolves
+d = cl.get("/api/eth/eras").get_json()
+assert d["ok"] is True and len(d["eras"]) == 4
+assert d["era_steps"] == b.ETH_ERA_STEPS
+# ETH_ERA_STEPS is floored at 1000: the env value 20 above is deliberately too
+# small, and a slice smaller than that is not a run worth starting.
+assert b.ETH_ERA_STEPS == 1000, b.ETH_ERA_STEPS
+assert [x["span"] for x in d["eras"]] == [
+    e2["end"] - e2["start"] + 1 for e2 in b.ETH_ERAS]
+assert {k for k in d["eras"][0]} >= {"id", "era", "label", "window", "unit",
+                                     "start", "end", "span", "recipes",
+                                     "default", "scannable", "note",
+                                     "default_steps"}
+d2 = cl.get("/api/eth/recipes").get_json()
+assert d2["eras"] == d2["presets"] and len(d2["eras"]) == 4
+print("24 ok  era table values, spans, CVE + 14-digit end corrections")
+
+# ══════════════════════════════════════════════════════════════════════
+# 25 — /api/eth/era validation: never start a doomed batch
+# ══════════════════════════════════════════════════════════════════════
+reset_rpc()
+for payload, why in (({"eras": [], "recipes": ["sha256_dec"]}, "at least one era"),
+                     ({"eras": ["nope"], "recipes": ["sha256_dec"]}, "unknown era"),
+                     ({"eras": ["tw"], "recipes": []}, "at least one recipe"),
+                     ({"eras": ["tw"], "recipes": ["not_a_recipe"]}, "recipe"),
+                     # a string and a dict list are both accepted forms
+                     ({"eras": "tw", "recipes": "sha256_dec", "steps": 5},
+                      "ok-ish"),
+                     ({"eras": [{"id": "tw", "steps": 5}],
+                       "recipes": ["sha256_dec"]}, "dict form")):
+    r = cl.post("/api/eth/era", json=payload).get_json()
+    if why in ("ok-ish", "dict form"):
+        assert r["ok"] is True and r["steps"] == 5, (payload, r)
+        wait_job("eth_era", 20)
+    else:
+        assert r["ok"] is False and why in r["msg"], (payload, r)
+# tw_bip39_s and mt19937_s are SECONDS-only; a millisecond era cannot use them,
+# so the route must refuse before deriving anything
+r = cl.post("/api/eth/era", json={"eras": ["cryptojs"],
+                                  "recipes": ["tw_bip39_s", "mt19937_s"],
+                                  "steps": 4}).get_json()
+assert r["ok"] is False and "unit" in r["msg"] and "ms" in r["msg"], r
+assert not b._JOBS["eth_era"]["alive"], b._JOBS["eth_era"]
+# ... but a mixed selection passes as long as ONE selected era can use one
+# recipe; the eras that cannot are skipped per era and the log says so
+r = cl.post("/api/eth/era", json={"eras": ["tw", "frontier"],
+                                  "recipes": ["tw_bip39_s"],
+                                  "steps": 4}).get_json()
+assert r["ok"] is True, r
+wait_job("eth_era", 20)
+assert not b._JOBS["eth_era"]["alive"], b._JOBS["eth_era"]
+# the per-era slice is capped by ETH_MAX_TOTAL_STEPS (100,000 in this suite)
+r = cl.post("/api/eth/era", json={"eras": ["frontier", "cryptojs"],
+                                  "recipes": ["sha256_dec"],
+                                  "steps": 80000}).get_json()
+assert r["ok"] is False and "ETH_MAX_TOTAL_STEPS" in r["msg"], r
+# ... and the cap is per run, not per era
+r = cl.post("/api/eth/era", json={"eras": ["frontier", "cryptojs"],
+                                  "recipes": ["sha256_dec"],
+                                  "steps": 40000}).get_json()
+assert r["ok"] is True and r["steps"] == 80000, r
+b._JOBS["eth_era"]["stop"] = True            # do not really sweep 80k per era
+wait_job("eth_era", 30)
+# an unknown era in a list of known ones is rejected outright, nothing starts
+r = cl.post("/api/eth/era", json={"eras": [{"id": "tw", "steps": 10},
+                                           {"id": "bogus"}],
+                                  "recipes": ["sha256_dec"]}).get_json()
+assert r["ok"] is False and "bogus" in r["msg"], r
+assert not b._JOBS["eth_era"]["alive"], b._JOBS["eth_era"]
+print("25 ok  /api/eth/era validation: unknown ids, units, recipes, cap")
+
+# ══════════════════════════════════════════════════════════════════════
+# 26 — attack_eth_eras sweeps the selected eras in sequence, with slices
+# ══════════════════════════════════════════════════════════════════════
+reset_rpc()
+specs = [{"id": "tw", "steps": 6, "offset": 0},
+         {"id": "frontier", "steps": 4, "offset": 1000}]
+job, logs = newjob(), []
+hits = b.attack_eth_eras(specs, ["sha256_dec", "tw_bip39_s"], logs.append, job)
+assert job["progress"] == 1.0, job
+# era 1: tw is s and takes BOTH recipes (6 steps x 2 = 12 candidates); era 2:
+# frontier is ms, so tw_bip39_s is filtered out (4 steps x 1 = 4). Nothing is
+# funded, so every candidate is counted as skipped-empty rather than saved.
+assert job["eth_skipped"] == 6 * 2 + 4 * 1, job
+assert not hits
+assert any("batch of 2 era" in l for l in logs), logs
+assert any(l.startswith("[era 1/2 · Era 4 tw] ") for l in logs), logs
+assert any(l.startswith("[era 2/2 · Era 2 frontier] ") for l in logs), logs
+assert any("eras run one after another" in l for l in logs), logs
+# the frontier slice starts 1000 steps into the window and is 4 wide
+assert any("1438214401000..1438214401003 ms: 4 of 13,391,999,001" in l
+           for l in logs), [l for l in logs if "frontier" in l]
+assert any("offset 1,000" in l for l in logs), logs
+assert job["detail"].startswith("Era "), job["detail"]
+# a recipe that no selected era can use is reported per era, not silently dropped
+job, logs = newjob(), []
+b.attack_eth_eras([{"id": "cryptojs", "steps": 3, "offset": 0}],
+                  ["tw_bip39_s"], logs.append, job)
+assert job.get("eth_skipped", 0) == 0, job
+assert any("no selected recipe accepts unit=ms" in l for l in logs), logs
+# an offset past the end of the window is skipped instead of sweeping 0..N
+job, logs = newjob(), []
+b.attack_eth_eras([{"id": "tw", "steps": 5, "offset": 10 ** 12}],
+                  ["sha256_dec"], logs.append, job)
+assert job.get("eth_skipped", 0) == 0 and any("past the end of the window" in l
+                                              for l in logs), logs
+# unscannable Era 1 says so, in the log, every single time
+job, logs = newjob(), []
+b.attack_eth_eras([{"id": "presale", "steps": 2, "offset": 0}],
+                  ["sha256_dec"], logs.append, job)
+assert job["eth_skipped"] == 2, job
+assert any("NOT recoverable by a private-key sweep" in l for l in logs), logs
+assert any("Will NOT recover a presale wallet" in l for l in logs), logs
+# a funded candidate anywhere in the batch is saved like any other sweep hit
+reset_rpc()
+fn = b.ETH_RECIPES["sha256_dec"]["fn"]
+ts = by_id["tw"]["start"] + 3
+target = b.eth_address(fn(ts, "s")[0][0])
+FUNDED[target.lower()] = 5 * 10 ** 17      # the fake RPC keys balances lowercase
+NONCES[target.lower()] = 2
+job, logs = newjob(), []
+hits = b.attack_eth_eras([{"id": "tw", "steps": 6, "offset": 0}],
+                         ["sha256_dec"], logs.append, job)
+assert len(hits) == 1 and hits[0]["address"] == target, hits
+assert hits[0]["ts"] == ts and hits[0]["unit"] == "s", hits[0]
+assert hits[0]["recipe"] == "sha256_dec", hits[0]
+assert job["eth_skipped"] == 5, job          # 6 candidates, 1 funded
+rows = [json.loads(p) for _a, p in b._db().execute(
+    "SELECT attack,payload FROM results")]
+assert any(r["address"] == target and r["attack"] == "eth_sha256_dec"
+           for r in rows), rows
+assert any("HIT" in l for l in logs), logs
+print("26 ok  era batch: sequential eras, per-era slices, offsets, warnings")
+
+# ══════════════════════════════════════════════════════════════════════
+# 27 — Stop mid-batch and no-endpoint stop the whole batch
+# ══════════════════════════════════════════════════════════════════════
+reset_rpc()
+job, logs = newjob(), []
+job["stop"] = True
+b.attack_eth_eras([{"id": "tw", "steps": 5}, {"id": "frontier", "steps": 5}],
+                  ["sha256_dec"], logs.append, job)
+assert job.get("eth_skipped", 0) == 0, job
+assert any("stopped before tw" in l for l in logs), logs
+# Stop between eras: era 1 runs, era 2 does not
+reset_rpc()
+job, logs = newjob(), []
+_orig = b.attack_eth_timestamp
+
+
+def _stop_after(*a, **kw):
+    out = _orig(*a, **kw)
+    job["stop"] = True
+    return out
+
+
+b.attack_eth_timestamp = _stop_after
+b.attack_eth_eras([{"id": "tw", "steps": 3}, {"id": "frontier", "steps": 3}],
+                  ["sha256_dec"], logs.append, job)
+b.attack_eth_timestamp = _orig
+assert job["eth_skipped"] == 3, job        # only era 1 ran
+assert any("stopped before frontier" in l for l in logs), logs
+assert job["progress"] < 1.0, job
+# every endpoint refusing: the batch stops rather than deriving blind
+reset_rpc()
+MODE["fail"] = "all"
+b.ETH_PREFLIGHT = True
+job, logs = newjob(), []
+b.attack_eth_eras([{"id": "tw", "steps": 4}, {"id": "frontier", "steps": 4}],
+                  ["sha256_dec"], logs.append, job)
+b.ETH_PREFLIGHT = True
+# the pre-flight probe found zero live endpoints: era 1 derived nothing and the
+# batch stopped instead of walking on to era 2
+assert job.get("eth_no_rpc") or job.get("eth_rpc_alive") == 0, job
+assert job.get("eth_skipped", 0) == 0, job
+assert any("stopping the batch: no RPC endpoint answered" in l for l in logs), logs
+assert job["progress"] < 1.0, job             # honestly unfinished
+assert "stopped early: no RPC endpoint" in logs[-1], logs[-1]
+print("27 ok  era batch honours Stop and stops when no endpoint answers")
+
+# ══════════════════════════════════════════════════════════════════════
+# 28 — the era widget and the restyled chrome on /eth
+# ══════════════════════════════════════════════════════════════════════
+reset_rpc()
+txt = cl.get("/eth").get_data(as_text=True)
+for frag in ("Era batch", "era-presale", "era-frontier", "era-cryptojs",
+             "era-tw", "st-frontier", "of-frontier", "startEra()",
+             "watch('eth_era','Era')", "select scannable", "steps total",
+             "Will NOT recover a presale wallet", "CVE-2023-46233",
+             "year 2471", "const ERAS=", "eraWhole", "eraManual",
+             "1,514,764,800,000", "1,577,836,800,000", "63,072,000,001"):
+    assert frag in txt, frag
+# per-era controls exist for every era, and only the scannable ones are ticked.
+# (Server-built attributes are single-quoted, template ones double-quoted.)
+for e in b.ETH_ERAS:
+    for ctrl in ("ck-", "st-", "of-", "era-"):
+        assert ("id='%s%s'" % (ctrl, e["id"])) in txt, (ctrl, e["id"])
+    assert "eraWhole('%s')" % e["id"] in txt, e["id"]
+    assert "eraManual('%s')" % e["id"] in txt, e["id"]
+    ticked = ("id='ck-%s' value='%s' checked" % (e["id"], e["id"])) in txt
+    assert ticked == bool(e["default"]), (e["id"], ticked)
+    # the era row shows its recipe list and its warning pill where it has one
+    assert e["era"] in txt and e["window"] in txt, e["id"]
+# The 14-digit typo appears exactly once — inside the note that corrects it —
+# and never as a scan value in the JSON the widget drives itself from.
+assert txt.count("15778368000000") == 1 and "one digit too many" in txt
+assert txt.count("CVE-2026-71851") == 1 and "does not exist" in txt
+# the scale arithmetic on the page is computed from the table, not hand-typed
+# prose: 63,072,000,001 / 24,000 candidates/s = 30 days of CPU, and at
+# ETH_RPC_BATCH addresses per request it is 1.26 billion requests (~8 years at
+# a sustainable 5 req/s). If any of those inputs change, these must follow.
+span3 = 63_072_000_001
+assert "%d days of pure" % round(span3 / 24000 / 86400) in txt, "CPU days"
+assert format(int(span3 / b.ETH_RPC_BATCH), ",") in txt, "batch request count"
+years3 = round(span3 / b.ETH_RPC_BATCH / 5 / 86400 / 365)
+assert years3 >= 1, years3                     # never renders as "0 years"
+assert "about %d years at a sustainable" % years3 in txt
+assert "one timestamp in %s" % format(
+    max(1, int(span3 / b.ETH_ERA_STEPS)), ",") in txt, "slice ratio"
+assert not any(tok in txt for tok in
+               ("{years}", "{days3}", "{reqs3}", "{rpcyears3}", "{ratio3}",
+                "{cover3}", "{span3}", "{erasteps}", "{maxtotal}"))
+eras_js = txt.split("const ERAS=", 1)[1].split(";", 1)[0]
+assert "15778368000000" not in eras_js, eras_js[:200]
+assert '"end": 1577836800000' in eras_js, eras_js[:200]
+# the restyle: sticky locked header, 3D buttons, smooth scrolling, widgets
+for frag in ("class=\"topbar\"", "id=\"jobs-chip\"", "scroll-behavior:smooth",
+             "translateY(2px)", "linear-gradient(180deg,#6f9ad0",
+             "position:sticky;top:var(--stick)", "class=\"card accent-green\"",
+             "class='era", "class='pill", "backdrop-filter:blur",
+             "refreshChip", "refreshSticky", "<nav class=\"nav\">",
+             "--stick:112px", "id=\"era\""):
+    assert frag in txt, frag
+assert txt.count('class="on"') == 1           # exactly one active nav pill
+for path in ("/", "/results", "/randstorm", "/brain", "/nonce", "/data"):
+    other = cl.get(path).get_data(as_text=True)
+    assert 'class="topbar"' in other and "refreshChip" in other, path
+    assert "refreshSticky" in other and "--stick" in other, path
+    assert other.count('class="on"') == 1, path
+    assert not any(p in other for p in ("{nav}", "{build_id}", "{ec_backend}",
+                                        "{keccak_backend}")), path
+# the home page carries a launcher for the same batch, with the defaults
+home = cl.get("/").get_data(as_text=True)
+for frag in ("Ethereum era batch", "startEraHome()", "watch('eth_era','EraH')",
+             'id="barEraH"', 'id="logEraH"', "not privkey-recoverable",
+             "63,072,000,001", "ETH_ERA_STEPS", "configure eras"):
+    assert frag in home, frag
+assert '["frontier", "cryptojs", "tw"]' in home      # the ticked-by-default eras
+assert 'id="presale"' not in home and "era-presale" not in home
+assert '"presale"' not in home.split("startEraHome", 1)[1].split(";", 1)[0]
+assert home.count("%%") == 0 and "{era_home}" not in home
+# the manual sweep still works, and still rejects a unit mismatch
+d = cl.post("/api/eth/timestamp", json={"start": "1669248000",
+                                        "end": "1669248005", "unit": "s",
+                                        "recipes": ["sha256_dec"]}).get_json()
+assert d["ok"] is True, d
+wait_job("eth_ts", 20)
+print("28 ok  era widget + sticky header + 3D buttons on every page")
+
+# ══════════════════════════════════════════════════════════════════════
+# 29 — the headless era batch: --list-eras and --cli-eth-era
+# ══════════════════════════════════════════════════════════════════════
+import subprocess  # noqa: E402
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV = dict(os.environ, DISK_PATH=DISK, APP_USER="", APP_PASSWORD="",
+           ETH_VERIFY_BALANCES="0")       # no network: derive and count only
+
+
+def cli(*argv):
+    return subprocess.run([sys.executable, os.path.join(ROOT, "btc_hunt.py")]
+                          + list(argv), capture_output=True, text=True,
+                          env=ENV, timeout=180)
+
+
+r = cli("--list-eras")
+assert r.returncode == 0, r.stderr[-400:]
+for frag in ("63,072,000,001", "13,391,999,001", "2,505,600",
+             "NOT recoverable by a privkey sweep", "CVE-2023-46233",
+             "default per-era steps: 1,000"):
+    assert frag in r.stdout, frag
+r = cli("--cli-eth-era", "tw:20,frontier:10@5", "--recipes", "sha256_dec")
+assert r.returncode == 0, r.stderr[-400:]
+assert "batch of 2 era(s)" in r.stdout, r.stdout[-400:]
+assert "1669248000..1669248019 s: 20 of 2,505,600" in r.stdout, r.stdout[-400:]
+assert "1438214400005..1438214400014 ms: 10 of 13,391,999,001" in r.stdout
+assert "offset 5" in r.stdout and "batch done — 2 of 2 era(s)" in r.stdout
+r = cli("--cli-eth-era", "presale:5", "--recipes", "sha256_dec")
+assert r.returncode == 0 and "Will NOT recover a presale wallet" in r.stdout
+r = cli("--cli-eth-era", "bogus")
+assert r.returncode != 0 and "unknown era(s): bogus" in r.stderr, r.stderr[-300:]
+r = cli("--cli-eth-era", "tw:notanumber")
+assert r.returncode != 0 and "must be integers" in r.stderr, r.stderr[-300:]
+r = cli("--cli-eth-era", "tw:99999999")
+assert r.returncode != 0 and "ETH_MAX_TOTAL_STEPS" in r.stderr, r.stderr[-300:]
+print("29 ok  --list-eras and --cli-eth-era slices, offsets and validation")
+
+# ══════════════════════════════════════════════════════════════════════
+# 30 — throughput, for the docs (informational)
 # ══════════════════════════════════════════════════════════════════════
 for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
     fn = b.ETH_RECIPES[rid]["fn"]
@@ -723,7 +1054,7 @@ for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
         priv, _extra = fn(TS0 + i, "s")[0]
         b.eth_address(priv)
     el = (time.time() - t0) / n
-    print("23 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
+    print("30 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
           "Trust Wallet window in %5.1f min"
           % (rid, el * 1000, 1 / el, 2_505_600 * el / 60))
 

@@ -219,6 +219,12 @@ PYTHONUNBUFFERED=1
 # 2,505,600 one-second seeds), and the cap on one weak-key run.
 #ETH_MAX_STEPS=5000000
 #ETH_MAX_TOTAL_STEPS=20000000
+# The era batch (/eth "1 · Era batch", or --cli-eth-era) sweeps the fixed era
+# windows in sequence. Those windows are billions of timestamps wide, so this is
+# the slice taken from EACH era per run -- a sample, not a sweep. Raise it only
+# with a private RPC endpoint; the sum over all selected eras must stay under
+# ETH_MAX_TOTAL_STEPS.
+#ETH_ERA_STEPS=1000000
 #ETH_MAX_WEAK_KEYS=2000000
 # Vendored 2048-word BIP-39 English list (sha256 2f5eed53...).
 #BIP39_WORDLIST_PATH=/opt/btc-hunt/data/bip39_english.txt

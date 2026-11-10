@@ -319,11 +319,36 @@ Public endpoints 429 within seconds of a real sweep anyway: at ~24,000
 candidates/s with batches of 50 the app would need ~475 requests/s. Full recipe/window honesty table and measured rates:
 [Ethereum section in the main README](../../README.md#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
 
+### The era batch
+
+`/eth` card **1 · Era batch** holds the documented weak-key eras as fixed scan
+values (`presale`, `frontier`, `cryptojs`, `tw`). Tick the ones you want, give
+each a `steps` budget and an `offset` into its window, and one job sweeps them
+**in sequence** — the RPC endpoint is the bottleneck, so parallel eras only
+multiply 429s. Each era can also be loaded into the manual Start/End/Unit
+fields and edited.
+
+The defaults sample each era; they do not sweep it. `ETH_ERA_STEPS=1000000`
+covers 0.0016% of Era 3, and the sum over all selected eras must stay under
+`ETH_MAX_TOTAL_STEPS`. Use `offset` to walk through an era run by run:
+`offset + steps` is where the next run starts. Two eras in that table cannot be
+recovered by a private-key timestamp sweep at all — Era 1 (presale keys came
+from a CSPRNG; the weakness is the keystore password/IV) and the
+non-clock-seeded part of Era 3 (CVE-2023-46233 needs the browser PRNG *state*).
+The page, the run log and `--list-eras` say so every time. Details and the
+corrected era table:
+[Ethereum section in the main README](../../README.md#the-fixed-era-windows-batch-and-manual).
+
 Headless, without the dashboard:
 
 ```bash
 sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
   --cli-eth 1669248000 1671753599 --unit s --recipes tw_bip39_s,sha256_dec
+
+# the fixed eras, with per-era slices: ERA[:STEPS[@OFFSET]]
+sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py --list-eras
+sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
+  --cli-eth-era frontier:50000,cryptojs:50000@2000000 --recipes sha256_dec
 ```
 
 ## Dataset mirrors
