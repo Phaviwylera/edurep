@@ -52,6 +52,9 @@ DATASET_URLS = [
     "http://addresses.loyce.club/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
     "https://3xpl.com/data/dumps/blockchair_bitcoin_addresses_and_balance_LATEST.tsv.gz",
 ]
+# Wall-clock budget for the whole download+build (a stalled mirror must not
+# hold a job open forever). Individual socket reads still time out at 60 s.
+BUILD_DEADLINE_SECS = 1800
 ESPLORA    = os.environ.get("ESPLORA_URL", "https://blockstream.info/api")
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
@@ -280,10 +283,12 @@ class BloomFilter:
 # ════════════════════════════════════════════════════════════════════
 # DATASET
 # ════════════════════════════════════════════════════════════════════
-def _download(url, dest, log, progress=None):
+def _download(url, dest, log, progress=None, should_stop=None, deadline=None):
     # Stream into a .part file so a failed 1.5 GB transfer never leaves a
     # truncated dataset that later looks "already downloaded".
     log(f"[dl] {url}")
+    if deadline is None:
+        deadline = time.time() + 600
     tmp = Path(str(dest) + ".part")
     try:
         # Some mirrors reject the default python-requests User-Agent.
@@ -295,6 +300,10 @@ def _download(url, dest, log, progress=None):
         done = 0; last = 0
         with open(tmp, 'wb') as f:
             for chunk in r.iter_content(1 << 20):
+                if should_stop and should_stop():
+                    raise RuntimeError("cancelled")
+                if time.time() > deadline:
+                    raise RuntimeError("download exceeded its time budget")
                 f.write(chunk); done += len(chunk)
                 if total and done - last > 50 << 20:
                     last = done
@@ -312,22 +321,34 @@ def _download(url, dest, log, progress=None):
     except Exception as e:
         log(f"[!] {url}: {e}")
         tmp.unlink(missing_ok=True)
+        if str(e) == "cancelled":
+            raise  # do not silently try the next mirror after a user stop
         return False
 
 
-def build_bloom(log, progress=None):
+def build_bloom(log, progress=None, should_stop=None):
     # Two streaming passes over the gzip: pass 1 sizes the bloom from the row
     # count, pass 2 fills it directly. Holding every hash160 in a Python set
     # needs several GB and gets OOM-killed on a small instance.
+    deadline = time.time() + BUILD_DEADLINE_SECS
+
     def report(frac, detail):
         if progress:
             progress(frac, detail)
+
+    def check():
+        if should_stop and should_stop():
+            raise RuntimeError("cancelled")
+        if time.time() > deadline:
+            raise RuntimeError("dataset build exceeded its time budget")
 
     if not ADDR_GZ.exists():
         report(0.02, "downloading dataset")
         ok = False
         for u in DATASET_URLS:
-            if _download(u, ADDR_GZ, log, progress): ok = True; break
+            check()
+            if _download(u, ADDR_GZ, log, progress, should_stop, deadline):
+                ok = True; break
         if not ok:
             raise RuntimeError("all dataset mirrors failed")
     else:
@@ -346,6 +367,7 @@ def build_bloom(log, progress=None):
     report(0.30, "pass 1/2 — counting address rows")
     n = 0
     for _ in hashes():
+        check()
         n += 1
         if n % 1000000 == 0:
             log(f"[parse] pass 1 — {n/1e6:.1f}M rows counted")
@@ -360,6 +382,7 @@ def build_bloom(log, progress=None):
     report(0.35, "pass 2/2 — filling bloom")
     i = 0
     for h in hashes():
+        check()
         bf.add(h); i += 1
         if i % 500000 == 0:
             log(f"[parse] {i/1e6:.1f}M/{n/1e6:.1f}M addresses")
@@ -810,14 +833,7 @@ max-height:320px;font-size:12px;border:1px solid #3b4252}
 .msg:empty{display:none}
 .msg.ok{background:#2e3b2b;color:#a3be8c;border:1px solid #a3be8c}
 .msg.err{background:#3b2629;color:#bf616a;border:1px solid #bf616a}
-</style></head><body>
-<h1>₿ BTC Hunt — pre-2015 attack dashboard</h1>
-<p><a href="/">home</a><a href="/data">dataset</a>
-<a href="/randstorm">randstorm</a><a href="/brain">brainwallet</a>
-<a href="/nonce">nonce reuse</a><a href="/results">results</a></p>
-<hr style="border-color:#3b4252;margin:14px 0">
-<div id="msg" class="msg"></div>
-{body}
+</style>
 <script>
 // Short JSON polls instead of long-lived SSE streams. SSE generators used to
 // loop forever and exhaust Gunicorn's worker threads, which made the whole
@@ -871,6 +887,14 @@ function watch(name){
   tick();
 }
 </script>
+</head><body>
+<h1>₿ BTC Hunt — pre-2015 attack dashboard</h1>
+<p><a href="/">home</a><a href="/data">dataset</a>
+<a href="/randstorm">randstorm</a><a href="/brain">brainwallet</a>
+<a href="/nonce">nonce reuse</a><a href="/results">results</a></p>
+<hr style="border-color:#3b4252;margin:14px 0">
+<div id="msg" class="msg"></div>
+{body}
 </body></html>
 """
 
@@ -937,13 +961,17 @@ def api_dataset():
             job["progress"] = max(0.0, min(1.0, frac))
             job["detail"] = detail
         try:
-            build_bloom(log, progress)
+            build_bloom(log, progress, lambda: job["stop"])
             job["progress"] = 1.0
             job["detail"] = "done — bloom filter ready"
             log("[✓] dataset ready")
         except Exception as e:
-            job["error"] = str(e)
-            log(f"[!] {e}")
+            if str(e) == "cancelled":
+                job["detail"] = "stopped by user"
+                log("[!] cancelled by user")
+            else:
+                job["error"] = str(e)
+                log(f"[!] {e}")
     ok, msg = _start_job("dataset", runner)
     return {"ok": ok, "msg": msg}
 

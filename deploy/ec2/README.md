@@ -169,7 +169,7 @@ venv, and `requirements.txt` pins the dependencies.
 | Symptom | Check |
 | --- | --- |
 | Start button does nothing | The page shows the server message in a banner — usually `bloom not built`: build it at `/data` first |
-| Dataset build shows no progress | Refresh `/data` after a deploy; the live log and progress bar poll `/api/job/dataset` |
+| Dataset build shows no progress | Hard-refresh `/data` (Ctrl+Shift+R) after a deploy; the live log and progress bar poll `/api/job/dataset` every second |
 | `/health` times out | Security group inbound rules; `sudo systemctl status btc-hunt`; `sudo nginx -t`; bootstrap log |
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |

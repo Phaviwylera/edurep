@@ -29,8 +29,9 @@ ENV_FILE="${ENV_FILE:-/etc/btc-hunt.env}"
 DISK_PATH="$(sed -n 's/^DISK_PATH=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
 DISK_PATH="${DISK_PATH:-/var/lib/btc-hunt}"
 BUSY_MARKER="$DISK_PATH/.btc-hunt-busy"
-if [ -f "$BUSY_MARKER" ]; then
+if [ -f "$BUSY_MARKER" ] && [ "${BTC_HUNT_FORCE_UPDATE:-0}" != "1" ]; then
   echo "[update] job running ($(cat "$BUSY_MARKER")) — deferring deploy until it finishes"
+  echo "[update] to override: sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update"
   exit 0
 fi
 
