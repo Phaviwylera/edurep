@@ -152,6 +152,14 @@ PYTHONUNBUFFERED=1
 #ESPLORA_CACHE_SIZE=4096
 #NONCE_MAX_ADDRESSES=5000
 #NONCE_MAX_UPLOAD_BYTES=2000000
+
+# Bloom false-positive rate. Default 0.000001 (~183 MB bitset for 51M rows,
+# k~19). Rebuild the bloom on /data after changing it (Download & build bloom
+# reuses the cached .gz). Lower = fewer false HITs, larger/slower build.
+#BLOOM_FP_RATE=0.000001
+
+# Max unique hit addresses checked by one /results "Check balances" run.
+#VERIFY_MAX_ADDRESSES=5000
 EOF
   chmod 0600 "$ENV_FILE"
   log "created $ENV_FILE (add APP_USER / APP_PASSWORD there to require login)"

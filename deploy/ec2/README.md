@@ -211,6 +211,24 @@ land in `/var/lib/btc-hunt/btc_hunt.sqlite` and are visible at `/results`;
 export all of them (the page shows only 500) with the JSONL download links on
 that page. Nonce reuse does **not** need `funded.bloom`.
 
+## False positives and balance checks
+
+Randstorm/brainwallet `★★★ HIT` lines are Bloom-filter candidates, not
+confirmed wallets. `BLOOM_FP_RATE` defaults to `0.000001` (~183 MB bitset for
+51M rows, k≈19); the previous `0.001` produced ~12,000 false hits per 4M
+timestamps × 3 derived addresses. Change it in `/etc/btc-hunt.env`, restart,
+then rebuild the bloom on `/data` — **Download & build bloom** reuses the
+cached `.gz`, so no 1.7 GB re-download is needed.
+
+Open `/results` and click **Check balances** (or **Force re-check** to clear
+the in-process Esplora cache). The job is paced by `ESPLORA_MIN_INTERVAL`,
+stoppable, checks up to `VERIFY_MAX_ADDRESSES` (default 5000) unique
+addresses, and stores results in `btc_hunt.sqlite`. Each hit gets a badge:
+`likely Bloom false positive` when the chain shows `tx_count=0` and 0 sats,
+`spent / empty`, or a BTC amount to verify manually with a block explorer.
+The JSONL downloads on `/results` include the same fields. Verification never
+calls the explorer from inside the attack loop.
+
 ## Dataset mirrors
 
 `/data` tries, in order: any `DATASET_URLS` you configured, up to four recent
@@ -260,6 +278,7 @@ Then click **Download & build bloom** — the cached file is used as-is. Click
 | 502 Bad Gateway | gunicorn not running — `sudo journalctl -u btc-hunt -n 100`; confirm `127.0.0.1:8000` matches in both rendered configs |
 | Progress panel never updates | Hard-refresh (Ctrl+Shift+R) to load the new polling UI; check `sudo journalctl -u btc-hunt -f` |
 | Auto-pull stuck on `job running` | A stale busy marker older than `BUILD_DEADLINE_SECS + 600` (default 130 min) is cleared automatically; `sudo env BTC_HUNT_FORCE_UPDATE=1 btc-hunt-update` forces it immediately |
+| Lots of `★★★ HIT` lines but every address has 0 BTC | These are Bloom false positives. `sudo journalctl -u btc-hunt -f` shows the FP rate; set `BLOOM_FP_RATE=0.000001` (default now), rebuild the bloom on `/data`, and use **Check balances** on `/results` to flag never-funded hits |
 | New UI (e.g. bulk upload on `/nonce`) not showing after a merge | Check the page footer / `curl /health` for the `build` hash; `sudo journalctl -u btc-hunt-autopull.service -n 30 --no-pager`; `sudo btc-hunt-update`. A previously failed `install.sh` used to leave the old process running forever — the `.btc-hunt-deployed` stamp now forces a retry. Hard-refresh the tab (Ctrl+Shift+R) |
 | `dataset build exceeded its time budget` | Raise `BUILD_DEADLINE_SECS` in `/etc/btc-hunt.env` and `sudo systemctl restart btc-hunt`; the cached `.gz` is reused, so no re-download is needed. Defaults are now 2 h total / 30 min download |
 | All dataset mirrors failed | LoyceV disabled its `LATEST` direct download (torrent-only); the app now discovers dated snapshots from its index. Paste a working `.gz` URL into the Dataset URL field, set `DATASET_URLS` in `/etc/btc-hunt.env`, or `sudo cp` a dump to `/var/lib/btc-hunt/blockchair.tsv.gz` |
