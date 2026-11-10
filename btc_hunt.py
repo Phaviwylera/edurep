@@ -116,6 +116,12 @@ ESPLORA_MAX_RETRIES    = _env_int("ESPLORA_MAX_RETRIES", 2, 0)
 ESPLORA_CACHE_SIZE     = _env_int("ESPLORA_CACHE_SIZE", 4096, 0)
 NONCE_MAX_ADDRESSES    = _env_int("NONCE_MAX_ADDRESSES", 5000, 1)
 NONCE_MAX_UPLOAD_BYTES = _env_int("NONCE_MAX_UPLOAD_BYTES", 2_000_000, 1024)
+# Bloom false-positive rate. 0.001 gave ~12,000 spurious ★★★ HITs per 4M
+# timestamps x 3 derived addresses; 1e-6 cuts that to ~12. A smaller rate
+# needs a bigger bitset (~90 MB -> ~183 MB for 51M rows) and more hash rounds.
+BLOOM_FP_RATE = min(0.5, max(1e-12, _env_float("BLOOM_FP_RATE", 1e-6)))
+# Cap on unique addresses checked by one /api/verify run.
+VERIFY_MAX_ADDRESSES = _env_int("VERIFY_MAX_ADDRESSES", 5000, 1)
 PORT       = int(os.environ.get("PORT", 5000))
 GENESIS_TS = 1293840000000  # 2011-01-01 ms
 CUTOFF_TS  = 1420070400000  # 2015-01-01 ms
@@ -350,8 +356,12 @@ class BloomFilter:
         self.bits = bytearray((m_bits + 7) // 8)
 
     @classmethod
-    def create(cls, n_items, fp_rate=0.001):
-        m = int(-n_items * math.log(fp_rate) / (math.log(2) ** 2))
+    def create(cls, n_items, fp_rate=None):
+        # `None` picks the configured BLOOM_FP_RATE; an explicit value is still
+        # honoured (tests, callers that want a different precision).
+        p = BLOOM_FP_RATE if fp_rate is None else fp_rate
+        p = min(0.5, max(1e-12, float(p)))
+        m = int(-n_items * math.log(p) / (math.log(2) ** 2))
         m = (m + 7) // 8 * 8
         k = max(1, int((m / max(n_items, 1)) * math.log(2)))
         return cls(m, k)
@@ -725,7 +735,8 @@ def build_bloom(log, progress=None, should_stop=None, urls=None):
     log(f"[parse] {n:,} rows — sizing bloom")
     if not n:
         raise RuntimeError("dataset contains no usable addresses")
-    bf = BloomFilter.create(n, fp_rate=0.001)
+    bf = BloomFilter.create(n, fp_rate=BLOOM_FP_RATE)
+    log(f"[parse] bloom target FP rate {BLOOM_FP_RATE:g}")
 
     log(f"[parse] pass 2/2 — filling bloom ({bf.m/8/1e6:.0f} MB bitset, k={bf.k})")
     report(0.35, "pass 2/2 — filling bloom")
@@ -918,6 +929,10 @@ def _esplora_cache_get(path):
             return None
         _ESPLORA_CACHE.move_to_end(path)
         return _ESPLORA_CACHE[path]
+
+def _esplora_cache_clear():
+    with _ESPLORA_CACHE_LOCK:
+        _ESPLORA_CACHE.clear()
 
 def _esplora_cache_put(path, text):
     if ESPLORA_CACHE_SIZE <= 0:
@@ -1219,6 +1234,14 @@ def _db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             attack TEXT, payload TEXT, ts TEXT
         );
+        CREATE TABLE IF NOT EXISTS balance_checks (
+            address TEXT PRIMARY KEY,
+            sats INTEGER NOT NULL DEFAULT 0,
+            tx_count INTEGER NOT NULL DEFAULT 0,
+            mempool_sats INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT ''
+        );
     """)
     return c
 
@@ -1235,6 +1258,123 @@ def _list_results():
         return [{"attack": a, "payload": json.loads(p), "ts": t}
                 for a, p, t in c.execute(
                     "SELECT attack,payload,ts FROM results ORDER BY id DESC LIMIT 500")]
+
+# ── Optional post-hit balance verification ─────────────────────────────
+# Deliberately NOT inside _save_result: a network call per Bloom hit in the
+# hot loop would hammer the explorer and stall the attack. Hits stay saved as
+# candidates; /results checks them in a separate, paced, stoppable job.
+
+def _all_result_addresses(limit=None):
+    """Unique, syntactically valid addresses from every saved hit."""
+    with _db() as c:
+        rows = list(c.execute("SELECT payload FROM results ORDER BY id DESC"))
+    out, seen = [], set()
+    for (p,) in rows:
+        try:
+            item = json.loads(p)
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in ("address", "recovered_addr"):
+            a = item.get(key)
+            if not isinstance(a, str):
+                continue
+            a = _normalise_address(a)
+            if not _valid_address(a) or a in seen:
+                continue
+            seen.add(a)
+            out.append(a)
+            if limit and len(out) >= limit:
+                return out
+    return out
+
+def _store_balance_check(addr, sats, tx_count, mempool_sats, error=""):
+    with _db() as c:
+        c.execute("INSERT OR REPLACE INTO balance_checks "
+                  "(address,sats,tx_count,mempool_sats,checked_at,error) "
+                  "VALUES (?,?,?,?,?,?)",
+                  (addr, int(sats), int(tx_count), int(mempool_sats),
+                   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   str(error)[:200]))
+
+def _balance_checks():
+    with _db() as c:
+        return {a: {"sats": s, "tx_count": t, "mempool_sats": ms,
+                    "checked_at": ts, "error": e}
+                for a, s, t, ms, ts, e in c.execute(
+                    "SELECT address,sats,tx_count,mempool_sats,checked_at,error "
+                    "FROM balance_checks")}
+
+def _balance_badge(addr, checks):
+    v = checks.get(addr)
+    if not v:
+        return '<span class="muted">not checked yet</span>'
+    if v["error"]:
+        return ('<span class="badge warn">check failed: '
+                + html.escape(str(v["error"])[:120]) + '</span>')
+    total = v["sats"] + v["mempool_sats"]
+    if total > 0:
+        return (f'<span class="badge ok">{total/1e8:.8f} BTC — '
+                'verify manually with a block explorer</span>')
+    if v["tx_count"] == 0:
+        return ('<span class="badge bad">0 BTC · never funded — '
+                'likely Bloom false positive</span>')
+    return '<span class="badge bad">0 BTC · spent / empty</span>'
+
+def verify_result_balances(force, log, job):
+    """Check saved hits against Esplora. Paced, cached, stoppable."""
+    if force:
+        log("[verify] forced re-check (Esplora cache cleared)")
+    addrs = _all_result_addresses(VERIFY_MAX_ADDRESSES)
+    if not addrs:
+        log("[verify] no saved hits with a valid address")
+        job["detail"] = "no addresses to check"
+        return
+    total = len(addrs)
+    log(f"[verify] checking {total:,} unique address(es) against {ESPLORA}")
+    t0 = time.time()
+    funded = never_funded = errors = 0
+    for i, addr in enumerate(addrs):
+        if job["stop"]:
+            log("[verify] stopped by user")
+            break
+        try:
+            txt = _esplora_get(f"/address/{addr}", lambda: job["stop"])
+            d = json.loads(txt)
+            chain = d.get("chain_stats") or {}
+            mem = d.get("mempool_stats") or {}
+            sats = int(chain.get("funded_txo_sum", 0)) - int(chain.get("spent_txo_sum", 0))
+            msats = int(mem.get("funded_txo_sum", 0)) - int(mem.get("spent_txo_sum", 0))
+            tx_count = int(chain.get("tx_count", 0))
+            _store_balance_check(addr, sats, tx_count, msats)
+            if sats + msats > 0:
+                funded += 1
+                log(f"[verify] {addr}: {sats+msats:,} sats — VERIFY MANUALLY")
+            elif tx_count == 0:
+                never_funded += 1
+            else:
+                log(f"[verify] {addr}: 0 sats (spent/empty)")
+        except RuntimeError as e:
+            if "stopped by user" in str(e):
+                log("[verify] stopped by user")
+                break
+            errors += 1
+            _store_balance_check(addr, 0, 0, 0, str(e))
+            log(f"[verify] {addr}: {e}")
+        except Exception as e:
+            # One bad response must not abort a multi-thousand-address run.
+            errors += 1
+            _store_balance_check(addr, 0, 0, 0, str(e))
+            log(f"[verify] {addr}: {e}")
+        done = i + 1
+        rate = done / max(time.time() - t0, 0.001)
+        job["progress"] = done / total
+        job["detail"] = (f"{done:,}/{total:,} addresses  funded={funded:,}  "
+                         f"never-funded={never_funded:,}  errors={errors:,}  "
+                         f"{rate:.2f} addr/s")
+    log(f"[verify] done — {funded:,} with balance, {never_funded:,} never funded, "
+        f"{errors:,} errors")
 
 def _sync_busy():
     """Keep the deploy marker in sync with the set of live jobs."""
@@ -1349,6 +1489,11 @@ max-height:320px;font-size:12px;border:1px solid #3b4252}
 .bar{background:#2e3440;border-radius:4px;height:12px;overflow:hidden;margin:6px 0}
 .bar>div{background:#a3be8c;height:100%;transition:width .3s}
 .hit{color:#ebcb8b;font-weight:bold}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;
+font-weight:bold;border:1px solid}
+.badge.ok{background:#2e3b2b;color:#a3be8c;border-color:#a3be8c}
+.badge.bad{background:#3b2629;color:#bf616a;border-color:#bf616a}
+.badge.warn{background:#3b3326;color:#ebcb8b;border-color:#ebcb8b}
 .muted{color:#7b8794;font-size:13px}
 .status-ok{color:#a3be8c}.status-bad{color:#bf616a}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
@@ -1485,6 +1630,8 @@ def data_page():
         balance_note = "disabled (all rows kept)"
     else:
         balance_note = f"keep rows with balance &gt; {DATASET_MIN_BALANCE:g}"
+    est_mb = (-51_000_000 * math.log(BLOOM_FP_RATE) /
+              (math.log(2) ** 2) / 8 / 1e6)
     body = f"""
 <div class="card"><h2>Dataset status</h2>
 <p>cached dataset (.gz): {'✓ ' + f'{status["gz_size"]/1e9:.2f} GB' if status['gz']
@@ -1501,7 +1648,9 @@ download was disabled in 2026), then text dumps and other public mirrors.
 The balance TSV is ~1.7 GB; smaller text/hex dumps are fallbacks. Set
 DATASET_PREFER_BALANCE_TSV=0 to prefer the smaller text dump. Budget:
 {BUILD_DEADLINE_SECS // 60} min total, {DOWNLOAD_DEADLINE_SECS // 60} min for
-the download. Balance filter: {balance_note}
+the download. Bloom FP rate: {BLOOM_FP_RATE:g} (~{est_mb:.0f} MB bitset at 51M
+rows); changing BLOOM_FP_RATE needs a rebuild — Download &amp; build bloom
+reuses the cached .gz. Balance filter: {balance_note}
 (set DATASET_MIN_BALANCE=-1 to keep zero balances). To replace an already
 cached text dump with a balance TSV, click Re-download &amp; rebuild. You can
 also copy a .gz to {DATA_DIR}/blockchair.tsv.gz and click Download — the
@@ -1751,22 +1900,78 @@ def api_nonce_bulk():
 @app.route("/results")
 def results_page():
     rows = _list_results()
+    checks = _balance_checks()
     body = "<div class='card'><h2>Results</h2>"
+    body += ("<p class='muted'>Hits are Bloom-filter candidates from a dated "
+             "snapshot, not confirmed wallets. Check balances before trusting "
+             "any hit: a zero-balance address with no transactions is almost "
+             "certainly a Bloom false positive. Even a funded hit still needs "
+             "manual verification with a block explorer.</p>")
     body += ("<p><a class='btn' href='/api/results/export'>Download all (JSONL)</a>"
              "<a class='btn' href='/api/results/export?attack=nonce'>"
              "Download nonce results (JSONL)</a></p>"
              "<p class='muted'>The page shows the newest 500 hits; "
              "the downloads contain all of them.</p>")
+    body += ("<div class='card'><h2>Check balances</h2>"
+             "<button class='btn' onclick=\"verifyBalances(false)\">"
+             "Check balances</button>"
+             "<button class='btn' onclick=\"verifyBalances(true)\">"
+             "Force re-check</button>"
+             "<button class='btn danger' onclick=\"stop('verify')\">Stop</button>"
+             f"<p class='muted'>Queries {html.escape(ESPLORA)} for every saved "
+             "hit address, paced by ESPLORA_MIN_INTERVAL and cached per "
+             "process. Force re-check clears that cache. "
+             f"Max {VERIFY_MAX_ADDRESSES:,} unique addresses per run.</p>"
+             "<div class='bar'><div id='bar' style='width:0%'></div></div>"
+             "<p id='detail' class='muted'></p><pre id='log'></pre></div>")
     if not rows:
         body += "<p class='muted'>no hits yet</p>"
+    funded = never_funded = unchecked = 0
     for r in rows:
+        payload = r["payload"]
+        addrs = []
+        for key in ("address", "recovered_addr"):
+            a = payload.get(key)
+            if isinstance(a, str) and a and a not in addrs:
+                addrs.append(a)
+        badges = []
+        for a in addrs:
+            v = checks.get(a)
+            if v and not v["error"]:
+                if v["sats"] + v["mempool_sats"] > 0:
+                    funded += 1
+                elif v["tx_count"] == 0:
+                    never_funded += 1
+            else:
+                unchecked += 1
+            badges.append("<p>" + html.escape(a) + " — "
+                          + _balance_badge(a, checks) + "</p>")
         # Hit payloads can contain user-supplied passphrases: escape before
         # inserting into HTML, otherwise a stored XSS is possible.
         body += (f"<div class='card'><p class='hit'>[{html.escape(str(r['attack']))}] "
                  f"{html.escape(str(r['ts']))}</p>"
-                 f"<pre>{html.escape(json.dumps(r['payload'], indent=2))}</pre></div>")
+                 + "".join(badges)
+                 + f"<pre>{html.escape(json.dumps(payload, indent=2))}</pre></div>")
+    if rows:
+        body += (f"<p class='muted'>Summary: {funded:,} with a balance, "
+                 f"{never_funded:,} never funded (likely false positives), "
+                 f"{unchecked:,} not checked yet.</p>")
     body += "</div>"
+    body += ("<script>\n"
+             "function verifyBalances(force){ post('/api/verify',{force:!!force}); }\n"
+             "watch('verify');\n"
+             "</script>")
     return page(body)
+
+@app.route("/api/verify", methods=["POST"])
+def api_verify():
+    """Start an async balance check of all saved hits."""
+    j = request.get_json(silent=True) or {}
+    force = bool(j.get("force"))
+    if force:
+        _esplora_cache_clear()
+    ok, msg = _start_job("verify", verify_result_balances, force)
+    return {"ok": ok, "msg": msg}
 
 @app.route("/api/results/export")
 def api_results_export():
@@ -1780,6 +1985,7 @@ def api_results_export():
     q += " ORDER BY id ASC"
     with _db() as c:
         rows = list(c.execute(q, args))
+    checks = _balance_checks()
     lines = []
     for a, p, ts in rows:
         try:
@@ -1788,6 +1994,19 @@ def api_results_export():
             item = {"payload_raw": p}
         item["attack"] = a
         item["saved_at"] = ts
+        addr = item.get("address") or item.get("recovered_addr")
+        v = checks.get(addr) if isinstance(addr, str) else None
+        if v:
+            sats = v["sats"] + v["mempool_sats"]
+            item["balance_sats"] = sats
+            item["balance_tx_count"] = v["tx_count"]
+            item["balance_checked_at"] = v["checked_at"]
+            item["balance_error"] = v["error"]
+            item["balance_verdict"] = (
+                "check_failed" if v["error"] else
+                "funded_verify_manually" if sats > 0 else
+                "never_funded_likely_false_positive" if v["tx_count"] == 0 else
+                "empty_or_spent")
         lines.append(json.dumps(item))
     slug = re.sub(r"[^A-Za-z0-9_-]", "", attack) or "all"
     filename = f"btc-hunt-{slug}-results.jsonl"

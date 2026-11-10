@@ -71,6 +71,8 @@ required for the health check and the public URL to work.
 | `ESPLORA_CACHE_SIZE` | `4096` | Bounded in-memory cache of Esplora responses per process |
 | `NONCE_MAX_ADDRESSES` | `5000` | Cap on addresses in one bulk upload |
 | `NONCE_MAX_UPLOAD_BYTES` | `2000000` | Cap on the uploaded text size |
+| `BLOOM_FP_RATE` | `0.000001` | Bloom false-positive target; lower = fewer false hits, larger/slower build. Rebuild the bloom after changing it |
+| `VERIFY_MAX_ADDRESSES` | `5000` | Max unique hit addresses checked by one `/results` balance run |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `PORT` | set by Render | Do not override |
 
@@ -123,6 +125,40 @@ flooded with bogus recoveries.
 
 `/results` shows the newest 500 hits. Use **Download all (JSONL)** or
 **Download nonce results (JSONL)** there to export every hit.
+
+## Verifying hits and false positives
+
+`h in bf` is a probabilistic membership test against a **dated snapshot** of
+funded addresses, not a live-balance lookup. At the old `BLOOM_FP_RATE=0.001`,
+a 4,000,001-timestamp Randstorm run performs ~12M membership tests (three
+derived addresses per key) and expects **~12,000 false ★★★ HITs**. The default
+is now `0.000001`, cutting that to ~12 while growing the bitset from ~90 MB to
+~183 MB for 51M rows (k rises from ~10 to ~19). Raise it if the extra build
+time/memory is a problem; lower it for even fewer false alarms. Changing the
+rate requires a rebuild — **Download & build bloom** on `/data` rebuilds from
+the cached `.gz` (no re-download), or use **Re-download & rebuild** to replace
+the dump too. An existing `funded.bloom` still loads fine: its own `m`/`k` are
+stored in the file header.
+
+`/results` now has **Check balances** / **Force re-check**. It starts a paced,
+stoppable job that queries `ESPLORA_URL` for every saved hit address and stores
+the result in SQLite — deliberately **not** inside `_save_result`, so no network
+call ever stalls an attack in the hot loop. Badges:
+
+- `0 BTC · never funded — likely Bloom false positive` (chain `tx_count == 0`)
+- `0 BTC · spent / empty`
+- `X BTC — verify manually with a block explorer`
+- `check failed: ...` if the explorer was unreachable
+
+Balances are cached per process; **Force re-check** clears that cache. The
+JSONL downloads include `balance_sats`, `balance_tx_count`,
+`balance_checked_at`, `balance_error` and `balance_verdict`. Only
+`VERIFY_MAX_ADDRESSES` (default 5000) unique addresses are checked per run.
+
+A funded hit is still only a candidate: it comes from a snapshot, and a Bloom
+false positive can coincidentally have a balance. Always confirm with a block
+explorer before trusting any private key. Only test addresses you own or are
+authorised to test.
 
 ## Checking which build is live
 
