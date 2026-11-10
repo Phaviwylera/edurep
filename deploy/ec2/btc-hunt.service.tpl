@@ -15,7 +15,7 @@ Environment=PYTHONUNBUFFERED=1
 # Optional file (mode 0600) holding DISK_PATH, ESPLORA_URL and the
 # APP_USER / APP_PASSWORD Basic-auth credentials. Leading "-" = optional.
 EnvironmentFile=-__ENV_FILE__
-ExecStart=__APP_DIR__/.venv/bin/gunicorn btc_hunt:app --bind __BIND__ --timeout 180 --workers 1 --threads 8 --access-logfile - --error-logfile -
+ExecStart=__APP_DIR__/.venv/bin/gunicorn btc_hunt:app --bind __BIND__ --timeout 180 --workers 1 --threads 16 --access-logfile - --error-logfile -
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM

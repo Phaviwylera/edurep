@@ -22,6 +22,18 @@ if ! git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
+# Jobs live in the app process; restarting mid-job would kill a long dataset
+# build or scan. The app writes this marker while a job is alive. Defer the
+# whole deploy (do NOT fetch) so the next timer tick can pick it up later.
+ENV_FILE="${ENV_FILE:-/etc/btc-hunt.env}"
+DISK_PATH="$(sed -n 's/^DISK_PATH=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)"
+DISK_PATH="${DISK_PATH:-/var/lib/btc-hunt}"
+BUSY_MARKER="$DISK_PATH/.btc-hunt-busy"
+if [ -f "$BUSY_MARKER" ]; then
+  echo "[update] job running ($(cat "$BUSY_MARKER")) — deferring deploy until it finishes"
+  exit 0
+fi
+
 BEFORE="$(git -C "$APP_DIR" rev-parse HEAD)"
 echo "[update] fetching origin/$REPO_BRANCH"
 git -C "$APP_DIR" fetch --depth 1 origin "$REPO_BRANCH"

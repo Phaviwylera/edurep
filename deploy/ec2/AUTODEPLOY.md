@@ -220,4 +220,5 @@ re-installs its own newest version on every deploy.
 | SSM command stays `Pending` | Instance not SSM-managed: check the instance profile and `snap.amazon-ssm-agent.amazon-ssm-agent.service` |
 | Deploy fails with `Failed` | Workflow prints `StandardErrorContent`; on the instance `sudo btc-hunt-update` to reproduce |
 | Auto-pull timer does nothing | `systemctl status btc-hunt-autopull.timer`; `sudo journalctl -u btc-hunt-autopull.service -n 50` |
+| Deploy deferred (`job running`) | By design: a restart would kill the in-progress dataset build/scan. The next 2-minute tick deploys once it finishes |
 | `/health` still 502 | `sudo systemctl status btc-hunt nginx`, `sudo nginx -t` |
