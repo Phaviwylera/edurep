@@ -7,9 +7,10 @@ that provisions the whole service.
 
 Four scans ship today: the timestamp dataset sweep, Randstorm-style
 millisecond timestamps, passphrase brainwallets, ECDSA nonce reuse — plus an
-[Ethereum page](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances) that
-sweeps weak Ethereum generators and verifies every candidate live over
-JSON-RPC.
+[Ethereum page](#ethereum-timestamp-sweeps-weak-keys-nonce-reuse-live-rpc-balances)
+that sweeps weak Ethereum generators, reads real signed transactions for
+[nonce (`k`) reuse](#ethereum-nonce-k-reuse), and verifies every candidate live
+over JSON-RPC.
 
 > **The service has to be created from your own Render account.** This
 > workspace has no Render integration or API token, so it can prepare and
@@ -114,6 +115,18 @@ required for the health check and the public URL to work.
 | `ETH_RATE` | `24000` | Candidates/s assumed by that estimate (measured `sha256_dec` with both accelerators on one vCPU); divided by the number of selected recipes. The job log always shows the real rate |
 | `ETH_ERA_STEPS` | `1000000` | Default slice of **each** era taken by one era-batch run (floored at 1000). The eras are billions of timestamps wide, so this is a sample, not a sweep — raise it, or set an era's steps to its whole span, if you have a private RPC endpoint and the patience |
 | `ETH_MAX_WEAK_KEYS` | `2000000` | **Warn threshold, not a cap** on sequential + pasted keys per weak-key run: keys are streamed and checked one RPC batch at a time, so a larger count just runs longer |
+| `ETH_EXPLORER_URLS` | `https://eth.blockscout.com` | Comma-separated indexer bases for **Ethereum nonce-reuse address mode** (public JSON-RPC cannot list an address's transactions). Each keeps its own cooldown; requests fail over. Setting this replaces the default list entirely |
+| `ETH_EXPLORER_STYLE` | `blockscout` | `blockscout` = keyless `/api/v2/addresses/{addr}/transactions?filter=from`; `etherscan` = `/api?module=account&action=txlist`, which needs `ETH_EXPLORER_KEY` |
+| `ETH_EXPLORER_KEY` | empty | API key appended in `etherscan` style. A 403 in `blockscout` style is reported as "wants an API key", never as "no reuse" |
+| `ETH_EXPLORER_TIMEOUT` | `25` | Seconds per indexer request |
+| `ETH_EXPLORER_MIN_INTERVAL` | `0.3` | Minimum seconds between indexer requests; `0` disables pacing |
+| `ETH_EXPLORER_PAGE` | `10000` | Page size requested in `etherscan` style (Blockscout v2 pages by cursor) |
+| `ETH_NONCE_MAX_TXS` | `2000` | Cap on how many of one address's sent transactions a nonce run reads. Hitting it is logged as `INCOMPLETE`, not silent |
+| `ETH_NONCE_MAX_PAGES` | `100` | Cap on indexer pages followed per address |
+| `ETH_NONCE_MAX_ITEMS` | `20000` | Cap on pasted transaction hashes / raw transactions in one request |
+| `ETH_NONCE_BLOCKS` | `20` | Default block count when a range gives only its start |
+| `ETH_NONCE_MAX_BLOCKS` | `20000` | **Batch size** in blocks: a larger range is split and the batches run one after another. Nothing is refused |
+| `ETH_NONCE_MAX_SIGS` | `200000` | Signatures held in RAM by one run. Hitting it makes the run `partial` |
 | `BIP39_WORDLIST_PATH` | `data/bip39_english.txt` | The vendored 2048-word BIP-39 English list (SHA-256 `2f5eed53…`) |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
@@ -158,7 +171,9 @@ containing `0`.
 
 The scan uses the same `nonce` job as a single-address scan, so the progress
 bar, live log and **Stop** button all work, and only one nonce job can run at a
-time.
+time. This is the **Bitcoin** scan; the Ethereum equivalent — real signed
+transactions, five tx types, `(sender, r)` grouping — is
+[Ethereum nonce (k) reuse](#ethereum-nonce-k-reuse), and `/nonce` links to it.
 
 **Both signature layouts are parsed now.** A legacy `scriptSig` signature is
 checked against the legacy sighash; a segwit witness signature against its
@@ -417,7 +432,7 @@ false positive can coincidentally have a balance. Always confirm with a block
 explorer before trusting any private key. Only test addresses you own or are
 authorised to test.
 
-## Ethereum: timestamp sweeps, weak keys, live RPC balances
+## Ethereum: timestamp sweeps, weak keys, nonce reuse, live RPC balances
 
 `/eth` adds Ethereum to the same dashboard. The curve is identical
 (secp256k1), so the EC backend from the Randstorm work is reused unchanged;
@@ -630,6 +645,128 @@ Only sweep windows and addresses you own or are authorised to test. Sweeping
 someone else's address space is key-guessing, and a funded hit is not
 authorisation to move funds.
 
+## Ethereum nonce (k) reuse
+
+The **Nonce (k) reuse** card on [`/eth`](#ethereum-timestamp-sweeps-weak-keys-nonce-reuse-live-rpc-balances)
+is the Ethereum twin of the Bitcoin [`/nonce` scan](#bulk-nonce-reuse-scans), and
+it works on **real signed transactions**: it parses them, rebuilds the payload
+each one actually signed, recovers the sender from `(v, r, s)` and only then
+looks for a reused `k`.
+
+Two different things are called a "nonce" on Ethereum, and only one of them is
+a vulnerability:
+
+| | what it is | repeated value means |
+| --- | --- | --- |
+| **account nonce** | the sender's transaction counter (`eth_getTransactionCount`) | a speed-up or a cancel: two transactions with the same counter, only one of which lands. Harmless |
+| **ECDSA `k`** | the secret per-signature random value | two signatures with the **same `r`**, which leaks the private key outright |
+
+This card looks at `k`, via `r`. `k` is never published; `r = (k·G).x mod n` is,
+in every signature.
+
+### What leaks a key, and what provably does not
+
+Signatures are grouped by **(sender, `r`)** — not by `r` alone:
+
+- **Same key, same `k`, different message** — the leak. From
+  `s = k⁻¹(z + r·d)`, two signatures give `k = (z₁−z₂)/(s₁−s₂)` and then
+  `d = (k·s₁ − z₁)/r`. Every pair in the group is solved and each candidate is
+  verified before it is believed.
+- **Two different keys sharing one `r`** — reported as **NOT a leak** and never
+  chased. The same algebra gives `k·(s₁−s₂) = (z₁−z₂) + r·(d₁−d₂)`: two
+  equations in three unknowns, so neither key follows. Cross-sender `r`
+  collisions are interesting, not actionable.
+- **The same message signed twice** (byte-identical `r`, `s`, `z`) — a
+  resubmission or a re-broadcast. The pair is degenerate, implies no key, and is
+  logged as such instead of being counted as a test that ran.
+- **Low-S normalisation (EIP-2)** does not save a signer that applied it to one
+  signature and not the other: both signs of `k` and the mixed-parity case are
+  solved, exactly as on the Bitcoin side.
+
+### Four ways to feed it
+
+| Mode | Input | Network | Cost |
+| --- | --- | --- | --- |
+| **Address** | one `0x…` address | indexer + RPC | the indexer lists the transactions the address **sent** (`filter=from` — only those carry its signature), then each hash is fetched from RPC |
+| **Tx hashes** | a list of `0x…` hashes | RPC only | one `eth_getTransactionByHash` per hash, batched; **no indexer is touched** |
+| **Raw hex** | signed transactions, `0x` prefix optional | **none** | parsed locally; with `ETH_VERIFY_BALANCES=0` the whole run makes zero requests |
+| **Block range** | `start:end`, decimal or `0x…` | RPC only | one `eth_getBlockByNumber(n, true)` per block — full transactions arrive with their signatures inline |
+
+Public JSON-RPC has no "transactions by address" method (`ots_*` and traces are
+not served), so **address mode needs an indexer**: Blockscout's keyless
+`/api/v2/addresses/{addr}/transactions` by default, or an Etherscan-style
+endpoint with `ETH_EXPLORER_STYLE=etherscan` and `ETH_EXPLORER_KEY`. Blockscout
+list items carry `hash` and `from.hash` but **not** `r`/`s`/`v`, so the
+signatures always come from RPC. Block-range mode skips the indexer entirely and
+is the only mode that can survey senders you did not already know.
+
+Every transaction type is parsed: legacy pre-EIP-155 (`v` = 27/28 over six
+fields), legacy EIP-155 (`v = chainId·2 + 35 + parity` over nine), and the typed
+envelopes `0x01` EIP-2930 (11 fields), `0x02` EIP-1559 (12), `0x03` EIP-4844
+(14) and `0x04` EIP-7702 (13 — its `authorization_list` tuples carry their own
+signatures and are not analysed yet).
+
+### The payload gate
+
+The signing payload is rebuilt from parsed fields, so a field this build does
+not understand would produce a **wrong `z`** — and a wrong `z` looks exactly
+like a failed key recovery. Every parsed transaction is therefore checked before
+it is trusted: raw input must re-serialise to the same bytes, and a transaction
+read from RPC must hash back to the hash the node reported. A transaction that
+fails is **counted, logged and excluded**, never silently believed; the
+53 vendored vectors in `data/eth_tx_vectors.json` (accepted transactions from
+`ethereum/tests`, with their published senders and hashes, provenance recorded
+in the file) keep that gate honest in `tests/test_eth.py`.
+
+### A failed read is never a clean verdict
+
+- An indexer that answers 403/429/5xx, an RPC where every endpoint refuses, a
+  hash the node does not know, a block that cannot be read, a cap that stops the
+  run early, or **Stop**: the run is marked `partial`, the log says
+  `INCOMPLETE READ`, and "no repeated `r`" is explicitly scoped to what was
+  actually read.
+- `NO private key can be extracted from this public data` is printed **only**
+  after a complete read — that sentence is the one thing on this page that must
+  never be wrong.
+- A run that tested repeated-`r` groups and recovered nothing says so:
+  `N repeated-r group(s) tested, no key recovered. That is a result, not a
+  failure`.
+
+A recovered key is saved only once it **verifies**: the candidate must reproduce
+the uncompressed pubkey that signed, or the address that sent the transaction
+(`verify_recovered_eth_key`, evidence `pubkey:…` / `eth_address:…`). Saved hits
+land in `/results` with the EIP-55 checksummed address, are picked up by the
+Ethereum balance verifier and appear in `/api/results/export?attack=eth`.
+
+### Headless
+
+```bash
+# one address, via the indexer + RPC
+.venv/bin/python btc_hunt.py --cli-eth-nonce 0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F
+
+# a list of transaction hashes (RPC only, no indexer)
+.venv/bin/python btc_hunt.py --cli-eth-nonce-txs hashes.txt
+
+# signed transactions pasted in a file — parses with no network at all
+.venv/bin/python btc_hunt.py --cli-eth-nonce-raw txs.txt
+
+# a block range: START:END, decimal or 0x hex, one RPC call per block
+.venv/bin/python btc_hunt.py --cli-eth-nonce-blocks 19000000:19000020
+```
+
+Each flag takes a file of one item per line (hashes/raw) or a single token
+(address/range), refuses a Bitcoin address in the Ethereum field, and exits
+non-zero on a range whose end precedes its start — but never on size: a range
+above `ETH_NONCE_MAX_BLOCKS` is split into batches and run, like every other
+scan in this repo.
+
+### Scope
+
+Detection is public data and may be run against any address. **Key extraction
+and sweeping are only for addresses you own or are authorised to test**, and a
+recovered key is not authorisation to move funds — the same rule as the
+timestamp sweeps above.
+
 ## Checking which build is live
 
 Every page has a footer showing `build <commit>`, the process start time, the
@@ -647,7 +784,7 @@ backend is installed, or `python windowed w=4` when the pure-Python fallback is
 running (~4x slower — see [Scan speed](#scan-speed-and-the-ec-backend)).
 `keccak` reads `pycryptodome <version>` or `python keccak-f1600 (~400 us/hash)`
 and only affects the Ethereum page (~117x slower without it — see
-[Ethereum](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances)).
+[Ethereum](#ethereum-timestamp-sweeps-weak-keys-nonce-reuse-live-rpc-balances)).
 
 Compare `build` with the newest commit on `main`. If the field is missing (a
 process started before this change) or the hash is old, the auto-pull has not
@@ -716,14 +853,29 @@ python tests/test_eth.py       # no pytest, no network: requests is monkeypatche
 python tests/test_live.py      # no pytest, no internet: a synthetic Esplora
 ```
 
-30 groups: published vectors for every Ethereum primitive, the recipes, the
+38 groups: published vectors for every Ethereum primitive, the recipes, the
 JSON-RPC client (batching, per-item errors, batch refusal, 429 failover, 403
 parking, pre-flight probe, adaptive batch size), the sweeps, the retry queue and
 its drainer, the fixed era table (including the corrected CVE id and the
 14-digit end), the era batch route/job/CLI, the dashboard widgets, the
 no-range-refused batching on both the ETH and the Bitcoin side, and a Bitcoin
-regression group. It writes only to a temporary `DISK_PATH` and runs the CLI
-groups as subprocesses with `ETH_VERIFY_BALANCES=0`, so it needs no network.
+regression group. Groups 31-37 are the **nonce-reuse** scan: RLP edge cases and
+the EIP-155 worked example (signing data, signing hash, raw transaction, `v/r/s`
+and sender asserted verbatim), the 53 accepted `ethereum/tests` vectors in
+`data/eth_tx_vectors.json` — each one's published `txbytes` re-hashed to its
+published `hash`, re-serialised byte-for-byte, its sender recovered, and the
+recovery cross-checked against libsecp256k1's own `ecrecover` — all five
+transaction types by round-trip (the suite ships no accepted `0x03`/`0x04`
+vector), the RPC entry point agreeing with the raw bytes, the payload gate
+excluding a transaction that does not reproduce its hash, same-key reuse
+recovering the key with both parities, and the two negative controls that decide
+the design (a byte-identical pair and a cross-sender `r` collision leak nothing),
+then all four input modes end to end, indexer pagination, truncation, an explicit
+verdict for a clean address, every failure mode staying honest instead of
+reading as "clean", the route's validation, the card's rendering, the results and
+export wiring, and the four headless flags. It writes only to a temporary
+`DISK_PATH` and runs the CLI groups as subprocesses with
+`ETH_VERIFY_BALANCES=0`, so it needs no network.
 
 `tests/test_live.py` adds 19 groups for the signature and live-monitor side:
 the **published BIP-143 vectors** (Native P2WPKH, P2SH-P2WPKH, Native P2WSH
@@ -772,8 +924,12 @@ practical option on smaller plans.
   JSON-RPC, so public endpoints — not the CPU — set the sweep rate, and a
   large window needs your own node or a paid provider. Public endpoints also
   reject datacenter IPs outright (HTTP 403), which the pre-flight probe reports
-  before a run wastes hours. See
-  [Ethereum](#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
+  before a run wastes hours. **Nonce-reuse address mode also needs an indexer**
+  (`ETH_EXPLORER_URLS`): public JSON-RPC cannot list an address's transactions,
+  so that mode is the one Ethereum scan with a third-party dependency — the
+  hashes, raw-hex and block-range modes talk to RPC only, and raw hex to nothing
+  at all. See
+  [Ethereum](#ethereum-timestamp-sweeps-weak-keys-nonce-reuse-live-rpc-balances).
 - **No range is refused, so a big range is a time commitment.** Era 2 is 13.4
   billion timestamps and Era 3 is 63.1 billion; at the ~24,000 candidates/s
   measured on EC2 that is ~6 and ~30 days of pure CPU, but 268 million and 1.26

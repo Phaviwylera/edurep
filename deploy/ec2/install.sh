@@ -234,6 +234,31 @@ PYTHONUNBUFFERED=1
 # Warn threshold for one weak-key run (keys are streamed one RPC batch at a
 # time, so a larger count just runs longer).
 #ETH_MAX_WEAK_KEYS=2000000
+# Nonce (k) reuse on Ethereum (/eth "7 - Nonce (k) reuse", --cli-eth-nonce*).
+# Real signed transactions: the app parses them, rebuilds the payload each one
+# signed, recovers the sender from (v,r,s) and groups signatures by (sender,r).
+# Only the SAME key signing twice with one k leaks a key; two different keys
+# sharing one r provably do not, and that is reported rather than chased.
+# Address mode needs an indexer - public JSON-RPC has no "transactions by
+# address" method. Blockscout's v2 API is keyless and is the default:
+#ETH_EXPLORER_URLS=https://eth.blockscout.com
+# "etherscan" style uses /api?module=account&action=txlist and needs a key:
+#ETH_EXPLORER_STYLE=blockscout
+#ETH_EXPLORER_KEY=
+#ETH_EXPLORER_TIMEOUT=25
+#ETH_EXPLORER_MIN_INTERVAL=0.3
+#ETH_EXPLORER_PAGE=10000
+# Caps for one run. Every cap is reported when it is hit: a truncated read is
+# logged as INCOMPLETE and marked partial, never dressed up as "no reuse".
+#ETH_NONCE_MAX_TXS=2000
+#ETH_NONCE_MAX_PAGES=100
+#ETH_NONCE_MAX_ITEMS=20000
+# Block-range mode needs no indexer at all: eth_getBlockByNumber(n, true)
+# returns every transaction with its signature inline - one call per block. A
+# range above ETH_NONCE_MAX_BLOCKS is split into batches, never refused.
+#ETH_NONCE_BLOCKS=20
+#ETH_NONCE_MAX_BLOCKS=20000
+#ETH_NONCE_MAX_SIGS=200000
 # Vendored 2048-word BIP-39 English list (sha256 2f5eed53...).
 #BIP39_WORDLIST_PATH=/opt/btc-hunt/data/bip39_english.txt
 
