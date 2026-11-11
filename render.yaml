@@ -38,6 +38,13 @@ services:
       # The built-in default is three public, rate-limited endpoints.
       - key: ETH_RPC_URLS
         sync: false
+      # The Ethereum nonce-reuse card (/eth, "7 - Nonce (k) reuse") reads real
+      # signed transactions. Hashes, raw-hex and block-range modes use the RPC
+      # above; ADDRESS mode also needs an indexer, because public JSON-RPC has
+      # no "transactions by address" method. The built-in default is keyless
+      # Blockscout (https://eth.blockscout.com) - set these in the Render
+      # dashboard only if you run your own, or use an Etherscan-style endpoint
+      # (ETH_EXPLORER_STYLE=etherscan + ETH_EXPLORER_KEY).
       # Optional HTTP Basic auth for the dashboard. Render prompts for these
       # on Blueprint creation; leave both blank to run without authentication.
       - key: APP_USER

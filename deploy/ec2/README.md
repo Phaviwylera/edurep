@@ -354,7 +354,7 @@ refuses (403), the run stops and says so rather than filling the queue: point
 
 Public endpoints 429 within seconds of a real sweep anyway: at ~24,000
 candidates/s with batches of 50 the app would need ~475 requests/s. Full recipe/window honesty table and measured rates:
-[Ethereum section in the main README](../../README.md#ethereum-timestamp-sweeps-weak-keys-live-rpc-balances).
+[Ethereum section in the main README](../../README.md#ethereum-timestamp-sweeps-weak-keys-nonce-reuse-live-rpc-balances).
 
 ### The era batch
 
@@ -391,6 +391,56 @@ sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py --list
 sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
   --cli-eth-era frontier:50000,cryptojs:50000@2000000 --recipes sha256_dec
 ```
+
+### Nonce (k) reuse
+
+`/eth` card **7 · Nonce (k) reuse** is the Ethereum twin of the Bitcoin
+`/nonce` scan and works on **real signed transactions**: it parses them,
+rebuilds the payload each one actually signed (legacy pre-155 and EIP-155, plus
+the `0x01`/`0x02`/`0x03`/`0x04` typed envelopes), recovers the sender from
+`(v, r, s)` and groups signatures by **(sender, `r`)**. Only the same key
+signing twice with one `k` leaks a key — two different keys sharing an `r` give
+two equations in three unknowns and are reported as **NOT a leak**, and a
+byte-identical pair is a resubmission that implies nothing.
+
+It is the account **nonce** (`eth_getTransactionCount`) that people usually mean
+by "nonce reuse" on Ethereum, and that one is harmless: two transactions with
+the same counter is a speed-up or a cancel. This card looks at the ECDSA `k`.
+
+Four input modes, with different network costs:
+
+| Mode | Network | Notes |
+| --- | --- | --- |
+| Address | indexer + RPC | Blockscout's keyless `/api/v2/addresses/{addr}/transactions?filter=from` lists what the address **sent**, then each hash is fetched from RPC (list items carry no `r`/`s`/`v`) |
+| Tx hashes | RPC only | one batched `eth_getTransactionByHash` per hash, **no indexer** |
+| Raw hex | **none** | parsed locally; with `ETH_VERIFY_BALANCES=0` the run makes zero requests |
+| Block range | RPC only | one `eth_getBlockByNumber(n, true)` per block — full transactions arrive with signatures inline |
+
+```bash
+# which indexer answers from this host (address mode only)
+curl -s -u admin:PASS "http://127.0.0.1:8000/api/jobs" | python3 -m json.tool
+
+# headless: one address, a hash list, pasted raw txs, or a block range
+sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
+  --cli-eth-nonce 0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F
+sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
+  --cli-eth-nonce-blocks 19000000:19000020
+```
+
+Address mode is the only Ethereum scan here with a third-party dependency, so
+point `ETH_EXPLORER_URLS` at your own Blockscout (or set
+`ETH_EXPLORER_STYLE=etherscan` + `ETH_EXPLORER_KEY`) if the public one 403s this
+host — a refusal is reported as `no transactions read … NOT evidence that the
+key is safe`, never as a clean verdict. The same holds for a dead RPC, an
+unknown hash, an unreadable block, a cap that stops the run early and **Stop**:
+each marks the job `partial` and logs `INCOMPLETE READ`. `NO private key can be
+extracted from this public data` is printed only after a complete read.
+
+A recovered key is saved only once it verifies against the pubkey that signed or
+the address that sent it, then lands in `/results` with its EIP-55 checksummed
+address and in `/api/results/export?attack=eth`. Caps, honesty rules, the
+vendored `ethereum/tests` vectors and the algebra:
+[Ethereum nonce (k) reuse](../../README.md#ethereum-nonce-k-reuse).
 
 ## Dataset mirrors
 

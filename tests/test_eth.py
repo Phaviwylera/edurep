@@ -17,11 +17,18 @@ this is safe to run on a deploy box or in CI. It covers
         unscannable-era warning, the era widget on /eth, the home-page
         launcher, the headless --cli-eth-era / --list-eras, and the
         no-range-refused batching on both the ETH and the BTC side
+  31-37 Ethereum nonce (k) reuse: RLP and the five signing payloads against
+        EIP-155's worked example, the 53 accepted txbytes+sender+hash vectors
+        vendored from ethereum/tests, sender recovery for every tx type, what
+        leaks a key and what provably does not (the cross-sender negative
+        control), the four input modes end to end, the failure modes that must
+        never read as "clean", and the routes/page/CLI/results wiring
 
 Every assertion that encodes a published test vector says so in a comment.
 """
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -38,6 +45,10 @@ os.environ.update({
     "ETH_MAX_TOTAL_STEPS": "100000", "ETH_DEAD_COOL_SECS": "30",
     "ETH_ERROR_COOL_SECS": "1", "ETH_RPC_ROUNDS": "2",
     "ETH_PENDING_MAX": "1000", "ETH_PREFLIGHT": "1", "ETH_ERA_STEPS": "20",
+    # Nonce-reuse knobs: the indexer must not pace, and the caps stay small so
+    # the truncation and memory-cap paths are reachable in a test.
+    "ETH_EXPLORER_MIN_INTERVAL": "0", "ETH_NONCE_MAX_TXS": "200",
+    "ETH_NONCE_MAX_SIGS": "1000", "ETH_NONCE_BLOCKS": "5",
     "APP_USER": "", "APP_PASSWORD": "", "BTC_HUNT_BUILD_ID": "test-eth",
 })
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,6 +59,11 @@ REAL_GET = b.requests.get
 FUNDED = {}          # lowercase address -> wei
 NONCES = {}          # lowercase address -> nonce
 MODE = {"fail": None, "refuse_batch": False, "posts": [], "dead": []}
+# Nonce-reuse fakes: TXS serves eth_getTransactionByHash, BLOCKS serves
+# eth_getBlockByNumber(n, true), and EXP stands in for the address indexer.
+TXS = {}               # lowercase tx hash -> the JSON an RPC returns
+BLOCKS = {}            # block number -> [tx JSON, …]
+EXP = {"fail": None, "by_addr": {}, "pages": {}, "cursor": {}, "gets": []}
 
 
 class FakeResp:
@@ -78,8 +94,24 @@ def _one(call):
         val = (FUNDED.get(addr, 0) if m == "eth_getBalance"
                else NONCES.get(addr, 0))
         return {"jsonrpc": "2.0", "id": call.get("id"), "result": hex(val)}
+    if m == "eth_getTransactionByHash":
+        h = ((call.get("params") or [""])[0] or "").lower()
+        if MODE["fail"] == "tx":
+            return {"jsonrpc": "2.0", "id": call.get("id"),
+                    "error": {"code": -32000, "message": "boom"}}
+        return {"jsonrpc": "2.0", "id": call.get("id"),
+                "result": TXS.get(h)}
+    if m == "eth_getBlockByNumber":
+        try:
+            n = int((call.get("params") or ["0x0"])[0], 16)
+        except (TypeError, ValueError):
+            n = -1
+        if n not in BLOCKS:
+            return {"jsonrpc": "2.0", "id": call.get("id"), "result": None}
+        return {"jsonrpc": "2.0", "id": call.get("id"),
+                "result": {"number": hex(n), "transactions": BLOCKS[n]}}
     return {"jsonrpc": "2.0", "id": call.get("id"),
-            "error": {"code": -32601, "message": "unknown method"}}
+            "error": {"code": -32601, "message": "unknown method " + str(m)}}
 
 
 def fake_post(url, json=None, timeout=None, headers=None, **kw):
@@ -96,9 +128,128 @@ def fake_post(url, json=None, timeout=None, headers=None, **kw):
     return FakeResp(_one(json))
 
 
+# ── Ethereum nonce-reuse harness ───────────────────────────────────────
+# Synthetic signers. ETH_D_LEAK is EIP-155's own example key (0x4646…46), so
+# the published vector and the synthetic reuse share one identity.
+ETH_D_LEAK = 0x4646464646464646464646464646464646464646464646464646464646464646
+ETH_D_OK   = 0x1111111111111111111111111111111111111111111111111111111111111111
+ETH_D_PEER = 0x2222222222222222222222222222222222222222222222222222222222222222
+ETH_K      = 0xDEADBEEFCAFEBABEDEADBEEFCAFEBABEDEADBEEFCAFEBABEDEADBEEFCAFEBABE
+ETH_A_LEAK = b.eth_address(ETH_D_LEAK).lower()
+ETH_A_OK   = b.eth_address(ETH_D_OK).lower()
+ETH_A_PEER = b.eth_address(ETH_D_PEER).lower()
+# The raw bytes of EIP-155's published signed transaction.
+EIP155_RAW = bytes.fromhex(
+    "f86c098504a817c800825208943535353535353535353535353535353535353535"
+    "880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71"
+    "ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc6421"
+    "4b297fb1966a3b6d83")
+
+
+def eth_mk_tx(d, nonce, k, typ=0, chain=1, value=10**18, gas=21000,
+              low_s=True):
+    """A signed transaction made with an EXPLICIT k.
+
+    A signer with a broken RNG does exactly this, so a reuse can be built on
+    purpose instead of being hoped for. Returns the tx dict with `_raw` (its
+    serialisation) and `hash` filled in.
+    """
+    tx = b.eth_tx_new(
+        type=typ, chain_id=chain, nonce=nonce, gas_price=20 * 10**9,
+        max_prio=10**9, max_fee=30 * 10**9, gas_limit=gas,
+        to=bytes.fromhex("35" * 20), value=value, data=b"",
+        access_list=([[bytes.fromhex("11" * 20), [bytes.fromhex("22" * 32)]]]
+                     if typ in (1, 2, 3, 4) else []),
+        max_blob_fee=10**8, blob_hashes=[bytes.fromhex("01" + "00" * 31)],
+        auth_list=[[1, bytes.fromhex("44" * 20), 0, 0, 5, 6]])
+    z = int.from_bytes(b.eth_tx_signing_hash(tx), "big")
+    R = b.ec_mul(k)
+    r = R[0] % b.N
+    s = (pow(k, -1, b.N) * (z + r * d)) % b.N
+    par = R[1] & 1
+    if low_s and s > b.N // 2:
+        s, par = b.N - s, par ^ 1
+    tx["r"], tx["s"], tx["parity"] = r, s, par
+    tx["v"] = (chain * 2 + 35 + par) if typ == 0 else par
+    tx["_raw"] = b.eth_tx_raw(tx)
+    tx["hash"] = b.eth_tx_hash(tx["_raw"])
+    return tx
+
+
+def eth_rpc_json(tx, **over):
+    """What eth_getTransactionByHash / a full block returns for `tx`."""
+    hx = lambda n: hex(int(n))                     # noqa: E731
+    j = {"hash": tx["hash"], "nonce": hx(tx["nonce"]),
+         "gas": hx(tx["gas_limit"]), "to": "0x" + tx["to"].hex(),
+         "value": hx(tx["value"]), "input": "0x", "v": hx(tx["v"]),
+         "r": hx(tx["r"]), "s": hx(tx["s"]),
+         "from": b.eth_tx_sender(tx)[0], "blockNumber": "0x10"}
+    if tx["type"] == 0:
+        j["type"] = "0x0"
+        j["gasPrice"] = hx(tx["gas_price"])
+    else:
+        j["type"] = hx(tx["type"])
+        j["chainId"] = hx(tx["chain_id"] or 1)
+        j["accessList"] = [{"address": "0x" + a.hex(),
+                            "storageKeys": ["0x" + k.hex() for k in ks]}
+                           for a, ks in tx["access_list"]]
+        if tx["type"] == 1:
+            j["gasPrice"] = hx(tx["gas_price"])
+        else:
+            j["maxPriorityFeePerGas"] = hx(tx["max_prio"])
+            j["maxFeePerGas"] = hx(tx["max_fee"])
+        if tx["type"] == 3:
+            j["maxFeePerBlobGas"] = hx(tx["max_blob_fee"])
+            j["blobVersionedHashes"] = ["0x" + h.hex()
+                                        for h in tx["blob_hashes"]]
+        if tx["type"] == 4:
+            j["authorizationList"] = [
+                {"chainId": hex(a[0]), "address": "0x" + a[1].hex(),
+                 "nonce": hex(a[2]), "yParity": hex(a[3]),
+                 "r": hex(a[4]), "s": hex(a[5])} for a in tx["auth_list"]]
+    j.update(over)
+    return j
+
+
+def fake_get(url, timeout=None, headers=None, **kw):
+    """The indexer. Only explorer paths are served; anything else is a 404."""
+    EXP["gets"].append(url)
+    if EXP["fail"]:
+        return FakeResp(None, EXP["fail"])
+    if "/api/v2/addresses/" not in url:
+        return FakeResp(None, 404)
+    addr = url.split("/api/v2/addresses/")[1].split("/")[0].lower()
+    pages = EXP["pages"].get(addr)
+    if pages:
+        # Page N is selected by the presence of next_page_params echoed back.
+        idx = 0 if "block_number" not in url else min(
+            EXP["cursor"].get(addr, 1), len(pages) - 1)
+        if "block_number" in url:
+            EXP["cursor"][addr] = idx + 1
+        rows = pages[idx]
+        nxt = ({"block_number": 1, "index": 0, "inserted_at": "x",
+                "hash": "0x" + "00" * 32, "value": "0", "fee": "0"}
+               if idx + 1 < len(pages) else None)
+        return FakeResp({"items": [{"hash": h, "from": {"hash": f}}
+                                   for h, f in rows], "next_page_params": nxt})
+    rows = EXP["by_addr"].get(addr, [])
+    return FakeResp({"items": [{"hash": h, "from": {"hash": f}}
+                               for h, f in rows], "next_page_params": None})
+
+
+def eth_nc_run(target, job=None):
+    """Run the nonce scan synchronously; returns (hits, job, log_lines)."""
+    job = job or newjob()
+    lines = []
+    hits = b.attack_eth_nonce(target, lines.append, job,
+                              lambda: job.get("stop", False))
+    return hits, job, lines
+
+
 def reset_rpc():
     """Clean every piece of per-endpoint, queue and database state."""
     b.requests.post = fake_post
+    b.requests.get = fake_get
     b._ETH_BATCH_OK.clear()
     b._ETH_BASE_ERR.clear()
     b._ETH_DEAD.clear()
@@ -112,6 +263,13 @@ def reset_rpc():
     MODE["dead"] = []
     FUNDED.clear()
     NONCES.clear()
+    TXS.clear()
+    BLOCKS.clear()
+    EXP["fail"] = None
+    EXP["by_addr"].clear()
+    EXP["pages"].clear()
+    EXP["cursor"].clear()
+    EXP["gets"] = []
     try:
         b._eth_pending_path().unlink()
     except OSError:
@@ -145,6 +303,7 @@ def wait_job(name, timeout=30.0):
 
 
 b.requests.post = fake_post
+b.requests.get = fake_get
 print("EC: %s | keccak: %s | rpc bases: %d | queue: %s"
       % (b.EC_BACKEND, b.ETH_HASH_BACKEND, len(b._ETH_RPC_BASES),
          b._eth_pending_path()))
@@ -1204,7 +1363,584 @@ reset_rpc()
 print("30 ok  no range refused: batches run in order, Stop keeps the bar honest")
 
 # ══════════════════════════════════════════════════════════════════════
-# 31 — throughput, for the docs (informational)
+# 31 — RLP and the five Ethereum signing payloads (published vectors)
+# ══════════════════════════════════════════════════════════════════════
+# RLP: the documented edge cases, including the 55/56-byte length boundaries
+# where a one-byte prefix turns into a length-of-length.
+assert b.rlp_int(0) == b"" and b.rlp_int(1) == b"\x01"
+assert b.rlp_int(1024) == b"\x04\x00"
+assert b.rlp_encode(b"") == b"\x80"
+assert b.rlp_encode(b"\x00") == b"\x00"          # single byte < 0x80: itself
+assert b.rlp_encode(b"\x7f") == b"\x7f"
+assert b.rlp_encode(b"\x80") == b"\x81\x80"
+assert b.rlp_encode(b"a" * 55) == bytes([0x80 + 55]) + b"a" * 55
+assert b.rlp_encode(b"a" * 56) == b"\xb8\x38" + b"a" * 56
+assert b.rlp_encode([]) == b"\xc0"
+assert b.rlp_encode([[]]) == b"\xc1\xc0"
+assert b.rlp_encode([b"a" * 56]) == b"\xf8\x3a" + b"\xb8\x38" + b"a" * 56
+# the canonical ["cat","dog"] example from the RLP specification
+assert b.rlp_encode([b"cat", b"dog"]).hex() == "c88363617483646f67"
+try:
+    b.rlp_encode(True)
+    raise AssertionError("rlp_encode accepted a bool")
+except TypeError:
+    pass
+try:
+    b.rlp_int(-1)
+    raise AssertionError("rlp_int accepted a negative")
+except ValueError:
+    pass
+# decode is the exact inverse, and refuses malformed input rather than
+# inventing a transaction out of it
+for obj in (b"", b"\x00", b"\x80", b"a" * 55, b"a" * 56, [], [[]],
+            [b"cat", b"dog"], [b"a" * 56], [b"\x01", [b"\x02", [b"\x03"]]]):
+    enc = b.rlp_encode(obj)
+    got, nxt = b.rlp_decode(enc)
+    assert nxt == len(enc), (obj, nxt, len(enc))
+    assert got == obj, (obj, got)
+for bad in (b"\x81", b"\xb8", b"\xb8\x01a", b"\xf8\x01\xc0", b"\x82a"):
+    try:
+        b.rlp_decode(bad)
+        raise AssertionError("rlp_decode accepted %r" % bad)
+    except ValueError:
+        pass
+
+# EIP-155's worked example (ethereum/EIPs, EIPS/eip-155.md): signing data,
+# signing hash and signed transaction are all published, so all three are
+# asserted verbatim — and the privkey it names is ETH_D_LEAK.
+tx = b.eth_tx_from_raw(EIP155_RAW)
+assert tx is not None and tx["type"] == 0 and tx["chain_id"] == 1
+assert (tx["nonce"], tx["gas_price"], tx["gas_limit"], tx["value"]) == (
+    9, 20 * 10**9, 21000, 10**18)
+assert tx["to"] == bytes.fromhex("35" * 20) and tx["data"] == b""
+assert tx["v"] == 37 and tx["parity"] == 0        # 37 = 1*2 + 35 + 0
+assert b.eth_tx_signing_payload(tx).hex() == (
+    "ec098504a817c800825208943535353535353535353535353535353535353535"
+    "880de0b6b3a764000080018080")
+assert b.eth_tx_signing_hash(tx).hex() == (
+    "daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53")
+assert b.eth_tx_raw(tx) == EIP155_RAW             # decode/re-encode is exact
+assert hex(tx["r"])[2:] == ("28ef61340bd939bc2195fe537567866003e1a15d"
+                            "3c71ff63e1590620aa636276")
+assert hex(tx["s"])[2:] == ("67cbe9d8997f761aecb703304b3800ccf555c9f3"
+                            "dc64214b297fb1966a3b6d83")
+eip_addr, eip_pub = b.eth_tx_sender(tx)
+assert eip_addr == "0x9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f" == ETH_A_LEAK
+assert b.eth_address_checksum(eip_addr) == b.eth_address(ETH_D_LEAK)
+# eth_tx_sender returns the uncompressed pubkey as bare hex ("04…"), and the
+# evidence string is that same hex with a "pubkey:" prefix.
+assert eip_pub.startswith("04") and len(eip_pub) == 130
+assert b.verify_recovered_eth_key(
+    ETH_D_LEAK, pubkeys=(eip_pub,)) == "pubkey:" + eip_pub
+assert b.verify_recovered_eth_key(
+    ETH_D_LEAK, pubkeys=("0x" + eip_pub,)) == ""      # a 0x prefix is not it
+assert b.verify_recovered_eth_key(ETH_D_LEAK, addresses=(ETH_A_LEAK,)) == (
+    "eth_address:" + b.eth_address(ETH_D_LEAK))
+# the wrong key produces no evidence at all — that is the gate that keeps a bad
+# signing payload from being reported as a recovery
+assert b.verify_recovered_eth_key(ETH_D_OK, addresses=(ETH_A_LEAK,),
+                                  pubkeys=(eip_pub,)) == ""
+
+# Pre-155 (v = 27/28) hashes SIX fields, not nine, and must still recover.
+pre = b.eth_tx_new(type=0, chain_id=None, nonce=0, gas_price=1, gas_limit=21000,
+                   to=bytes.fromhex("35" * 20), value=1, data=b"")
+z = int.from_bytes(b.eth_tx_signing_hash(pre), "big")
+R = b.ec_mul(ETH_K)
+r0 = R[0] % b.N
+s0 = (pow(ETH_K, -1, b.N) * (z + r0 * ETH_D_LEAK)) % b.N
+p0 = R[1] & 1
+pre.update(r=r0, s=s0, parity=p0, v=27 + p0)
+raw0 = b.eth_tx_raw(pre)
+back0 = b.eth_tx_from_raw(raw0)
+assert back0 is not None and back0["chain_id"] is None and back0["v"] == 27 + p0
+assert b.eth_tx_sender(back0)[0] == ETH_A_LEAK
+assert len(b.rlp_decode(b.eth_tx_signing_payload(pre))[0]) == 6
+assert len(b.rlp_decode(b.eth_tx_signing_payload(tx))[0]) == 9
+# an impossible v is rejected instead of being guessed at
+bad_v = b.rlp_encode([0, 1, 21000, bytes.fromhex("35" * 20), 1, b"", 26,
+                      r0, s0])
+assert b.eth_tx_from_raw(bad_v) is None
+assert b.eth_tx_from_raw(b"") is None
+assert b.eth_tx_from_raw(EIP155_RAW[:-1]) is None       # truncated
+assert b.eth_tx_from_raw(b"\xc0") is None               # empty list
+assert b.eth_tx_from_rpc(None) is None
+assert b.eth_tx_from_rpc({"hash": "0x1", "type": "0x9"}) is None
+assert b.eth_tx_sender(b.eth_tx_new(r=0, s=0)) == (None, None)
+assert b.eth_address_checksum("0x12") is None
+reset_rpc()
+print("31 ok  RLP edge cases + EIP-155 payload/hash/raw/sender verbatim, and "
+      "pre-155 six-field signing")
+
+# ══════════════════════════════════════════════════════════════════════
+# 32 — the accepted transaction vectors vendored from ethereum/tests
+# ══════════════════════════════════════════════════════════════════════
+# data/eth_tx_vectors.json holds every TransactionTests entry whose
+# `result.<fork>` has txbytes and NO `exception`, i.e. a transaction the
+# reference suite accepts, with its published sender and hash. Provenance
+# (source repo + commit) is recorded in the file itself.
+VEC_PATH = os.path.join(ROOT, "data", "eth_tx_vectors.json")
+assert os.path.exists(VEC_PATH), VEC_PATH
+vec_doc = json.load(open(VEC_PATH, encoding="utf-8"))
+assert re.fullmatch(r"[0-9a-f]{40}", vec_doc["_provenance"]["commit"]), \
+    vec_doc["_provenance"]["commit"]
+assert "ethereum/tests" in vec_doc["_provenance"]["source"]
+vecs = vec_doc["vectors"]
+assert len(vecs) == vec_doc["_provenance"]["count"] == 53, len(vecs)
+kinds, cc_checked = {}, 0
+for v in vecs:
+    raw = bytes.fromhex(v["txbytes"][2:])
+    # the published tx hash is keccak256 of the published bytes: this checks the
+    # serialisation itself, not just the parse
+    assert b.eth_tx_hash(raw) == v["hash"], (v["name"], "hash")
+    vt = b.eth_tx_from_raw(raw)
+    assert vt is not None, (v["name"], "decode")
+    assert b.eth_tx_raw(vt) == raw, (v["name"], "round-trip")
+    got, pub = b.eth_tx_sender(vt)
+    assert (got or "").lower() == v["sender"].lower(), (v["name"], got,
+                                                        v["sender"])
+    kinds[vt["type"]] = kinds.get(vt["type"], 0) + 1
+    if b._coincurve is not None:
+        # independent implementation: libsecp256k1's own ecrecover
+        sig = (vt["r"].to_bytes(32, "big") + vt["s"].to_bytes(32, "big")
+               + bytes([vt["parity"]]))
+        pk = b._CoincurvePublicKey.from_signature_and_message(
+            sig, b.eth_tx_signing_hash(vt), hasher=None)
+        assert ("0x" + b.keccak256(pk.format(compressed=False)[1:])[12:].hex()
+                ) == got, (v["name"], "coincurve disagrees")
+        cc_checked += 1
+assert kinds.get(0) and kinds.get(1) and kinds.get(2), kinds
+print("32 ok  %d accepted ethereum/tests vectors: hash, round-trip and sender "
+      "all reproduced (types %s, %d cross-checked against libsecp256k1)"
+      % (len(vecs), kinds, cc_checked))
+
+# ══════════════════════════════════════════════════════════════════════
+# 33 — every tx type, the RPC entry point, and the payload gate
+# ══════════════════════════════════════════════════════════════════════
+# ethereum/tests ships no accepted EIP-4844 or EIP-7702 transaction, so those
+# two are checked by round-trip: sign with a known key, serialise, re-parse and
+# recover the same sender. The payload field lists come from the EIPs.
+for typ in (0, 1, 2, 3, 4):
+    t = eth_mk_tx(ETH_D_LEAK, 7, 0xC0FFEE, typ=typ)
+    raw = t["_raw"]
+    assert (raw[0] >= 0xc0) if typ == 0 else (raw[0] == typ)
+    back = b.eth_tx_from_raw(raw)
+    assert back is not None, "type %d did not re-parse" % typ
+    assert b.eth_tx_raw(back) == raw, "type %d round-trip" % typ
+    assert b.eth_tx_signing_hash(back) == b.eth_tx_signing_hash(t), typ
+    assert b.eth_tx_sender(back)[0] == ETH_A_LEAK, typ
+    assert b.ETH_TX_TYPE_NAMES[typ]
+    # the JSON an RPC serves must produce the SAME signing hash as the bytes
+    rj = eth_rpc_json(t)
+    from_rpc = b.eth_tx_from_rpc(rj)
+    assert from_rpc is not None, typ
+    assert b.eth_tx_signing_hash(from_rpc) == b.eth_tx_signing_hash(t), typ
+    assert b.eth_tx_sender(from_rpc)[0] == ETH_A_LEAK, typ
+    assert from_rpc["from"] == ETH_A_LEAK and from_rpc["block"] == 16
+    assert b.eth_tx_hash(b.eth_tx_raw(from_rpc)) == t["hash"], typ
+# unsigned/absent fields: `to` null (contract creation) and no `input`
+created = b.eth_tx_from_rpc({"hash": "0x" + "ab" * 32, "type": "0x2",
+                             "nonce": "0x0", "to": None, "value": "0x0",
+                             "gas": "0x5208", "chainId": "0x1",
+                             "maxFeePerGas": "0x1", "maxPriorityFeePerGas": "0x1",
+                             "v": "0x0", "r": "0x1", "s": "0x1"})
+assert created is not None and created["to"] == b"" and created["data"] == b""
+assert b.eth_tx_signing_payload(created)[0:1] == b"\x02"
+# the payload gate: a field that does not reproduce the reported hash marks the
+# tx untrusted, and eth_signatures then EXCLUDES it from recovery
+good = eth_mk_tx(ETH_D_LEAK, 0, ETH_K)
+tampered = eth_rpc_json(good, gasPrice="0x1")
+assert b.eth_tx_hash(b.eth_tx_raw(b.eth_tx_from_rpc(tampered))) != good["hash"]
+sigs, stats = b.eth_signatures([b.eth_tx_from_rpc(tampered)])
+assert sigs == [] and stats["untrusted"] == 1 and stats["sigs"] == 0, stats
+sigs, stats = b.eth_signatures([good], log=lambda m: None)
+assert stats["sigs"] == 1 and sigs[0]["sender"] == ETH_A_LEAK
+assert sigs[0]["pubkey"].startswith("04") and len(sigs[0]["pubkey"]) == 130
+sigs, stats = b.eth_signatures([b.eth_tx_new(r=0, s=0), None, good])
+assert stats["unsigned"] == 2 and stats["sigs"] == 1, stats
+print("33 ok  five tx types round-trip, RPC JSON agrees with raw bytes, and an "
+      "unreproducible payload is excluded instead of trusted")
+
+# ══════════════════════════════════════════════════════════════════════
+# 34 — what leaks a key, and what provably does not
+# ══════════════════════════════════════════════════════════════════════
+L1 = eth_mk_tx(ETH_D_LEAK, 0, ETH_K)          # same key, same k, message A
+L2 = eth_mk_tx(ETH_D_LEAK, 1, ETH_K)          # same key, same k, message B
+assert L1["r"] == L2["r"]
+s1, s2 = b.eth_signatures([L1, L2])[0]
+assert s1["z"] != s2["z"] and s1["s"] != s2["s"]
+cands = b.recover_keys_from_pair(L1["r"], s1["s"], s1["z"],
+                                 s2["s"], s2["z"])
+assert any(b.eth_address(c).lower() == ETH_A_LEAK for c in cands), cands
+assert b._eth_nonce_k(L1["r"], s1["s"], s1["z"], s2["s"], s2["z"]) \
+    in (ETH_K % b.N, (-ETH_K) % b.N)
+# a signer that low-S-normalises one signature and not the other still leaks
+N1 = eth_mk_tx(ETH_D_LEAK, 2, ETH_K, low_s=True)
+N2 = eth_mk_tx(ETH_D_LEAK, 3, ETH_K, low_s=False)
+assert N1["r"] == N2["r"]
+n1, n2 = b.eth_signatures([N1, N2])[0]
+cands2 = b.recover_keys_from_pair(N1["r"], n1["s"], n1["z"],
+                                  n2["s"], n2["z"])
+assert any(b.eth_address(c).lower() == ETH_A_LEAK for c in cands2), cands2
+# NEGATIVE CONTROL 1: the same message signed twice is a resubmission. The
+# pair is degenerate and implies no key.
+D1 = eth_mk_tx(ETH_D_LEAK, 4, ETH_K + 1)
+D2 = b.eth_tx_from_raw(D1["_raw"])
+dg1, dg2 = b.eth_signatures([D1, D2])[0]
+cands3 = b.recover_keys_from_pair(D1["r"], dg1["s"], dg1["z"],
+                                  dg2["s"], dg2["z"])
+assert not any(b.eth_address(c).lower() == ETH_A_LEAK for c in cands3), cands3
+# NEGATIVE CONTROL 2 — the one that decides the design: two DIFFERENT keys
+# sharing one k give k*(s1-s2) = (z1-z2) + r*(d1-d2), two equations in three
+# unknowns, so neither key follows. A cross-sender r collision is reported,
+# never chased.
+X1 = eth_mk_tx(ETH_D_PEER, 0, ETH_K)
+assert X1["r"] == L1["r"]
+xs = b.eth_signatures([X1])[0][0]
+cands4 = b.recover_keys_from_pair(L1["r"], s1["s"], s1["z"],
+                                  xs["s"], xs["z"])
+leaked = {b.eth_address(c).lower() for c in cands4}
+assert ETH_A_LEAK not in leaked and ETH_A_PEER not in leaked, cands4
+groups, cross, replays = b.eth_nonce_groups([s1, s2, xs])
+assert (ETH_A_LEAK, L1["r"]) in groups, groups
+assert len(groups[(ETH_A_LEAK, L1["r"])]) == 2, groups
+assert len(groups) == 1, groups          # PEER's r is not a (sender, r) group
+assert cross == {L1["r"]: sorted([ETH_A_LEAK, ETH_A_PEER])}, cross
+groups2, cross2, replays2 = b.eth_nonce_groups([dg1, dg2])
+assert replays2 == {(ETH_A_LEAK, D1["r"]): 1}, replays2
+print("34 ok  same-key reuse leaks (both parities); a replay and a cross-sender "
+      "r collision provably do not")
+
+# ══════════════════════════════════════════════════════════════════════
+# 35 — the four input modes end to end
+# ══════════════════════════════════════════════════════════════════════
+T_A = eth_mk_tx(ETH_D_LEAK, 0, ETH_K)         # the leaking pair
+T_B = eth_mk_tx(ETH_D_LEAK, 1, ETH_K)
+T_C = eth_mk_tx(ETH_D_LEAK, 2, ETH_K + 1)     # a third tx, its own k
+OK1 = eth_mk_tx(ETH_D_OK, 0, ETH_K + 7)       # a clean signer
+OK2 = eth_mk_tx(ETH_D_OK, 1, ETH_K + 8)
+PEER = eth_mk_tx(ETH_D_PEER, 0, ETH_K)        # shares r with T_A, different key
+REPLAY = eth_mk_tx(ETH_D_LEAK, 3, ETH_K + 99)
+
+
+def load_txs(*txs):
+    TXS.update({t["hash"]: eth_rpc_json(t) for t in txs})
+    return txs
+
+
+load_txs(T_A, T_B, T_C, OK1, OK2, PEER, REPLAY)
+EXP["by_addr"][ETH_A_LEAK] = [(t["hash"], ETH_A_LEAK)
+                              for t in (T_A, T_B, T_C, REPLAY)]
+EXP["by_addr"][ETH_A_OK] = [(t["hash"], ETH_A_OK) for t in (OK1, OK2)]
+
+# (a) address mode: indexer -> RPC -> one key, saved exactly once
+FUNDED.clear()
+hits, job, log = eth_nc_run({"mode": "address", "address": ETH_A_LEAK})
+assert len(hits) == 1, hits
+h = hits[0]
+assert int(h["privkey"], 16) == ETH_D_LEAK and h["address"].lower() == ETH_A_LEAK
+assert h["attack"] == "eth_nonce" and h["chain"] == "ethereum"
+assert h["recipe"] == "nonce_reuse" and h["signer"] == ETH_A_LEAK
+assert h["evidence"].startswith("pubkey:") and int(h["k"], 16) == ETH_K % b.N
+assert h["signatures"] == 2 and len(h["txs"]) == 2
+assert h["balance_verdict"] in ("never_used_likely_never_funded",
+                                "empty_or_spent", "funded_verify_manually")
+with b._db() as c:
+    rows = list(c.execute("SELECT attack FROM results"))
+assert rows == [("eth_nonce",)], rows          # saved once, not per candidate
+assert EXP["gets"] and len(MODE["posts"]) >= 1
+assert not any("NOT a leak" in l for l in log), log
+
+# (b) hashes mode: no indexer is touched at all
+reset_rpc(); load_txs(T_A, T_B, T_C)
+hits, job, log = eth_nc_run({"mode": "hashes",
+                             "hashes": [T_A["hash"], T_B["hash"], T_C["hash"]]})
+assert len(hits) == 1 and int(hits[0]["privkey"], 16) == ETH_D_LEAK
+assert EXP["gets"] == [], EXP["gets"]
+
+# (c) raw mode: no network of any kind when the balance check is off
+reset_rpc()
+b.ETH_VERIFY_BALANCES = False
+try:
+    hits, job, log = eth_nc_run({"mode": "raw", "raws": [
+        "0x" + T_A["_raw"].hex(), T_B["_raw"].hex().upper(),
+        "not hex", "0xdeadbeef"]})
+finally:
+    b.ETH_VERIFY_BALANCES = True
+assert len(hits) == 1 and int(hits[0]["privkey"], 16) == ETH_D_LEAK
+assert hits[0]["balance_verdict"] == "unchecked"
+assert EXP["gets"] == [] and MODE["posts"] == [], (EXP["gets"], MODE["posts"])
+assert any("not a signed Ethereum transaction" in l for l in log), log
+
+# (d) blocks mode: one call per block, every sender grouped separately
+reset_rpc(); load_txs(T_A, T_B, T_C, OK1, OK2, PEER, REPLAY)
+BLOCKS[16] = [eth_rpc_json(T_A), eth_rpc_json(T_B), eth_rpc_json(OK1)]
+BLOCKS[17] = [eth_rpc_json(T_C), eth_rpc_json(OK2), eth_rpc_json(PEER)]
+BLOCKS[18] = [eth_rpc_json(REPLAY), eth_rpc_json(REPLAY),
+              eth_rpc_json(REPLAY, gasPrice="0x1")]
+hits, job, log = eth_nc_run({"mode": "blocks", "start": 16, "end": 18})
+assert {int(x["privkey"], 16) for x in hits} == {ETH_D_LEAK}, hits
+assert any("NOT a leak" in l for l in log), log           # PEER shares r
+assert any("byte-identical" in l for l in log), log       # the replay
+assert not any("did not verify" in l for l in log), log   # no test never run
+assert any("could not be reproduced" in l for l in log), log
+assert EXP["gets"] == []
+assert "3 block(s)" in "".join(log)
+
+# (e) indexer pagination, and the truncation warning
+reset_rpc(); load_txs(T_A, T_B, T_C, REPLAY)
+EXP["pages"][ETH_A_LEAK] = [[(T_A["hash"], ETH_A_LEAK), (T_B["hash"], ETH_A_LEAK)],
+                            [(T_C["hash"], ETH_A_LEAK),
+                             (REPLAY["hash"], ETH_A_LEAK)]]
+hits, job, log = eth_nc_run({"mode": "address", "address": ETH_A_LEAK})
+assert len(hits) == 1 and len(EXP["gets"]) == 2, (hits, EXP["gets"])
+assert "block_number" in EXP["gets"][1], EXP["gets"][1]   # next_page_params echoed
+old_cap = b.ETH_NONCE_MAX_TXS
+b.ETH_NONCE_MAX_TXS = 2
+try:
+    reset_rpc(); load_txs(T_A, T_B, T_C, REPLAY)
+    EXP["pages"][ETH_A_LEAK] = [[(T_A["hash"], ETH_A_LEAK),
+                                 (T_B["hash"], ETH_A_LEAK)],
+                                [(T_C["hash"], ETH_A_LEAK)]]
+    hits, job, log = eth_nc_run({"mode": "address", "address": ETH_A_LEAK})
+    assert any("ETH_NONCE_MAX_TXS" in l and "INCOMPLETE" in l for l in log), log
+    assert job.get("partial") is True, job
+finally:
+    b.ETH_NONCE_MAX_TXS = old_cap
+
+# (f) a clean address gets an explicit verdict, not silence
+reset_rpc(); load_txs(OK1, OK2)
+EXP["by_addr"][ETH_A_OK] = [(t["hash"], ETH_A_OK) for t in (OK1, OK2)]
+hits, job, log = eth_nc_run({"mode": "address", "address": ETH_A_OK})
+assert hits == []
+assert any("no repeats" in l for l in log), log
+assert any("NO private key can be extracted" in l for l in log), log
+assert "no reuse" in job["detail"], job["detail"]
+with b._db() as c:
+    assert c.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
+print("35 ok  address / hashes / raw / blocks modes, indexer pagination, "
+      "truncation, and an explicit verdict for a clean address")
+
+# ══════════════════════════════════════════════════════════════════════
+# 36 — failure modes that must never read as "clean"
+# ══════════════════════════════════════════════════════════════════════
+for code in (403, 429, 500):
+    reset_rpc(); load_txs(T_A, T_B)
+    EXP["by_addr"][ETH_A_LEAK] = [(T_A["hash"], ETH_A_LEAK)]
+    EXP["fail"] = code
+    hits, job, log = eth_nc_run({"mode": "address", "address": ETH_A_LEAK})
+    assert hits == [], (code, hits)
+    assert "no transactions read" in job["detail"], (code, job["detail"])
+    assert any("NOT evidence that the key is safe" in l for l in log), log
+    assert not any("no repeats" in l for l in log), log
+reset_rpc()
+EXP["fail"] = 403
+hits, job, log = eth_nc_run({"mode": "address", "address": ETH_A_LEAK})
+assert any("ETH_EXPLORER_KEY" in l for l in log), log
+
+# every RPC endpoint refusing: the run stops and says so
+reset_rpc(); load_txs(T_A, T_B)
+MODE["fail"] = "403"
+hits, job, log = eth_nc_run({"mode": "hashes",
+                             "hashes": [T_A["hash"], T_B["hash"]]})
+assert hits == [] and "no RPC endpoint answered" in job["detail"], job["detail"]
+assert any("EVERY configured RPC endpoint" in l for l in log), log
+
+# a hash the node does not know makes the verdict INCOMPLETE, never "no reuse"
+reset_rpc(); load_txs(T_A)
+hits, job, log = eth_nc_run({"mode": "hashes",
+                             "hashes": [T_A["hash"], "0x" + "11" * 32]})
+assert hits == []
+assert any("INCOMPLETE READ" in l for l in log), log
+assert job.get("partial") is True and "INCOMPLETE" in job["detail"], job
+
+# a per-call RPC error is reported, not swallowed
+reset_rpc(); load_txs(T_A, T_B)
+MODE["fail"] = "tx"
+hits, job, log = eth_nc_run({"mode": "hashes",
+                             "hashes": [T_A["hash"], T_B["hash"]]})
+assert hits == [] and job.get("partial") is True
+assert any("could not be fetched" in l for l in log), log
+
+# an unreadable block leaves the range partially read
+reset_rpc(); load_txs(T_A, T_B, T_C)
+BLOCKS[16] = [eth_rpc_json(T_A), eth_rpc_json(T_B)]
+BLOCKS[18] = [eth_rpc_json(T_C)]
+hits, job, log = eth_nc_run({"mode": "blocks", "start": 16, "end": 18})
+assert len(hits) == 1
+assert any("could not be read" in l for l in log), log
+
+# Stop before any request, and mid-run
+reset_rpc()
+job = newjob(); job["stop"] = True
+lines = []
+assert b.attack_eth_nonce({"mode": "blocks", "start": 16, "end": 18},
+                          lines.append, job, lambda: job["stop"]) == []
+assert job.get("partial") is True and any("stopped by user" in l for l in lines)
+job2 = newjob()
+assert b.attack_eth_nonce({"mode": "address", "address": ETH_A_LEAK},
+                          lines.append, job2, lambda: True) == []
+assert job2.get("partial") is True
+assert EXP["gets"] == [], "Stop must happen before the first request"
+
+# a Bitcoin address in the Ethereum field is rejected without a request
+reset_rpc()
+hits, job, log = eth_nc_run({"mode": "address",
+                             "address": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"})
+assert hits == [] and "not an Ethereum address" in job["detail"], job["detail"]
+assert EXP["gets"] == [] and MODE["posts"] == []
+print("36 ok  indexer 403/429/500, dead RPC, unknown hash, unreadable block, "
+      "Stop and a wrong-chain address: all honest, none 'clean'")
+
+# ══════════════════════════════════════════════════════════════════════
+# 37 — routes, the /eth card, results wiring and the headless flags
+# ══════════════════════════════════════════════════════════════════════
+reset_rpc()
+cl = b.app.test_client()
+
+
+def nc(payload):
+    return cl.post("/api/eth/nonce", json=payload).get_json()
+
+
+d = nc({"mode": "nope"})
+assert d["ok"] is False and "mode must be one of" in d["msg"], d
+d = nc({"mode": "address", "address": ""})
+assert d["ok"] is False and "enter an Ethereum address" in d["msg"], d
+d = nc({"mode": "address", "address": "0x12"})
+assert d["ok"] is False and "not a 20-byte 0x" in d["msg"], d
+d = nc({"mode": "address", "address": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"})
+assert d["ok"] is False and "/nonce scans" in d["msg"], d
+# case of the prefix and of the hex body are both normalised to EIP-55 form
+d = nc({"mode": "address", "address": ETH_A_LEAK.upper()})
+assert d["ok"] is True and d["address"] == b.eth_address(ETH_D_LEAK), d
+wait_job("eth_nonce")
+d = nc({"mode": "address", "address": b.eth_address(ETH_D_LEAK)})
+assert d["ok"] is True and d["address"] == b.eth_address(ETH_D_LEAK), d
+wait_job("eth_nonce")
+d = nc({"mode": "hashes", "hashes": "not a hash\n0x" + "11" * 32})
+assert d["ok"] is True and d["items"] == 1 and d["skipped"] == 3, d
+wait_job("eth_nonce")
+d = nc({"mode": "hashes", "hashes": ["0x" + "22" * 32, "0x" + "22" * 32]})
+assert d["ok"] is True and d["items"] == 1, d          # de-duplicated
+wait_job("eth_nonce")
+d = nc({"mode": "hashes", "hashes": "0x12"})
+assert d["ok"] is False and "no valid transaction hashes" in d["msg"], d
+d = nc({"mode": "raw", "raws": ""})
+assert d["ok"] is False and "no raw transactions" in d["msg"], d
+d = nc({"mode": "raw", "raws": "zzz\n0x" + T_A["_raw"].hex()})
+assert d["ok"] is True and d["items"] == 1 and d["skipped"] == 1, d
+wait_job("eth_nonce")
+old_items = b.ETH_NONCE_MAX_ITEMS
+b.ETH_NONCE_MAX_ITEMS = 8
+try:
+    too_many = nc({"mode": "hashes",
+                   "hashes": ["0x%064x" % i for i in range(1, 12)]})
+    assert too_many["ok"] is False, too_many
+    assert "ETH_NONCE_MAX_ITEMS" in too_many["msg"], too_many["msg"]
+    # duplicates are removed BEFORE the cap is applied, so 4 copies of one hash
+    # is one item, not four
+    ok_dupes = nc({"mode": "hashes", "hashes": ["0x%064x" % 1] * 12})
+    assert ok_dupes["ok"] is True and ok_dupes["items"] == 1, ok_dupes
+    wait_job("eth_nonce")
+finally:
+    b.ETH_NONCE_MAX_ITEMS = old_items
+d = nc({"mode": "blocks", "start": "abc"})
+assert d["ok"] is False and "start must be a block number" in d["msg"], d
+d = nc({"mode": "blocks", "start": 10, "end": 5})
+assert d["ok"] is False and "end must be >= start" in d["msg"], d
+d = nc({"mode": "blocks", "start": -1})
+assert d["ok"] is False and "start at 0" in d["msg"], d
+d = nc({"mode": "blocks", "start": "0x10", "end": "0x20"})
+assert d["ok"] is True and d["start"] == 16 and d["end"] == 32, d
+assert d["requests"] == 17 and d["blocks"] == 17, d
+wait_job("eth_nonce")
+d = nc({"mode": "blocks", "start": 100})
+assert d["ok"] is True and d["end"] == 100 + b.ETH_NONCE_BLOCKS - 1, d
+wait_job("eth_nonce")
+# a huge range is batched, never refused
+d = nc({"mode": "blocks", "start": 0, "end": b.ETH_NONCE_MAX_BLOCKS + 5000})
+assert d["ok"] is True and d["batches"] == 2, d
+assert "batch" in d["msg"] and "too large" not in d["msg"], d["msg"]
+wait_job("eth_nonce")
+# BLOCKS is empty here, so every block is unreadable and the run gives up
+# having read nothing — which must be marked partial, never "done".
+assert b._JOBS["eth_nonce"].get("partial") is True, b._JOBS["eth_nonce"]
+assert "nothing read" in b._JOBS["eth_nonce"]["detail"], b._JOBS["eth_nonce"]
+
+# the job slot exists, is listed, and can be stopped
+assert "eth_nonce" in b.JOB_NAMES, b.JOB_NAMES
+jobs = cl.get("/api/jobs").get_json()
+assert "eth_nonce" in jobs["jobs"], sorted(jobs["jobs"])
+assert cl.post("/api/stop/eth_nonce", json={}).get_json()["ok"] in (True, False)
+
+# /eth renders card 7 with every placeholder substituted
+page = cl.get("/eth")
+assert page.status_code == 200
+ptxt = page.get_data(as_text=True)
+for frag in ("7 · Nonce (k) reuse", "ncMode", "startNc()", "ncAddr", "ncHashes",
+             "ncRaw", "ncBlocks", "watch('eth_nonce','Nc')", "ncModeChanged()",
+             "EIP-7702 authorisation tuples", "(sender, r)", "CVE-2023-46233",
+             "cannot find", "gates", "INCOMPLETE"):
+    assert frag in ptxt, frag
+for ph in ("{ncexplorer}", "{ncstyle}", "{ncmaxtxs}", "{ncblocks}",
+           "{ncmaxblocks}", "{ncmaxsigs}"):
+    assert ph not in ptxt, ph
+assert ptxt.count('class="on"') == 1, ptxt.count('class="on"')
+for tag in ("div", "details", "select", "textarea", "button"):
+    assert len(re.findall(r"<%s[\s>]" % tag, ptxt)) == \
+        len(re.findall(r"</%s>" % tag, ptxt)), tag
+# /nonce points at its Ethereum twin
+assert "/eth#nc" in cl.get("/nonce").get_data(as_text=True)
+
+# a saved hit reaches /results, the ETH balance verifier and the eth export
+with b._db() as c:
+    c.execute("DELETE FROM results"); c.execute("DELETE FROM balance_checks")
+b.ETH_VERIFY_BALANCES = False
+try:
+    reset_rpc(); load_txs(T_A, T_B)
+    EXP["by_addr"][ETH_A_LEAK] = [(T_A["hash"], ETH_A_LEAK),
+                                  (T_B["hash"], ETH_A_LEAK)]
+    hits, job, log = eth_nc_run({"mode": "address", "address": ETH_A_LEAK})
+finally:
+    b.ETH_VERIFY_BALANCES = True
+assert len(hits) == 1 and hits[0]["balance_verdict"] == "unchecked"
+rpage = cl.get("/results").get_data(as_text=True)
+assert "eth_nonce" in rpage and b.eth_address(ETH_D_LEAK) in rpage
+exp = cl.get("/api/results/export?attack=eth").get_data(as_text=True)
+assert "eth_nonce" in exp and "nonce_reuse" in exp
+assert any(a.lower() == ETH_A_LEAK for a in b._all_eth_addresses())
+
+# headless: a real reuse is recovered with no network at all
+NC_ENV = dict(ENV, ETH_VERIFY_BALANCES="0", ETH_RPC_ROUNDS="1",
+              ETH_EXPLORER_MIN_INTERVAL="0", BTC_HUNT_BUILD_ID="cli-nc")
+rawf = os.path.join(DISK, "nc-raw.txt")
+open(rawf, "w").write("0x" + T_A["_raw"].hex() + "\n" + T_B["_raw"].hex()
+                      + "\nnot hex\n")
+r = cli("--cli-eth-nonce-raw", rawf, env=NC_ENV)
+assert r.returncode == 0, r.stderr[-500:]
+assert "ETH KEY" in r.stdout and hex(ETH_D_LEAK) in r.stdout, r.stdout[-700:]
+assert "1 key(s) recovered" in r.stdout, r.stdout[-500:]
+open(rawf, "w").write("0x" + T_C["_raw"].hex() + "\n0x" + T_C["_raw"].hex() + "\n")
+r = cli("--cli-eth-nonce-raw", rawf, env=NC_ENV)
+assert r.returncode == 0 and "byte-identical" in r.stdout, r.stdout[-500:]
+assert "0 key(s) recovered" in r.stdout, r.stdout[-400:]
+open(rawf, "w").write("0x" + T_C["_raw"].hex() + "\n")
+r = cli("--cli-eth-nonce-raw", rawf, env=NC_ENV)
+assert "no repeats" in r.stdout and "NO private key can be extracted" in r.stdout
+r = cli("--cli-eth-nonce", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", env=NC_ENV)
+assert r.returncode != 0 and "not a 20-byte 0x Ethereum address" in r.stderr
+r = cli("--cli-eth-nonce-blocks", "5:3", env=NC_ENV)
+assert r.returncode != 0 and "end must be >= start" in r.stderr
+r = cli("--help", env=NC_ENV)
+for flag in ("--cli-eth-nonce", "--cli-eth-nonce-txs", "--cli-eth-nonce-raw",
+             "--cli-eth-nonce-blocks"):
+    assert flag in r.stdout, flag
+reset_rpc()
+print("37 ok  /api/eth/nonce validation for all four modes, card 7 renders, "
+      "results + export + verifier wired, and the CLI recovers a real reuse")
+
+# ══════════════════════════════════════════════════════════════════════
+# 38 — throughput, for the docs (informational)
 # ══════════════════════════════════════════════════════════════════════
 for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
     fn = b.ETH_RECIPES[rid]["fn"]
@@ -1213,7 +1949,7 @@ for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
         priv, _extra = fn(TS0 + i, "s")[0]
         b.eth_address(priv)
     el = (time.time() - t0) / n
-    print("31 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
+    print("38 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
           "Trust Wallet window in %5.1f min"
           % (rid, el * 1000, 1 / el, 2_505_600 * el / 60))
 
