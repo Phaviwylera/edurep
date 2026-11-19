@@ -259,6 +259,19 @@ PYTHONUNBUFFERED=1
 #ETH_NONCE_BLOCKS=20
 #ETH_NONCE_MAX_BLOCKS=20000
 #ETH_NONCE_MAX_SIGS=200000
+# ETH Block Scanner (/ethblock, --cli-eth-blockscan): one
+# eth_getBlockByNumber(n, true) per block, extracting every signature and the
+# public key behind it into a persistent (sender, r) index. No indexer needed,
+# so ETH_RPC_URLS is the only endpoint that matters - and old blocks need an
+# ARCHIVE node, or the endpoint returns null and the run reports it.
+#ETH_BLOCKSCAN_BLOCKS=20
+# Batch size in blocks; a larger ask is split and the batches run in order.
+#ETH_BLOCKSCAN_MAX_BLOCKS=20000
+# Signatures kept in the index; the oldest blocks are evicted first (and the
+# eviction is logged), so a long sweep stays bounded.
+#ETH_BLOCKSCAN_ROWS_MAX=2000000
+#ETH_BLOCKSCAN_SENDERS=5000
+#ETH_BLOCKSCAN_PAGE_ROWS=60
 # Vendored 2048-word BIP-39 English list (sha256 2f5eed53...).
 #BIP39_WORDLIST_PATH=/opt/btc-hunt/data/bip39_english.txt
 

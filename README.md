@@ -10,7 +10,8 @@ millisecond timestamps, passphrase brainwallets, ECDSA nonce reuse — plus an
 [Ethereum page](#ethereum-timestamp-sweeps-weak-keys-nonce-reuse-live-rpc-balances)
 that sweeps weak Ethereum generators, reads real signed transactions for
 [nonce (`k`) reuse](#ethereum-nonce-k-reuse), and verifies every candidate live
-over JSON-RPC.
+over JSON-RPC — plus an [ETH Block Scanner](#eth-block-scanner) that extracts
+every signature and public key out of a block and indexes them for reuse.
 
 > **The service has to be created from your own Render account.** This
 > workspace has no Render integration or API token, so it can prepare and
@@ -127,6 +128,11 @@ required for the health check and the public URL to work.
 | `ETH_NONCE_BLOCKS` | `20` | Default block count when a range gives only its start |
 | `ETH_NONCE_MAX_BLOCKS` | `20000` | **Batch size** in blocks: a larger range is split and the batches run one after another. Nothing is refused |
 | `ETH_NONCE_MAX_SIGS` | `200000` | Signatures held in RAM by one run. Hitting it makes the run `partial` |
+| `ETH_BLOCKSCAN_BLOCKS` | `20` | Default block count when the ETH Block Scanner is given only a start |
+| `ETH_BLOCKSCAN_MAX_BLOCKS` | `20000` | **Batch size** in blocks for `/ethblock`: a larger ask is split and the batches run in order (`chunk i/N`). Nothing is refused |
+| `ETH_BLOCKSCAN_ROWS_MAX` | `2000000` | Signatures kept in the persistent `(sender, r)` index. Oldest blocks are evicted first, with their `eth_blocks_scanned` rows, and the eviction is logged |
+| `ETH_BLOCKSCAN_SENDERS` | `5000` | Senders per chunk when the index is searched for a repeated `(sender, r)`, so no `IN` clause grows unbounded |
+| `ETH_BLOCKSCAN_PAGE_ROWS` | `60` | Rows per page in the on-page listing (the download always contains everything that matches) |
 | `BIP39_WORDLIST_PATH` | `data/bip39_english.txt` | The vendored 2048-word BIP-39 English list (SHA-256 `2f5eed53…`) |
 | `BTC_HUNT_BUILD_ID` | auto-detected git short hash | Override the build id shown in the page footer and `/health` when deploying from a tarball without `.git` |
 | `BTC_HUNT_WORKER_RESTART` | `1` | Let the **Kill all jobs** button replace the Gunicorn worker; `0` only stops jobs |
@@ -767,6 +773,71 @@ and sweeping are only for addresses you own or are authorised to test**, and a
 recovered key is not authorisation to move funds — the same rule as the
 timestamp sweeps above.
 
+## ETH Block Scanner
+
+`/ethblock` answers the question "what is actually **in** block N?" — one
+`eth_getBlockByNumber(n, true)` per block, no indexer, every sender in the block
+at once. Give it one block number, a pasted list, or a `start:end` range.
+
+**What it extracts**, for every transaction in the block — all of it public, all
+of it real, and all of it downloadable as CSV or JSONL:
+
+| field | where it comes from |
+| --- | --- |
+| sender address (EIP-55) and **uncompressed public key** | recovered from `(v, r, s)` over the rebuilt signing hash |
+| `r`, `s`, `v`/parity | the signature itself |
+| signing hash `z` | keccak256 of the tx's own unsigned payload, per tx type |
+| tx type, chain id, account nonce | the transaction envelope |
+| destination, value, gas limit, "contract creation" | the transaction fields |
+| tx hash, block height, tx index | where it was read |
+
+**What it cannot extract: private keys.** A signature reveals the *public* key
+that made it; the private key does not follow from a public key. That is the
+elliptic-curve discrete log problem — the assumption the entire chain rests on.
+A block contains no private keys, so nothing can "extract all private keys from
+block N", and the page says so in those words instead of printing guesses. The
+download has **no private-key column** for the same reason.
+
+**What it can find** is the one real leak. If a signer used the same secret nonce
+`k` for two different messages, `r` repeats and `k = (z₁−z₂)/(s₁−s₂)` followed by
+`d = (k·s₁ − z₁)/r` recovers the private key from public data alone. Every
+signature read is therefore indexed persistently in SQLite by **(sender, `r`)**
+and the index — not just the current run — is searched, so a reuse is found
+**across blocks and across runs**: the two halves of a real leak are usually in
+different blocks, which no single-block view can ever see. A candidate is saved
+only once it reproduces the pubkey or address that signed, exactly as in
+[Ethereum nonce (k) reuse](#ethereum-nonce-k-reuse), and lands on `/results` as
+`eth_nonce`.
+
+Blocks already in the index are **skipped**, so re-running a range costs nothing
+and a stopped sweep resumes where it ended; `rescan` re-reads them anyway, and
+storing is idempotent per `(block, tx_index)`. A run whose blocks are all indexed
+answers from the index with no block re-read, and says so.
+
+Same honesty rules as the rest of the Ethereum side: a block that cannot be read,
+a dead RPC, a 429, the row cap and **Stop** all mark the run `partial` and log
+`INCOMPLETE` — the "nothing extractable" verdict is printed only over blocks that
+were actually read, and a give-up logs `NOTHING was extracted, so nothing can be
+concluded about these blocks — this run is INCOMPLETE, not clean`. A large range
+is batched (`chunk i/N`) and run in order, never refused. Failed heights are
+recorded with their error, so a later run cannot mistake them for scanned, and a
+429 leaves them unscanned so the re-run resumes.
+
+The index is bounded by `ETH_BLOCKSCAN_ROWS_MAX` (default 2,000,000 signatures);
+the oldest blocks are evicted first, their `eth_blocks_scanned` rows with them,
+and the eviction is logged.
+
+```bash
+# one block, a list, or a range (START:LAST)
+.venv/bin/python btc_hunt.py --cli-eth-blockscan 25833523
+.venv/bin/python btc_hunt.py --cli-eth-blockscan 25833523:25833543
+.venv/bin/python btc_hunt.py --cli-eth-blockscan 25833523,25834001 --cli-eth-blockscan-rescan
+```
+
+The CLI prints what was extracted, how many `(sender, r)` pairs repeat, and how
+many keys were recovered — and when nothing was recovered it says plainly that a
+block yields public data and no reused `k` was found in what was read.
+
 ## Checking which build is live
 
 Every page has a footer showing `build <commit>`, the process start time, the
@@ -853,7 +924,7 @@ python tests/test_eth.py       # no pytest, no network: requests is monkeypatche
 python tests/test_live.py      # no pytest, no internet: a synthetic Esplora
 ```
 
-38 groups: published vectors for every Ethereum primitive, the recipes, the
+39 groups: published vectors for every Ethereum primitive, the recipes, the
 JSON-RPC client (batching, per-item errors, batch refusal, 429 failover, 403
 parking, pre-flight probe, adaptive batch size), the sweeps, the retry queue and
 its drainer, the fixed era table (including the corrected CVE id and the
@@ -873,7 +944,13 @@ the design (a byte-identical pair and a cross-sender `r` collision leak nothing)
 then all four input modes end to end, indexer pagination, truncation, an explicit
 verdict for a clean address, every failure mode staying honest instead of
 reading as "clean", the route's validation, the card's rendering, the results and
-export wiring, and the four headless flags. It writes only to a temporary
+export wiring, and the four headless flags. Group 38 is the **ETH Block Scanner**:
+a `k` reused in two *different* blocks is proved and saved, the extracted rows are
+public-only (asserted: no private-key field, every pubkey a 130-hex uncompressed
+point), a re-run is answered from the index with no block re-read, `rescan` is
+idempotent, the row cap evicts oldest-first, a dead RPC / a 429 / an unreadable
+block / Stop each stay `partial` and never claim a clean verdict, and the routes,
+the page and the CLI agree. It writes only to a temporary
 `DISK_PATH` and runs the CLI groups as subprocesses with
 `ETH_VERIFY_BALANCES=0`, so it needs no network.
 

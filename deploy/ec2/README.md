@@ -442,6 +442,38 @@ address and in `/api/results/export?attack=eth`. Caps, honesty rules, the
 vendored `ethereum/tests` vectors and the algebra:
 [Ethereum nonce (k) reuse](../../README.md#ethereum-nonce-k-reuse).
 
+### ETH Block Scanner
+
+`/ethblock` reads whole blocks: one `eth_getBlockByNumber(n, true)` per height, no
+indexer, every sender in the block. It extracts the **public** data — each
+signer's recovered public key and EIP-55 address, `(r, s, v)`, the signing hash
+`z`, tx type, chain id, account nonce, destination, value, gas limit — into a
+persistent SQLite index (`eth_block_index`) that downloads as CSV or JSONL.
+
+It does **not** extract private keys, and cannot: a signature reveals a public
+key, and the private key does not follow from one. What it hunts is the one real
+leak — a signer that reused `k`, so `r` repeats and
+`k = (z1-z2)/(s1-s2)`, `d = (k*s1-z1)/r` — and because the index persists and is
+searched by `(sender, r)`, it finds a reuse **across blocks and across runs**,
+which is where real leaks live. Anything proved is verified against the pubkey or
+address that signed and saved to `/results` as `eth_nonce`.
+
+```bash
+sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
+  --cli-eth-blockscan 25833523
+sudo -u btc-hunt /opt/btc-hunt/.venv/bin/python /opt/btc-hunt/btc_hunt.py \
+  --cli-eth-blockscan 25833523:25833543          # a range, batched, never refused
+```
+
+Blocks already indexed are skipped (so a stopped sweep resumes, and a re-run costs
+nothing), `--cli-eth-blockscan-rescan` re-reads them, and the index is bounded by
+`ETH_BLOCKSCAN_ROWS_MAX` with the oldest blocks evicted first. Unreadable heights
+are recorded with their error rather than counted as scanned; a dead RPC, a 429,
+the row cap and Stop all mark the run `partial` and log `INCOMPLETE`, because an
+unread block is not evidence that no key was ever reused in it. Old blocks need an
+**archive** endpoint — a pruned node returns null and the run says so. Caps and
+honesty rules: [ETH Block Scanner](../../README.md#eth-block-scanner).
+
 ## Dataset mirrors
 
 `/data` tries, in order: any `DATASET_URLS` you configured, up to four recent

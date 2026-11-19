@@ -44,7 +44,9 @@ services:
       # no "transactions by address" method. The built-in default is keyless
       # Blockscout (https://eth.blockscout.com) - set these in the Render
       # dashboard only if you run your own, or use an Etherscan-style endpoint
-      # (ETH_EXPLORER_STYLE=etherscan + ETH_EXPLORER_KEY).
+      # (ETH_EXPLORER_STYLE=etherscan + ETH_EXPLORER_KEY). The ETH Block
+      # Scanner (/ethblock) needs no indexer at all - one RPC call per block -
+      # but old blocks need an archive endpoint.
       # Optional HTTP Basic auth for the dashboard. Render prompts for these
       # on Blueprint creation; leave both blank to run without authentication.
       - key: APP_USER

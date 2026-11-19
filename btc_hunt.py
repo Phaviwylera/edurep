@@ -290,6 +290,19 @@ ETH_NONCE_MAX_BLOCKS = max(1, _env_int("ETH_NONCE_MAX_BLOCKS", 20_000, 1))
 # bounded; hitting the cap is reported as an incomplete run, never as "clean".
 ETH_NONCE_MAX_SIGS  = max(100, _env_int("ETH_NONCE_MAX_SIGS", 200_000, 100))
 
+# ── ETH block scanner (/ethblock) ─────────────────────────────────────────
+# One eth_getBlockByNumber(n, true) per block: signatures arrive inline, so no
+# indexer is involved. Everything read is kept in a persistent (sender, r)
+# index, which is what makes reuse findable ACROSS blocks and across runs.
+ETH_BLOCKSCAN_BLOCKS     = max(1, _env_int("ETH_BLOCKSCAN_BLOCKS", 20, 1))
+ETH_BLOCKSCAN_MAX_BLOCKS = max(1, _env_int("ETH_BLOCKSCAN_MAX_BLOCKS", 20_000, 1))
+# Index caps. Rows are evicted oldest-block-first; a run that fills the cap is
+# reported as incomplete rather than allowed to grow without bound.
+ETH_BLOCKSCAN_ROWS_MAX   = max(1_000, _env_int("ETH_BLOCKSCAN_ROWS_MAX",
+                                               2_000_000, 1_000))
+ETH_BLOCKSCAN_SENDERS    = max(10, _env_int("ETH_BLOCKSCAN_SENDERS", 5_000, 10))
+ETH_BLOCKSCAN_PAGE_ROWS  = max(10, _env_int("ETH_BLOCKSCAN_PAGE_ROWS", 60, 10))
+
 # ── Live block monitor (/live) ────────────────────────────────────────────
 # Follows the chain tip and looks for ECDSA nonce reuse in the signatures that
 # new blocks actually spend with. Esplora serves 25 transactions per page, so
@@ -2667,7 +2680,7 @@ _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 JOB_NAMES = ("dataset", "randstorm", "brainwallet", "nonce", "verify", "live",
              "eth_ts", "eth_weak", "eth_verify", "eth_retry", "eth_era",
-             "eth_nonce")
+             "eth_nonce", "eth_blockscan")
 
 _HITS_FILE = None  # set in worker mode: append-only JSONL of hits
 
@@ -2705,6 +2718,44 @@ def _db():
             mempool_sats INTEGER NOT NULL DEFAULT 0,
             checked_at TEXT NOT NULL,
             error TEXT NOT NULL DEFAULT ''
+        );
+        /* Every signature the block scanner has extracted, indexed by
+           (sender, r): the only pair shape that can yield a private key.
+           r/s/z are 256-bit, so they are stored as fixed-width hex. */
+        CREATE TABLE IF NOT EXISTS eth_block_index (
+            block INTEGER NOT NULL,
+            tx_index INTEGER NOT NULL,
+            hash TEXT NOT NULL DEFAULT '',
+            sender TEXT NOT NULL,
+            pubkey TEXT NOT NULL DEFAULT '',
+            txtype INTEGER NOT NULL DEFAULT 0,
+            chain_id INTEGER,
+            nonce INTEGER,
+            r TEXT NOT NULL,
+            s TEXT NOT NULL,
+            parity INTEGER NOT NULL DEFAULT 0,
+            z TEXT NOT NULL,
+            to_addr TEXT NOT NULL DEFAULT '',
+            value_wei TEXT NOT NULL DEFAULT '0',
+            gas_limit INTEGER NOT NULL DEFAULT 0,
+            created INTEGER NOT NULL DEFAULT 0,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (block, tx_index)
+        );
+        CREATE INDEX IF NOT EXISTS eth_bix_sr ON eth_block_index(sender, r);
+        CREATE INDEX IF NOT EXISTS eth_bix_block ON eth_block_index(block);
+        /* Which heights have been read, and what each one yielded, so a run
+           can skip them and a failed read is never mistaken for a clean one. */
+        CREATE TABLE IF NOT EXISTS eth_blocks_scanned (
+            block INTEGER PRIMARY KEY,
+            txs INTEGER NOT NULL DEFAULT 0,
+            sigs INTEGER NOT NULL DEFAULT 0,
+            senders INTEGER NOT NULL DEFAULT 0,
+            untrusted INTEGER NOT NULL DEFAULT 0,
+            unsigned INTEGER NOT NULL DEFAULT 0,
+            no_sender INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
+            scanned_at TEXT NOT NULL
         );
     """)
     return c
@@ -3911,7 +3962,8 @@ BTC + ETH</span></h1>
 NAV_ITEMS = (("/", "home"), ("/data", "dataset"), ("/randstorm", "randstorm"),
              ("/brain", "brainwallet"), ("/nonce", "nonce reuse"),
              ("/live", "live monitor"),
-             ("/eth", "ethereum"), ("/results", "results"))
+             ("/eth", "ethereum"), ("/ethblock", "eth blocks"),
+             ("/results", "results"))
 
 
 def _nav_html():
@@ -7638,6 +7690,289 @@ def attack_eth_nonce(target, log, job, should_stop=None):
         return []
 
 
+BS_PAGE_HTML = """
+<div class="card accent-red"><h2>ETH Block Scanner <span class="tag">one RPC
+call per block · every sender in it</span></h2>
+<p class="muted">Give this a block number and it reads that block from your RPC
+with <code>eth_getBlockByNumber(n, true)</code> — one call, no indexer — parses
+every transaction in it, and extracts <b>everything a block actually
+contains</b>: each signer's recovered <b>public key</b> and EIP-55 address, the
+<code>(r, s, v)</code> it signed with, the signing hash <code>z</code>, the
+transaction type, the account nonce, the destination and the value. Every
+signature is indexed in SQLite by <b>(sender, r)</b> and kept across runs.</p>
+<p><span class="pill bad">cannot do</span> <b>produce the private keys of a
+block.</b> A signature reveals the <i>public</i> key that made it; the private
+key does not follow from a public key. That is the elliptic-curve discrete log
+problem — the assumption the entire chain rests on — so a tool that claims to
+"extract all private keys from block N" is guessing, sweeping a weak generator,
+or lying. This page does none of those things and will never print a key it did
+not prove.</p>
+<p><span class="pill ok">can do</span> <b>find the one thing a block really can
+leak: a reused <code>k</code>.</b> Sign one message with the secret nonce
+<code>k</code> and <code>r=(k·G).x</code> is published. Sign a <i>second,
+different</i> message with the same <code>k</code> and <code>r</code> repeats,
+which gives <code>k=(z1−z2)/(s1−s2)</code> and then
+<code>d=(k·s1−z1)/r</code> — the private key, from public data alone. Because
+the index is persistent, that pair is found even when the two signatures sit in
+<b>different blocks</b>, or were read by two different runs days apart: the case
+a single-block view can never see, and the reason this page indexes instead of
+just printing.</p>
+<p><span class="pill info">verified</span> <b>before it is believed.</b> A
+candidate key is saved only once it reproduces the public key that signed or the
+address that sent the transaction. Every transaction's signing payload is also
+re-serialised and compared with the hash the node reported: one that fails is
+counted and <b>excluded</b>, because a wrong payload looks exactly like a failed
+recovery. The parsers reproduce EIP-155's worked example byte for byte and all
+53 accepted <code>ethereum/tests</code> vectors in
+<code>data/eth_tx_vectors.json</code>, cross-checked against libsecp256k1's own
+ecrecover (<code>tests/test_eth.py</code>, groups 31-38).</p>
+<p><span class="pill warn">costs</span> <b>one RPC call per block, and public
+endpoints refuse datacentres.</b> A mainnet block holds a few hundred
+transactions, so {bsmaxblocks} blocks is {bsmaxblocks} calls — batches of
+{bsmaxblocks} run in order (<code>chunk i/N</code>), blocks already in the index
+are skipped, and Stop keeps everything indexed so far. Point
+<code>ETH_RPC_URLS</code> at your own node or an archive provider for a serious
+sweep; <a href="/eth#rpc">Test RPC</a> on <code>/eth</code> says which endpoints
+answer this host.</p>
+</div>
+
+<div class="card"><h2>Scan blocks</h2>
+<div class="row"><div><label>what to read</label>
+<select id="bsMode" onchange="bsModeChanged()">
+<option value="one">one block number</option>
+<option value="list">a list of block numbers</option>
+<option value="range">a range — first:last</option>
+</select></div></div>
+<div id="bsOne"><label>block number</label>
+<input id="bsB" placeholder="e.g. {bsexample}">
+<p class="muted">Decimal or <code>0x…</code> hex. The block is read from your
+RPC — nothing here is invented, so an endpoint that refuses shows up as a
+refusal and a block that is not there says so.</p></div>
+<div id="bsList" style="display:none"><label>block numbers — one per line, or
+comma-separated</label>
+<textarea id="bsL" rows="4" placeholder="{bsexample}&#10;{bsexample2}"></textarea>
+<p class="muted">Duplicates are removed and anything that is not a block number
+is counted and reported, not silently dropped.</p></div>
+<div id="bsRange" style="display:none"><div class="inline">
+<div><label>first block</label><input id="bsS" placeholder="e.g. {bsexample}"></div>
+<div><label>last block (optional)</label><input id="bsE"
+placeholder="default: +{bsblocks}"></div>
+</div>
+<p class="muted">Nothing is refused: a range wider than {bsmaxblocks} blocks
+runs in batches of {bsmaxblocks}, and the index itself is bounded at
+{bsrowsmax} signatures (<code>ETH_BLOCKSCAN_ROWS_MAX</code>), oldest blocks
+evicted first and reported when that happens.</p></div>
+<div class="row">
+<label class="tiny"><input type="checkbox" id="bsRescan"> re-read blocks the
+index already holds</label>
+<button class="btn go" onclick="startBs()">▶ Scan blocks</button>
+<button class="btn danger" onclick="stop('eth_blockscan')">■ Stop</button>
+<span class="tiny">a proven key is saved to <a href="/results">/results</a> as
+<code>eth_nonce</code></span>
+</div>
+<div class="bar"><div id="barBs" style="width:0%"></div></div>
+<p id="detailBs" class="muted"></p><pre id="logBs"></pre>
+<details><summary>what this can and cannot find</summary><div class="muted">
+<p><span class="pill bad">cannot find</span> <b>a private key from a public
+key.</b> Recovering the signer of a transaction yields the uncompressed public
+key <code>04‖x‖y</code> and the address <code>keccak256(pubkey)[12:]</code>.
+Going further is ECDLP. Nor can two <i>different</i> keys sharing one
+<code>k</code> be solved: that gives
+<code>k·(s1−s2) = (z1−z2) + r·(d1−d2)</code> — two equations in three unknowns —
+so signatures are grouped per <b>(sender, r)</b> and a cross-sender
+<code>r</code> collision is reported as a non-leak instead of being chased.</p>
+<p><span class="pill info">expect</span> <b>no repeated r, and therefore no
+key.</b> Deterministic <code>k</code> (RFC 6979-style) is what every mainstream
+wallet does, so "nothing extractable" is the normal answer and the log says it
+explicitly. The class that did produce repeated <code>r</code> is Ledger's
+<b>CVE-2023-46233</b>, whose window card 1 on <a href="/eth">/eth</a> sweeps
+from the other end.</p>
+<p><span class="pill warn">skips</span> <b>the account nonce, contracts, and
+EIP-7702 authorisation tuples.</b> Two transactions sharing an <i>account</i>
+nonce is a speed-up or a cancel, and the same <code>(r,s,z)</code> twice is a
+resubmission — neither implies a key. A contract never signs, so a
+<code>to</code> of empty (a contract creation) is extracted and counted but has
+no signature to test. Only the outer transaction signature is checked.</p>
+<p><span class="pill warn">gates</span> <b>an unread block is never reported as
+clean.</b> A dead RPC, a 429, a block the endpoint will not serve, the row cap,
+or Stop marks the run <b>partial</b> and logs <b>INCOMPLETE READ</b>; the
+"nothing extractable" verdict is printed only over blocks that were actually
+read. Blocks that failed are recorded with their error, so a later run does not
+mistake them for scanned.</p>
+<p><span class="pill bad">scope</span> <b>reading blocks is public data; using a
+recovered key is not.</b> Extract what any node can see, and if a key ever does
+fall out of an address you do not own, that is a disclosure to its owner or
+their wallet vendor — never a withdrawal.</p>
+</div></details>
+</div>
+
+<div class="card accent-green"><h2>What has been extracted</h2>
+<p id="bsStat" class="muted">reading the index…</p>
+<p id="bsRep" class="muted"></p>
+<div class="row">
+<a class="btn ghost sm" id="bsCsv" href="/api/eth/blockscan/export?format=csv">↓
+extracted public data (CSV)</a>
+<a class="btn ghost sm" id="bsJson"
+href="/api/eth/blockscan/export?format=jsonl">↓ extracted public data
+(JSONL)</a>
+<button class="btn ghost sm" onclick="bsRows(true)">↻ refresh rows</button>
+</div>
+<p class="tiny">The download carries every extracted signature: block, tx index,
+hash, sender, EIP-55 address, <b>uncompressed public key</b>, tx type, chain id,
+account nonce, <code>r</code>, <code>s</code>, <code>v</code>, signing hash
+<code>z</code>, destination, value and gas limit. There is <b>no private-key
+column</b>, because a block does not contain one; a key that was <i>recovered</i>
+from a reused <code>k</code> is a hit and lives on
+<a href="/results">/results</a>.</p>
+<div class="inline">
+<div><label>filter: block</label><input id="bsFBlock" placeholder="optional"></div>
+<div><label>filter: sender</label><input id="bsFSender" placeholder="0x…"></div>
+<div><label>repeated (sender, r) only</label>
+<button class="btn ghost sm" onclick="bsOnlyRepeat()">toggle</button></div>
+</div>
+<pre id="bsRows">no rows yet — scan a block above</pre>
+<p id="bsPage" class="tiny"></p>
+<div class="row">
+<button class="btn ghost sm" onclick="bsPrev()">← newer</button>
+<button class="btn ghost sm" onclick="bsNext()">older →</button>
+<span class="tiny">r, s and z are truncated on screen; the download has them in
+full</span>
+</div>
+</div>
+"""
+
+BS_PAGE_JS = """
+<script>
+const BS_BATCH={bsmaxblocks_raw};
+const BS_PAGE={bspage_raw};
+const NL=String.fromCharCode(10);
+function $(id){ return document.getElementById(id); }
+function fmt(n){ return (n||0).toLocaleString('en-US'); }
+function pad(s,n){ s=String(s==null?'':s);
+  return s.length>n ? s.slice(0,n-1)+'…' : s+Array(n-s.length+1).join(' '); }
+function bsModeChanged(){
+  const m=$('bsMode').value;
+  $('bsOne').style.display   = (m==='one')?'':'none';
+  $('bsList').style.display  = (m==='list')?'':'none';
+  $('bsRange').style.display = (m==='range')?'':'none';
+}
+function startBs(){
+  const m=$('bsMode').value, p={rescan:!!($('bsRescan').checked)};
+  if(m==='range'){ p.start=$('bsS').value; p.end=$('bsE').value; }
+  else if(m==='list'){ p.blocks=$('bsL').value; }
+  else { p.blocks=$('bsB').value; }
+  post('/api/eth/blockscan',p).then(function(d){
+    if(d && d.ok){ setTimeout(bsState,700); setTimeout(function(){bsRows(true);},1500); }
+  });
+}
+let bsRepeatOnly=false, bsOffset=0, bsTotal=0;
+function bsQs(){
+  const q=[];
+  const fb=($('bsFBlock').value||'').trim(), fs=($('bsFSender').value||'').trim();
+  if(fb) q.push('block='+encodeURIComponent(fb));
+  if(fs) q.push('sender='+encodeURIComponent(fs));
+  if(bsRepeatOnly) q.push('repeat=1');
+  return q.length ? ('&'+q.join('&')) : '';
+}
+function bsState(){
+  fetch('/api/eth/blockscan/state',{cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      const el=$('bsStat'); if(!el) return;
+      el.innerHTML='index: <b>'+fmt(d.rows)+'</b> signature(s) from <b>'+
+        fmt(d.senders)+'</b> sender(s) over <b>'+fmt(d.blocks)+
+        '</b> block(s)'+((d.min_block==null)?'':
+        ' — heights '+fmt(d.min_block)+'..'+fmt(d.max_block))+
+        ' · '+fmt(d.distinct_r)+' distinct r · '+fmt(d.created)+
+        ' contract creation(s) · '+fmt(d.repeats)+' repeated (sender, r)'+
+        (d.failed_blocks?(' · <span class="status-bad">'+fmt(d.failed_blocks)+
+         ' block(s) indexed with a read error</span>'):'')+
+        (d.last_scanned_at?(' · last read '+
+         String(d.last_scanned_at).slice(0,19).replace('T',' ')+' UTC'):'');
+      const rp=$('bsRep');
+      if(rp){
+        rp.innerHTML = d.repeats
+          ? '<span class="pill warn">'+fmt(d.repeats)+' (sender, r) pair(s) '+
+            'repeat</span> those are the only rows that can yield a private '+
+            'key. Every run tests them; anything it proved is on '+
+            '<a href="/results">/results</a>.'
+          : '<span class="pill ok">no (sender, r) pair repeats</span> every '+
+            'signature indexed so far used its own k, so no private key is '+
+            'extractable from this public data — that is the normal answer, '+
+            'not a failure of the scan.';
+      }
+      const c=$('bsCsv'), jn=$('bsJson');
+      if(c) c.href='/api/eth/blockscan/export?format=csv'+bsQs();
+      if(jn) jn.href='/api/eth/blockscan/export?format=jsonl'+bsQs();
+    }).catch(function(e){
+      const el=$('bsStat'); if(el) el.textContent='index unavailable: '+e.message;
+    });
+}
+function bsRender(rows){
+  const el=$('bsRows'); if(!el) return;
+  if(!rows.length){ el.textContent='nothing extracted for this filter'; return; }
+  const out=[pad('block',11)+pad('idx',5)+pad('sender (EIP-55)',44)+
+             pad('type',9)+pad('r',15)+pad('v',4)+pad('to / created',44)+
+             'value (wei)'];
+  rows.forEach(function(r){
+    out.push(pad(r.block,11)+pad(r.index,5)+pad(r.address,44)+pad(r.type,9)+
+             pad(r.r,15)+pad(r.v,4)+
+             pad(r.created?'(contract creation)':(r.to||''),44)+r.value_wei);
+  });
+  el.textContent=out.join(NL);
+}
+function bsRows(reset){
+  if(reset) bsOffset=0;
+  fetch('/api/eth/blockscan/rows?limit='+BS_PAGE+'&offset='+bsOffset+bsQs(),
+        {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){ notify(d.msg||'could not read the index',false); return; }
+      bsTotal=d.total||0;
+      bsRender(d.rows||[]);
+      const p=$('bsPage');
+      if(p) p.textContent = bsTotal
+        ? (fmt(bsTotal)+' row(s) match — showing '+fmt(bsOffset+1)+'..'+
+           fmt(Math.min(bsTotal,bsOffset+(d.rows||[]).length))+
+           ' · full r/s/z and the public key are in the download')
+        : 'the index is empty — scan a block first';
+    }).catch(function(e){
+      const el=$('bsRows'); if(el) el.textContent='rows unavailable: '+e.message;
+    });
+}
+function bsNext(){
+  if(bsOffset+BS_PAGE>=bsTotal) return;
+  bsOffset+=BS_PAGE; bsRows();
+}
+function bsPrev(){ bsOffset=Math.max(0,bsOffset-BS_PAGE); bsRows(); }
+function bsOnlyRepeat(){
+  bsRepeatOnly=!bsRepeatOnly; bsRows(true);
+  notify(bsRepeatOnly?'only repeated (sender, r) rows — the ones that can leak a key'
+                      :'every extracted row', true);
+}
+bsModeChanged();
+watch('eth_blockscan','Bs');
+bsState(); bsRows(true);
+setInterval(bsState, 5000);
+</script>
+"""
+
+
+@app.route("/ethblock")
+def ethblock_page():
+    """The ETH Block Scanner page."""
+    body = (BS_PAGE_HTML
+            .replace("{bsmaxblocks}", format(ETH_BLOCKSCAN_MAX_BLOCKS, ","))
+            .replace("{bsrowsmax}", format(ETH_BLOCKSCAN_ROWS_MAX, ","))
+            .replace("{bsblocks}", str(ETH_BLOCKSCAN_BLOCKS - 1))
+            .replace("{bsexample}", "25833523")
+            .replace("{bsexample2}", "25833524"))
+    js = (BS_PAGE_JS
+          .replace("{bsmaxblocks_raw}", str(ETH_BLOCKSCAN_MAX_BLOCKS))
+          .replace("{bspage_raw}", str(ETH_BLOCKSCAN_PAGE_ROWS)))
+    return page(body + js)
+
+
 @app.route("/eth")
 def eth_page():
     # ── recipe widget (shared by the era batch and the manual sweep) ──────
@@ -7897,7 +8232,10 @@ placeholder="default: +{ncblocks}"></div>
 every signature inline — no indexer needed, so this is the cheapest way to look
 for reuse across many senders at once. Nothing is refused: a range wider than
 {ncmaxblocks} blocks runs in batches, and the run stops early (marked
-INCOMPLETE) if it fills the {ncmaxsigs}-signature memory cap.</p></div>
+INCOMPLETE) if it fills the {ncmaxsigs}-signature memory cap. To keep what you
+read — every signature and public key, indexed by (sender, r) across runs, so a
+k reused in two different blocks is still found — use the
+<a href="/ethblock">ETH Block Scanner</a>.</p></div>
 <div class="row">
 <button class="btn go" onclick="startNc()">▶ Analyse</button>
 <button class="btn danger" onclick="stop('eth_nonce')">■ Stop</button>
@@ -7938,10 +8276,10 @@ recovery.</p>
 <p><span class="pill ok">verified</span> <b>against published vectors, not
 against itself.</b> The signing payloads come from the EIPs, and the code
 reproduces EIP-155's worked example byte for byte (signing data, signing hash
-and signed transaction) and recovers the published sender for all 56 accepted
-<code>txbytes</code>+<code>sender</code>+<code>hash</code> vectors in
-<code>ethereum/tests</code> — cross-checked against libsecp256k1's own
-ecrecover.</p>
+and signed transaction) and recovers the published sender for all 53 accepted
+<code>txbytes</code>+<code>sender</code>+<code>hash</code> vectors vendored from
+<code>ethereum/tests</code> in <code>data/eth_tx_vectors.json</code> —
+cross-checked against libsecp256k1's own ecrecover.</p>
 <p><span class="pill bad">scope</span> <b>only analyse addresses you own or are
 authorised to test.</b> A recovered key on someone else's address is a
 disclosure to them, or to their wallet vendor — not a withdrawal.</p>
@@ -8362,7 +8700,556 @@ def api_eth_weakkeys():
     return {"ok": ok, "msg": msg, "keys": count + len(lines)}
 
 
+# ── ETH block scanner (/ethblock) ────────────────────────────────────────
+# One eth_getBlockByNumber(n, true) returns every transaction in a block WITH
+# its signature inline, so a block is the cheapest unit of Ethereum signature
+# data there is: one RPC call, no indexer, every sender in the block.
+#
+# What that call yields is PUBLIC data, and the distinction is written into the
+# page because it decides what this scanner may claim: from (v, r, s) and the
+# signing hash it recovers each signer's PUBLIC key and address — that is all a
+# block contains. A PRIVATE key does not follow from a public key; that is
+# ECDLP, the assumption the whole chain rests on. The one exception is a signer
+# that reused k: two signatures from the SAME key over different messages with
+# one r give k = (z1-z2)/(s1-s2) and then d = (k*s1-z1)/r. So every signature
+# read here is indexed persistently by (sender, r) — across blocks and across
+# runs — and the pairs that repeat go to the same verified recovery path as
+# /eth card 7. Indexing is what makes cross-block reuse findable at all: a
+# wallet that reused k usually did it in two different blocks, and a single
+# block read on its own would never show it.
+
+def _eth_blockscan_prune(log=None):
+    """Keep the signature index inside ETH_BLOCKSCAN_ROWS_MAX.
+
+    Oldest blocks go first, and their rows leave `eth_blocks_scanned` with
+    them so a later run re-reads those heights instead of believing an index
+    that no longer holds them. Returns how many blocks were evicted.
+    """
+    try:
+        with _db() as c:
+            n = c.execute("SELECT COUNT(*) FROM eth_block_index").fetchone()[0]
+            if n <= ETH_BLOCKSCAN_ROWS_MAX:
+                return 0
+            over, gone = n - ETH_BLOCKSCAN_ROWS_MAX, 0
+            blocks = [r[0] for r in c.execute(
+                "SELECT DISTINCT block FROM eth_block_index ORDER BY block ASC")]
+            for blk in blocks:
+                if gone >= over:
+                    break
+                c.execute("DELETE FROM eth_block_index WHERE block=?", (blk,))
+                c.execute("DELETE FROM eth_blocks_scanned WHERE block=?", (blk,))
+                gone += 1
+        if log and gone:
+            log("[block-scan] index over ETH_BLOCKSCAN_ROWS_MAX=%s — evicted %s "
+                "oldest block(s)" % (format(ETH_BLOCKSCAN_ROWS_MAX, ","),
+                                     format(gone, ",")))
+        return gone
+    except Exception:
+        return 0
+
+
+def _eth_blockscan_store(number, txs, sigs, stats, err=""):
+    """Persist one block's extracted signatures plus its read summary.
+
+    Idempotent per (block, tx_index): re-reading a height replaces its rows
+    rather than duplicating them, which is what makes `rescan` safe.
+    """
+    pos = {}
+    for i, tx in enumerate(txs or []):
+        h = (tx or {}).get("hash")
+        if h:
+            pos[h] = i
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for sg in sigs:
+        tx = None
+        for cand in (txs or []):
+            if (cand or {}).get("hash") == sg.get("tx"):
+                tx = cand
+                break
+        tx = tx or {}
+        to = tx.get("to") or b""
+        rows.append((
+            int(number), pos.get(sg.get("tx"), len(rows)), sg.get("tx") or "",
+            sg["sender"], sg.get("pubkey") or "", int(sg.get("type") or 0),
+            tx.get("chain_id"), tx.get("nonce"),
+            "%064x" % sg["r"], "%064x" % sg["s"], int(sg.get("parity") or 0),
+            "%064x" % sg["z"], ("0x" + to.hex()) if to else "",
+            str(int(tx.get("value") or 0)), int(tx.get("gas_limit") or 0),
+            0 if to else 1, now))
+    try:
+        with _db() as c:
+            if rows:
+                c.executemany(
+                    "INSERT OR REPLACE INTO eth_block_index (block,tx_index,"
+                    "hash,sender,pubkey,txtype,chain_id,nonce,r,s,parity,z,"
+                    "to_addr,value_wei,gas_limit,created,added_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            c.execute(
+                "INSERT OR REPLACE INTO eth_blocks_scanned (block,txs,sigs,"
+                "senders,untrusted,unsigned,no_sender,error,scanned_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (int(number), int(stats.get("txs") or 0),
+                 int(stats.get("sigs") or 0), len(stats.get("senders") or ()),
+                 int(stats.get("untrusted") or 0),
+                 int(stats.get("unsigned") or 0),
+                 int(stats.get("no_sender") or 0), err or "", now))
+    except Exception:
+        return 0
+    return len(rows)
+
+
+def _eth_blockscan_stats():
+    """Index summary for the page. Database reads only — never any network."""
+    out = {"rows": 0, "blocks": 0, "senders": 0, "distinct_r": 0,
+           "repeats": 0, "min_block": None, "max_block": None,
+           "failed_blocks": 0, "created": 0, "last_scanned_at": ""}
+    try:
+        with _db() as c:
+            r = c.execute("SELECT COUNT(*), COUNT(DISTINCT block), "
+                          "COUNT(DISTINCT sender), COUNT(DISTINCT r), "
+                          "MIN(block), MAX(block), SUM(created) "
+                          "FROM eth_block_index").fetchone()
+            out.update(rows=r[0] or 0, blocks=r[1] or 0, senders=r[2] or 0,
+                       distinct_r=r[3] or 0, min_block=r[4], max_block=r[5],
+                       created=r[6] or 0)
+            out["repeats"] = c.execute(
+                "SELECT COUNT(*) FROM (SELECT sender, r FROM eth_block_index "
+                "GROUP BY sender, r HAVING COUNT(*) > 1)").fetchone()[0]
+            out["failed_blocks"] = c.execute(
+                "SELECT COUNT(*) FROM eth_blocks_scanned WHERE error != ''"
+                ).fetchone()[0]
+            row = c.execute("SELECT MAX(scanned_at) FROM eth_blocks_scanned"
+                            ).fetchone()
+            out["last_scanned_at"] = (row or [""])[0] or ""
+    except Exception:
+        pass
+    return out
+
+
+def _eth_blockscan_chunked(seq, step):
+    """Yield lists of at most `step` items, so no IN clause grows unbounded.
+
+    Deliberately lazy: `seq` is usually a range, and materialising it would
+    turn a large block range into a memory problem before any RPC call.
+    """
+    step, part = max(1, step), []
+    for x in seq:
+        part.append(x)
+        if len(part) >= step:
+            yield part
+            part = []
+    if part:
+        yield part
+
+
+def _eth_blockscan_indexed(blocks, span=None):
+    """What the index already holds for these heights: senders, counts, errors.
+
+    Two things depend on this. A run whose blocks are all indexed answers from
+    the index with no RPC call at all — that is the point of keeping it. And a
+    run over NEW blocks still has to search the senders of the OLD ones, or a k
+    reused between a block scanned yesterday and one scanned now is missed.
+    """
+    senders, txs, sigs, created, failed, ok_blocks = set(), 0, 0, 0, [], 0
+    types = defaultdict(int)
+    try:
+        with _db() as c:
+            # A contiguous span is one BETWEEN per table, not 500-block chunks:
+            # a range ask stays a range all the way down.
+            parts = ([("block BETWEEN ? AND ?", [int(span[0]), int(span[1])])]
+                     if span else
+                     [("block IN (%s)" % ",".join("?" * len(p)),
+                       [int(x) for x in p])
+                      for p in _eth_blockscan_chunked(blocks, 500)])
+            for cond, part in parts:
+                senders |= {r[0] for r in c.execute(
+                    "SELECT DISTINCT sender FROM eth_block_index "
+                    "WHERE " + cond, part)}
+                row = c.execute(
+                    "SELECT COALESCE(SUM(txs),0), COALESCE(SUM(sigs),0), "
+                    "SUM(CASE WHEN error='' THEN 1 ELSE 0 END) "
+                    "FROM eth_blocks_scanned WHERE " + cond, part).fetchone()
+                txs += row[0] or 0
+                sigs += row[1] or 0
+                ok_blocks += row[2] or 0
+                row = c.execute(
+                    "SELECT COALESCE(SUM(created),0) FROM eth_block_index "
+                    "WHERE " + cond, part).fetchone()
+                created += row[0] or 0
+                failed.extend(r[0] for r in c.execute(
+                    "SELECT block FROM eth_blocks_scanned WHERE error != '' "
+                    "AND " + cond, part))
+                for t, cnt in c.execute(
+                        "SELECT txtype, COUNT(*) FROM eth_block_index "
+                        "WHERE " + cond + " GROUP BY txtype", part):
+                    types[t] += cnt
+    except Exception:
+        pass
+    return {"senders": senders, "txs": txs, "sigs": sigs, "created": created,
+            "failed": sorted(failed), "types": types,
+            "scanned_ok": ok_blocks}
+
+
+def _eth_blockscan_repeats(senders=None):
+    """(sender, r, n) for every indexed pair with more than one signature.
+
+    Those pairs — and only those — can yield a private key. `senders` narrows
+    the query to the senders one run touched, in chunks, so a run over a
+    million senders does not build a million-element IN list.
+    """
+    q = ("SELECT sender, r, COUNT(*) FROM eth_block_index %s"
+         "GROUP BY sender, r HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC")
+    out = []
+    try:
+        with _db() as c:
+            if senders is None:
+                out = [tuple(r) for r in c.execute(q % "")]
+                return out
+            chunk = sorted({s for s in senders if s})
+            step = max(10, ETH_BLOCKSCAN_SENDERS)
+            for i in range(0, len(chunk), step):
+                part = chunk[i:i + step]
+                where = ("WHERE sender IN (%s) " % ",".join("?" * len(part)))
+                out.extend(tuple(r) for r in c.execute(q % where, part))
+    except Exception:
+        return []
+    return out
+
+
+def _eth_blockscan_pair_sigs(sender, r):
+    """Rebuild the sig dicts for one (sender, r) pair straight from the index.
+
+    The shape is exactly what `_eth_nonce_analyse` consumes, so a pair found
+    across two runs is tested by the same verified code path as one found
+    inside a single block.
+    """
+    out = []
+    try:
+        with _db() as c:
+            rows = c.execute(
+                "SELECT block,tx_index,hash,sender,pubkey,txtype,chain_id,"
+                "nonce,r,s,parity,z FROM eth_block_index WHERE sender=? AND r=? "
+                "ORDER BY block ASC, tx_index ASC", (sender, r)).fetchall()
+    except Exception:
+        return out
+    for blk, _idx, h, snd, pub, typ, cid, nonce, rr, ss, par, zz in rows:
+        try:
+            out.append({"tx": h, "r": int(rr, 16), "s": int(ss, 16),
+                        "z": int(zz, 16), "parity": int(par or 0),
+                        "type": int(typ or 0), "chain_id": cid,
+                        "nonce": nonce, "block": blk, "sender": snd,
+                        "pubkey": pub or ""})
+        except Exception:
+            continue
+    return out
+
+
+def _eth_blockscan_rows(block=None, sender=None, limit=None, offset=0,
+                        repeat_only=False):
+    """Extracted public data for the page and the downloads."""
+    limit = int(limit or ETH_BLOCKSCAN_PAGE_ROWS)
+    where, args = [], []
+    if block is not None:
+        where.append("block=?")
+        args.append(int(block))
+    if sender:
+        # Stored senders are lowercase (that is what recovery yields), but a
+        # filter arrives as whatever the user pasted — EIP-55 mixed case, upper,
+        # lower. Compare case-insensitively or the filter silently finds nothing.
+        where.append("LOWER(sender)=?")
+        args.append(str(sender).strip().lower())
+    if repeat_only:
+        where.append("(sender, r) IN (SELECT sender, r FROM eth_block_index "
+                     "GROUP BY sender, r HAVING COUNT(*) > 1)")
+    sql = ("SELECT block,tx_index,hash,sender,pubkey,txtype,chain_id,nonce,r,s,"
+           "parity,z,to_addr,value_wei,gas_limit,created FROM eth_block_index")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY block DESC, tx_index ASC LIMIT ? OFFSET ?"
+    out = []
+    try:
+        with _db() as c:
+            rows = c.execute(sql, args + [limit, max(0, int(offset))]).fetchall()
+            total = c.execute(
+                "SELECT COUNT(*) FROM eth_block_index"
+                + (" WHERE " + " AND ".join(where) if where else ""),
+                args).fetchone()[0]
+    except Exception:
+        return [], 0
+    for (blk, idx, h, snd, pub, typ, cid, nonce, rr, ss, par, zz, to, val,
+         gas, created) in rows:
+        out.append({"block": blk, "index": idx, "hash": h, "sender": snd,
+                    "address": eth_address_checksum(snd) or snd,
+                    "pubkey": pub, "type": ETH_TX_TYPE_NAMES.get(typ, str(typ)),
+                    "type_id": typ, "chain_id": cid, "nonce": nonce,
+                    "r": "0x" + rr, "s": "0x" + ss, "v": par, "z": "0x" + zz,
+                    "to": to, "value_wei": val, "gas_limit": gas,
+                    "created": bool(created)})
+    return out, total
+
+
+def attack_eth_blockscan(target, log, job, should_stop=None):
+    """Read blocks, extract every signature they contain, test what can leak.
+
+    `target` is {"blocks": [int, …]} or {"start": lo, "end": hi}, plus
+    "rescan" and "label". Blocks
+    already in the index are skipped unless `rescan` is set, so re-running a
+    range costs nothing and a long sweep can be resumed after a restart.
+
+    Everything extracted here is public: the sender, its recovered public key,
+    and the (r, s, z) it signed. A private key is reported only when one
+    (sender, r) pair holds two different signatures, and only after the
+    recovered candidate reproduces the pubkey or address that signed.
+    """
+    stop = should_stop or (lambda: job.get("stop", False))
+    rescan = bool(target.get("rescan"))
+    if target.get("blocks"):
+        blocks, span = [int(b) for b in target["blocks"]], None
+    else:
+        lo, hi = int(target.get("start", 0)), int(target.get("end", -1))
+        # A range stays a range, so a 10-million-block ask costs no more memory
+        # than a 20-block one; batches below are lazy slices of it.
+        blocks = range(lo, hi + 1) if hi >= lo else range(0)
+        span = (lo, hi)
+    asked = len(blocks)
+    label = str(target.get("label") or "%s block(s)" % format(asked, ","))
+    hits, sigs_read, txs_read, read = [], 0, 0, 0
+    touched, unreadable, skipped, created = set(), [], 0, 0
+    types = defaultdict(int)
+    untrusted = unsigned = no_sender = 0
+    if not asked:
+        job["detail"] = "no blocks to read"
+        log("[block-scan] nothing to do: no block numbers were given")
+        return hits
+    incomplete = ""
+    try:
+        done = set()
+        if not rescan:
+            try:
+                with _db() as c:
+                    done = {r[0] for r in c.execute(
+                        "SELECT block FROM eth_blocks_scanned WHERE error=''")}
+            except Exception:
+                done = set()
+        total = max(1, asked)
+        batch_n = max(1, ETH_BLOCKSCAN_MAX_BLOCKS)
+        chunks = int(math.ceil(asked / batch_n))
+        log("[block-scan] %s: %s block(s) to consider, one "
+            "eth_getBlockByNumber(n, true) per block not already indexed — no "
+            "indexer involved" % (label, format(asked, ",")))
+        if chunks > 1:
+            # Same rule as every other scan here: a big ask is batched and run
+            # in order, never refused.
+            log("[block-scan] note: %s block(s) in %s batch(es) of %s — they run "
+                "in order (chunk i/N below), Stop keeps everything indexed so "
+                "far, and a later run resumes without re-reading a block"
+                % (format(asked, ","), format(chunks, ","),
+                   format(batch_n, ",")))
+
+        def _todo():
+            for b in blocks:
+                if not rescan and b in done:
+                    continue
+                yield b
+
+        cur_chunk, n = -1, 0
+        for height in _todo():
+            n = read
+            if stop():
+                job["partial"] = True
+                incomplete = ("stopped by user at block %s — %s of %s block(s) "
+                              "read" % (format(height, ","), format(n, ","),
+                                        format(total, ",")))
+                log("[block-scan] %s" % incomplete)
+                break
+            read += 1
+            chunk_i = n // batch_n
+            if chunk_i != cur_chunk:
+                cur_chunk = chunk_i
+                log("[block-scan] chunk %s/%s: block %s onward (%s block(s) per "
+                    "batch)" % (format(chunk_i + 1, ","), format(chunks, ","),
+                               format(height, ","), format(batch_n, ",")))
+            job["progress"] = min(0.9, read / total)
+            job["detail"] = ("block %s (%s/%s) — %s signature(s) indexed"
+                             % (format(height, ","), format(read, ","),
+                                format(total, ","), format(sigs_read, ",")))
+            blk, err = eth_block_txs(height, stop)
+            if blk is None:
+                unreadable.append(height)
+                _eth_blockscan_store(height, [], [], {"txs": 0}, err or "unreadable")
+                log("[block-scan] block %s: %s" % (format(height, ","), err))
+                if len(unreadable) >= 3 and not sigs_read:
+                    job["partial"] = True
+                    job["detail"] = ("gave up: %s — nothing read"
+                                     % (err or "no block could be read"))
+                    # Giving up has to say what it means: nothing was read, so
+                    # nothing follows about these blocks.
+                    log("[block-scan] gave up after %s unreadable block(s): %s. "
+                        "NOTHING was extracted, so nothing can be concluded "
+                        "about these blocks — this run is INCOMPLETE, not "
+                        "clean. Set ETH_RPC_URLS to an endpoint that serves "
+                        "this height (an archive node for old blocks)."
+                        % (format(len(unreadable), ","),
+                           err or "no block could be read"))
+                    return hits
+                continue
+            part, stats = eth_signatures(blk, None, stop)
+            stored = _eth_blockscan_store(height, blk, part, stats, err or "")
+            sigs_read += len(part)
+            txs_read += stats["txs"]
+            touched |= stats["senders"]
+            untrusted += stats["untrusted"]
+            unsigned += stats["unsigned"]
+            no_sender += stats["no_sender"]
+            for t, cnt in stats["types"].items():
+                types[t] += cnt
+            created += sum(1 for tx in blk if not (tx or {}).get("to"))
+            tnames = ", ".join("%s:%d" % (ETH_TX_TYPE_NAMES.get(k, k), v)
+                               for k, v in sorted(stats["types"].items()))
+            log("[block-scan] block %s: %s tx → %s signature(s) from %s "
+                "sender(s) [%s]%s%s — %s public key(s) extracted%s"
+                % (format(height, ","), format(stats["txs"], ","),
+                   format(stats["sigs"], ","),
+                   format(len(stats["senders"]), ","), tnames or "none",
+                   "" if not stats["untrusted"] else
+                   ", %d excluded (payload would not reproduce)"
+                   % stats["untrusted"],
+                   "" if not err else ", note: %s" % err,
+                   format(stored, ","),
+                   "" if not any(not (tx or {}).get("to") for tx in blk) else
+                   ", %d contract creation(s)"
+                   % sum(1 for tx in blk if not (tx or {}).get("to"))))
+            _eth_blockscan_prune(log)
+        skipped = asked - read
+        if skipped and read:
+            log("[block-scan] %s of %s block(s) were already in the index and "
+                "were not re-read (tick rescan to read them again)"
+                % (format(skipped, ","), format(asked, ",")))
+        if unreadable:
+            why = ("%s of %s block(s) could not be read (%s…)"
+                   % (format(len(unreadable), ","), format(max(1, read), ","),
+                      format(unreadable[0], ",")))
+            incomplete = (why + "; " + incomplete) if incomplete else why
+        # Search the senders of EVERY block asked for, not just the newly read
+        # ones: the pair that leaks a key is just as likely to straddle a block
+        # indexed by an earlier run.
+        already = _eth_blockscan_indexed(blocks, span)
+        touched |= already["senders"]
+        # `read == 0` means either "every block asked for was already indexed"
+        # — answer from the index — or "nothing could be read at all" (Stop
+        # before the first call, every endpoint dead). Only the first may speak
+        # for these blocks; the second has to stay partial and say so.
+        if not read and (already["scanned_ok"] or already["senders"]):
+            txs_read, created = already["txs"], already["created"]
+            sigs_read = already["sigs"]
+            if already["failed"]:
+                incomplete = ("%s of %s block(s) are indexed with a read error "
+                              "(%s…)" % (format(len(already["failed"]), ","),
+                                         format(len(blocks), ","),
+                                         format(already["failed"][0], ",")))
+                job["partial"] = True
+            types = already["types"]
+            job["detail"] = ("%s block(s) already indexed — answered from the "
+                             "index, no block re-read" % format(asked, ","))
+            log("[block-scan] all %s block(s) asked for are already in the "
+                "index (%s signature(s), %s sender(s)) — answering from it "
+                "without re-reading a single block. Tick rescan to read them "
+                "from the chain again."
+                % (format(skipped, ","), format(sigs_read, ","),
+                   format(len(touched), ",")))
+        log("[block-scan] %s totals: %s transaction(s), %s signature(s), %s "
+            "distinct sender(s), %s contract creation(s), tx types [%s]%s%s%s"
+            % ("extraction" if read else "index",
+               format(txs_read, ","), format(sigs_read, ","),
+               format(len(touched), ","), format(created, ","),
+               ", ".join("%s:%d" % (ETH_TX_TYPE_NAMES.get(k, k), v)
+                         for k, v in sorted(types.items())) or "none",
+               "" if not untrusted else
+               ", %d excluded as untrusted" % untrusted,
+               "" if not unsigned else ", %d unsigned" % unsigned,
+               "" if not no_sender else
+               ", %d whose sender would not recover" % no_sender))
+        if not sigs_read and not touched:
+            job["partial"] = True
+            job["detail"] = ("nothing extracted — %s"
+                             % (incomplete or "no signed transactions in range"))
+            log("[block-scan] no signatures were read, so nothing can be said "
+                "about these blocks: %s. An unread block is NOT evidence that "
+                "no key was ever reused in it."
+                % (incomplete or "the blocks held no signed transactions"))
+            return hits
+        # The only shape that can yield a private key: one sender, one r, two
+        # or more signatures — searched over the WHOLE index, so a pair split
+        # across two blocks (or two runs) is found.
+        job["progress"] = 0.93
+        job["detail"] = ("searching the index for a repeated (sender, r) among "
+                         "%s sender(s)" % format(len(touched), ","))
+        # What the verdict is about: blocks read from the chain this run, or
+        # blocks answered from the index. Saying "1 block(s)" after reading
+        # none would misdescribe the run.
+        src_label = ("%s block(s) from the index" % format(asked, ",")
+                     if not read else "%s block(s)" % format(read, ","))
+        reps = _eth_blockscan_repeats(touched)
+        if not reps:
+            st = _eth_blockscan_stats()
+            job["progress"] = 1.0
+            job["detail"] = ("%s: %s signature(s), %s sender(s), no repeated "
+                             "(sender, r) — nothing extractable"
+                             % (src_label, format(sigs_read, ","),
+                                format(len(touched), ",")))
+            log("[block-scan] every signature in these blocks used its own k: "
+                "no (sender, r) pair repeats anywhere in the %s-signature "
+                "index, so NO private key is extractable from this public data. "
+                "That is the normal answer — deterministic k (RFC 6979-style) "
+                "is what mainstream wallets do — and it is a result, not a "
+                "failure of the scan." % format(st["rows"], ","))
+            if incomplete:
+                job["partial"] = True
+                log("[block-scan] INCOMPLETE READ: %s. The verdict above "
+                    "covers only what was actually read." % incomplete)
+            return hits
+        log("[block-scan] %s (sender, r) pair(s) repeat in the index — the only "
+            "shape that can leak a key. Testing every pair."
+            % format(len(reps), ","))
+        pool = []
+        for sender, r, cnt in reps[:ETH_NONCE_MAX_SIGS]:
+            pool.extend(_eth_blockscan_pair_sigs(sender, r))
+        job["progress"] = 0.96
+        hits = _eth_nonce_analyse(pool, log, job, stop, "[block-scan] ",
+                                  src_label, incomplete)
+        return hits
+    except RuntimeError as e:
+        if "stopped by user" in str(e):
+            job["partial"] = True
+            job["detail"] = ("stopped — %s signature(s) indexed, everything "
+                             "found so far is kept" % format(sigs_read, ","))
+            log("[block-scan] stopped by user")
+            return hits
+        if isinstance(e, _EthNoEndpoint):
+            job["partial"] = True
+            job["detail"] = "stopped: no RPC endpoint answered"
+            log("[block-scan] EVERY configured RPC endpoint refused us: %s — "
+                "nothing was read. Set ETH_RPC_URLS to an endpoint that answers "
+                "this host (your own node is the reliable option)." % e)
+            return hits
+        if isinstance(e, _EsploraRateLimited):
+            job["partial"] = True
+            job["detail"] = "stopped: rate limited (%s signature(s) kept)" % (
+                format(sigs_read, ","))
+            log("[block-scan] rate limited: %s — %s signature(s) already "
+                "indexed are kept, and the blocks not yet read are NOT marked "
+                "scanned, so re-running resumes where this stopped."
+                % (e, format(sigs_read, ",")))
+            return hits
+        job["partial"] = True
+        job["detail"] = "failed: %s" % str(e)[:120]
+        log("[block-scan] RPC unavailable: %s" % e)
+        return hits
+
 _ETH_TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+# A block number token: decimal, or 0x hex (both are pasted in the wild).
+_ETH_BLOCK_TOKEN_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]{1,16}|\d{1,19})$")
 _ETH_RAW_TX_RE = re.compile(r"^(0x)?[0-9a-fA-F]{20,}$")
 
 
@@ -8499,6 +9386,173 @@ def api_eth_nonce():
                    % (msg, format(_eth_batch_size(), ",")))
     return dict({"ok": ok, "msg": msg, "mode": mode}, **extra)
 
+@app.route("/api/eth/blockscan", methods=["POST"])
+def api_eth_blockscan():
+    """Read blocks and extract every signature they contain.
+
+    Accepts one block number, a pasted list, or a start:end range. A large
+    range is batched and run in order — never refused, same rule as every other
+    scan here.
+    """
+    j = request.get_json(silent=True) or {}
+    rescan = bool(j.get("rescan"))
+    blocks, bad, how = [], 0, ""
+    start_raw = j.get("start")
+    if start_raw not in (None, ""):
+        try:
+            start = _eth_int_token(start_raw, "start block")
+        except (ValueError, TypeError):
+            return {"ok": False, "msg": "start must be a block number"}
+        end_raw = j.get("end")
+        try:
+            end = (start + ETH_BLOCKSCAN_BLOCKS - 1 if end_raw in (None, "")
+                   else _eth_int_token(end_raw, "end block"))
+        except (ValueError, TypeError):
+            return {"ok": False, "msg": "end must be a block number"}
+        if start < 0:
+            return {"ok": False, "msg": "block numbers start at 0"}
+        if end < start:
+            return {"ok": False, "msg": "end must be >= start"}
+        target = {"start": start, "end": end, "rescan": rescan,
+                  "label": "blocks %s..%s" % (format(start, ","),
+                                              format(end, ","))}
+        span, first, last = end - start + 1, start, end
+        how = "%s block(s)" % format(span, ",")
+    else:
+        value = j.get("blocks")
+        if value is None:
+            value = j.get("block")
+        items, bad = _eth_nonce_tokens(value, _ETH_BLOCK_TOKEN_RE, dedupe=True)
+        seen = set()
+        for tok in items:
+            try:
+                n = _eth_int_token(tok, "block number")
+            except (ValueError, TypeError):
+                bad += 1
+                continue
+            if n < 0 or n in seen:
+                bad += 1 if n < 0 else 0
+                continue
+            seen.add(n)
+            blocks.append(n)
+        if not blocks:
+            return {"ok": False,
+                    "msg": ("enter at least one block number — one number, a "
+                            "comma/newline list, or a start:end range"
+                            + ("" if not bad else
+                               " (%d token(s) were not block numbers)" % bad))}
+        blocks.sort()
+        target = {"blocks": blocks, "rescan": rescan,
+                  "label": "%s block(s)" % format(len(blocks), ",")}
+        span, first, last = len(blocks), blocks[0], blocks[-1]
+        how = "%s block(s)" % format(span, ",")
+    batches = _batch_count(span, ETH_BLOCKSCAN_MAX_BLOCKS)
+    ok, msg = _start_job("eth_blockscan", attack_eth_blockscan, target)
+    if ok:
+        msg = ("%s — %s: %s eth_getBlockByNumber call(s)%s"
+               % (msg, how, format(span, ","),
+                  "" if not rescan else
+                  ", re-reading blocks the index already holds"))
+        if span > ETH_BLOCKSCAN_MAX_BLOCKS:
+            msg = "%s — %s" % (msg, _batch_note(span, ETH_BLOCKSCAN_MAX_BLOCKS,
+                                                "blocks"))
+        if bad:
+            msg = "%s (%d token(s) were not block numbers)" % (msg, bad)
+    return {"ok": ok, "msg": msg, "blocks": span, "requests": span,
+            "batches": batches, "first": first, "last": last,
+            "rescan": rescan, "how": how}
+
+
+@app.route("/api/eth/blockscan/state")
+def api_eth_blockscan_state():
+    """Index summary for the page. Database reads only — never any network."""
+    st = _eth_blockscan_stats()
+    st.update(ok=True, page_rows=ETH_BLOCKSCAN_PAGE_ROWS,
+              batch_blocks=ETH_BLOCKSCAN_MAX_BLOCKS,
+              rows_max=ETH_BLOCKSCAN_ROWS_MAX,
+              default_blocks=ETH_BLOCKSCAN_BLOCKS,
+              rpc=[_eth_host(u) for u in _ETH_RPC_BASES])
+    return st
+
+
+@app.route("/api/eth/blockscan/rows")
+def api_eth_blockscan_rows():
+    """The extracted public data, a page at a time."""
+    block, sender = request.args.get("block"), request.args.get("sender")
+    try:
+        blk = _eth_int_token(block, "block") if block else None
+    except (ValueError, TypeError):
+        return {"ok": False, "msg": "block must be a block number"}
+    try:
+        limit = min(1000, max(1, int(request.args.get("limit")
+                                    or ETH_BLOCKSCAN_PAGE_ROWS)))
+        offset = max(0, int(request.args.get("offset") or 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "msg": "limit and offset must be numbers"}
+    rows, total = _eth_blockscan_rows(
+        block=blk, sender=sender, limit=limit, offset=offset,
+        repeat_only=bool(request.args.get("repeat")))
+    return {"ok": True, "rows": rows, "total": total, "limit": limit,
+            "offset": offset, "repeat": bool(request.args.get("repeat"))}
+
+
+@app.route("/api/eth/blockscan/export")
+def api_eth_blockscan_export():
+    """Every signature the scanner has extracted, streamed as CSV or JSONL.
+
+    Public data only: sender, recovered public key, (r, s, v), signing hash,
+    tx type, account nonce, destination and value. There is no private-key
+    column, because a block does not contain one — a key that was *recovered*
+    from a reused k is a hit and lives on /results.
+    """
+    want = (request.args.get("format") or "jsonl").strip().lower()
+    if want not in ("csv", "jsonl", "json"):
+        return {"ok": False, "msg": "format must be csv or jsonl"}
+    want = "csv" if want == "csv" else "jsonl"
+    block, sender = request.args.get("block"), request.args.get("sender")
+    try:
+        blk = _eth_int_token(block, "block") if block else None
+    except (ValueError, TypeError):
+        return {"ok": False, "msg": "block must be a block number"}
+    repeat = bool(request.args.get("repeat"))
+    cols = ("block", "index", "hash", "sender", "address", "pubkey", "type",
+            "type_id", "chain_id", "nonce", "r", "s", "v", "z", "to",
+            "value_wei", "gas_limit", "created")
+
+    def gen():
+        if want == "csv":
+            buf = io.StringIO()
+            csv.writer(buf).writerow(list(cols))
+            yield buf.getvalue()
+        off = 0
+        while True:
+            rows, _total = _eth_blockscan_rows(block=blk, sender=sender,
+                                               limit=1000, offset=off,
+                                               repeat_only=repeat)
+            if not rows:
+                return
+            for r in rows:
+                if want == "csv":
+                    buf = io.StringIO()
+                    csv.writer(buf).writerow([r.get(c) for c in cols])
+                    yield buf.getvalue()
+                else:
+                    yield json.dumps(r) + "\n"
+            off += len(rows)
+            if len(rows) < 1000:
+                return
+
+    slug = ("block-%d" % blk) if blk is not None else (
+        "repeat" if repeat else "all")
+    filename = "btc-hunt-eth-blockscan-%s-public.%s" % (
+        slug, "csv" if want == "csv" else "jsonl")
+    return Response(gen(),
+                    mimetype=("text/csv" if want == "csv"
+                              else "application/x-ndjson"),
+                    headers={"Content-Disposition":
+                             'attachment; filename="%s"' % filename,
+                             "Cache-Control": "no-store, max-age=0"})
+
 @app.route("/api/eth/ping", methods=["POST", "GET"])
 def api_eth_ping():
     """Probe every configured RPC base (parallel, ~1 s each)."""
@@ -8576,6 +9630,16 @@ if __name__ == "__main__":
                     help="scan a block range with eth_getBlockByNumber(n,true) "
                          "and group every sender's signatures by r "
                          "(default END: START+%d)" % (ETH_NONCE_BLOCKS - 1))
+    ap.add_argument("--cli-eth-blockscan", metavar="BLOCK[:LAST][,…]",
+                    help="headless ETH block scanner: read these blocks with "
+                         "eth_getBlockByNumber(n,true), extract every "
+                         "signature, index them by (sender, r) and recover any "
+                         "key a reused k leaks. One number, a comma-separated "
+                         "list, or START:LAST (default LAST: START+%d)"
+                         % (ETH_BLOCKSCAN_BLOCKS - 1))
+    ap.add_argument("--cli-eth-blockscan-rescan", action="store_true",
+                    help="re-read blocks the persistent index already holds "
+                         "(default: skip them and answer from the index)")
     ap.add_argument("--cli-live", action="store_true",
                     help="headless live block monitor: follow the chain tip, "
                          "index ECDSA signatures from legacy and segwit inputs "
@@ -8666,6 +9730,50 @@ if __name__ == "__main__":
         elif total > ETH_MAX_STEPS:
             print("[era] note: %s" % _batch_note(total, ETH_MAX_STEPS, "steps"))
         attack_eth_eras(specs, ids, print, job)
+        sys.exit(0)
+
+    if args.cli_eth_blockscan:
+        blocks, bad = [], 0
+        for tok in re.split(r"[\s,]+", args.cli_eth_blockscan.strip()):
+            if not tok:
+                continue
+            a, _, bb = tok.partition(":")
+            try:
+                start = _eth_int_token(a, "block")
+                end = (_eth_int_token(bb, "last block") if bb
+                       else start + ETH_BLOCKSCAN_BLOCKS - 1)
+            except (ValueError, TypeError) as e:
+                sys.exit("--cli-eth-blockscan: %s" % e)
+            if end < start:
+                sys.exit("--cli-eth-blockscan: %s — last block precedes the "
+                         "first" % tok)
+            blocks.extend(range(start, end + 1))
+        if not blocks:
+            sys.exit("--cli-eth-blockscan: no block numbers found")
+        blocks = sorted(set(blocks))
+        job = {"stop": False, "progress": 0.0, "detail": ""}
+        print("── %s block(s): %s..%s ──"
+              % (format(len(blocks), ","), format(blocks[0], ","),
+                 format(blocks[-1], ",")))
+        if len(blocks) > ETH_BLOCKSCAN_MAX_BLOCKS:
+            print("note: %s" % _batch_note(len(blocks),
+                                           ETH_BLOCKSCAN_MAX_BLOCKS, "blocks"))
+        hits = attack_eth_blockscan(
+            {"blocks": blocks, "rescan": bool(args.cli_eth_blockscan_rescan),
+             "label": "%d block(s)" % len(blocks)}, print, job)
+        st = _eth_blockscan_stats()
+        print("extracted  : %s signature(s) indexed from %s sender(s) over %s "
+              "block(s)" % (format(st["rows"], ","), format(st["senders"], ","),
+                            format(st["blocks"], ",")))
+        print("repeats    : %s (sender, r) pair(s) — the only shape that can "
+              "leak a key" % format(st["repeats"], ","))
+        print("   %d key(s) recovered; %s" % (len(hits), job.get("detail")
+                                              or "done"))
+        if not hits:
+            print("a block yields PUBLIC data: every signer's public key and "
+                  "address, and the (r, s, z) it signed. A private key needs a "
+                  "reused k, and none was found in what was read.")
+        print("total: %d key(s) recovered" % len(hits))
         sys.exit(0)
 
     if (args.cli_eth_nonce or args.cli_eth_nonce_txs
