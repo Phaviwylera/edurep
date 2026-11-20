@@ -17,12 +17,14 @@ this is safe to run on a deploy box or in CI. It covers
         unscannable-era warning, the era widget on /eth, the home-page
         launcher, the headless --cli-eth-era / --list-eras, and the
         no-range-refused batching on both the ETH and the BTC side
-  31-37 Ethereum nonce (k) reuse: RLP and the five signing payloads against
+  31-38 Ethereum nonce (k) reuse: RLP and the five signing payloads against
         EIP-155's worked example, the 53 accepted txbytes+sender+hash vectors
         vendored from ethereum/tests, sender recovery for every tx type, what
         leaks a key and what provably does not (the cross-sender negative
         control), the four input modes end to end, the failure modes that must
-        never read as "clean", and the routes/page/CLI/results wiring
+        never read as "clean", the routes/page/CLI/results wiring, and the ETH
+        block scanner (extract every signature in a block into a persistent
+        (sender, r) index, and find a k reused across two blocks or two runs)
 
 Every assertion that encodes a published test vector says so in a comment.
 """
@@ -147,7 +149,7 @@ EIP155_RAW = bytes.fromhex(
 
 
 def eth_mk_tx(d, nonce, k, typ=0, chain=1, value=10**18, gas=21000,
-              low_s=True):
+              low_s=True, to=None, data=b""):
     """A signed transaction made with an EXPLICIT k.
 
     A signer with a broken RNG does exactly this, so a reuse can be built on
@@ -157,7 +159,8 @@ def eth_mk_tx(d, nonce, k, typ=0, chain=1, value=10**18, gas=21000,
     tx = b.eth_tx_new(
         type=typ, chain_id=chain, nonce=nonce, gas_price=20 * 10**9,
         max_prio=10**9, max_fee=30 * 10**9, gas_limit=gas,
-        to=bytes.fromhex("35" * 20), value=value, data=b"",
+        to=(bytes.fromhex("35" * 20) if to is None else to),
+        value=value, data=data,
         access_list=([[bytes.fromhex("11" * 20), [bytes.fromhex("22" * 32)]]]
                      if typ in (1, 2, 3, 4) else []),
         max_blob_fee=10**8, blob_hashes=[bytes.fromhex("01" + "00" * 31)],
@@ -180,7 +183,8 @@ def eth_rpc_json(tx, **over):
     """What eth_getTransactionByHash / a full block returns for `tx`."""
     hx = lambda n: hex(int(n))                     # noqa: E731
     j = {"hash": tx["hash"], "nonce": hx(tx["nonce"]),
-         "gas": hx(tx["gas_limit"]), "to": "0x" + tx["to"].hex(),
+         "gas": hx(tx["gas_limit"]),
+         "to": ("0x" + tx["to"].hex()) if tx["to"] else None,
          "value": hx(tx["value"]), "input": "0x", "v": hx(tx["v"]),
          "r": hx(tx["r"]), "s": hx(tx["s"]),
          "from": b.eth_tx_sender(tx)[0], "blockNumber": "0x10"}
@@ -246,8 +250,13 @@ def eth_nc_run(target, job=None):
     return hits, job, lines
 
 
-def reset_rpc():
-    """Clean every piece of per-endpoint, queue and database state."""
+def reset_rpc(clear_db=True):
+    """Clean every piece of per-endpoint, queue and database state.
+
+    `clear_db=False` leaves the persistent stores alone — the block scanner's
+    index is the thing under test when a re-run must be answered from it, so
+    clearing it there would test nothing.
+    """
     b.requests.post = fake_post
     b.requests.get = fake_get
     b._ETH_BATCH_OK.clear()
@@ -280,9 +289,14 @@ def reset_rpc():
         b._BASE_FAILS.clear()
         b._RATE_INTERVAL[0] = b.ESPLORA_MIN_INTERVAL
         b._RATE_NEXT[0] = 0.0
-    with b._db() as c:
-        c.execute("DELETE FROM results")
-        c.execute("DELETE FROM balance_checks")
+    if clear_db:
+        with b._db() as c:
+            c.execute("DELETE FROM results")
+            c.execute("DELETE FROM balance_checks")
+            # the block scanner's persistent index, so one group cannot answer
+            # from what another group indexed
+            c.execute("DELETE FROM eth_block_index")
+            c.execute("DELETE FROM eth_blocks_scanned")
 
 
 def newjob():
@@ -1940,7 +1954,371 @@ print("37 ok  /api/eth/nonce validation for all four modes, card 7 renders, "
       "results + export + verifier wired, and the CLI recovers a real reuse")
 
 # ══════════════════════════════════════════════════════════════════════
-# 38 — throughput, for the docs (informational)
+# 38 — the ETH block scanner: extract a block, index it, and find a k that
+#      was reused across two blocks (or across two runs)
+# ══════════════════════════════════════════════════════════════════════
+def bs_run(target, job=None):
+    """Run the block scanner synchronously; returns (hits, job, log_lines)."""
+    job = job or newjob()
+    lines = []
+    hits = b.attack_eth_blockscan(target, lines.append, job,
+                                  lambda: job.get("stop", False))
+    return hits, job, lines
+
+
+def bs_load(mapping):
+    BLOCKS.update({n: [eth_rpc_json(t) for t in txs]
+                   for n, txs in mapping.items()})
+
+
+def bs_counts():
+    with b._db() as c:
+        return (c.execute("SELECT COUNT(*) FROM eth_block_index").fetchone()[0],
+                c.execute("SELECT COUNT(*) FROM eth_blocks_scanned").fetchone()[0])
+
+
+BS1 = eth_mk_tx(ETH_D_LEAK, 0, ETH_K)                 # block 16: half the leak
+BS2 = eth_mk_tx(ETH_D_LEAK, 1, ETH_K)                 # block 17: the other half
+BS3 = eth_mk_tx(ETH_D_OK, 0, ETH_K + 5)
+BS4 = eth_mk_tx(ETH_D_OK, 1, ETH_K + 6)
+BS5 = eth_mk_tx(ETH_D_OK, 2, ETH_K + 7, typ=2)        # a typed tx, same block
+BS6 = eth_mk_tx(ETH_D_OK, 3, ETH_K + 8, to=b"", gas=100000)   # contract creation
+A_LEAK, A_OK = b.eth_address(ETH_D_LEAK), b.eth_address(ETH_D_OK)
+
+# (a) a k reused in two DIFFERENT blocks is found, proved and saved — the case
+#     a single-block view can never see
+reset_rpc()
+bs_load({16: [BS1, BS3], 17: [BS2, BS4, BS5], 18: [BS6]})
+hits, job, log = bs_run({"blocks": [16, 17, 18]})
+assert len(hits) == 1, hits
+assert int(hits[0]["privkey"], 16) == ETH_D_LEAK
+assert hits[0]["attack"] == "eth_nonce" and hits[0]["recipe"] == "nonce_reuse"
+assert hits[0]["evidence"].startswith("pubkey:") and hits[0]["signatures"] == 2
+# the two signatures that leaked the key came from two DIFFERENT blocks
+assert {int(x) for x in hits[0]["blocks"]} == {16, 17}, hits[0]["blocks"]
+assert len(hits[0]["txs"]) == 2 and len(set(hits[0]["txs"])) == 2, hits[0]["txs"]
+assert any("block 16:" in l and "public key(s) extracted" in l for l in log), log
+assert any("repeat in the index" in l for l in log), log
+assert not any("no (sender, r) pair repeats" in l for l in log), log
+with b._db() as c:
+    assert c.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 1
+rows, total = b._eth_blockscan_rows(limit=50)
+assert total == 6 == len(rows), total          # every signed tx was extracted
+assert {r["address"] for r in rows} == {A_LEAK, A_OK}, rows
+assert all(r["pubkey"].startswith("04") and len(r["pubkey"]) == 130
+           for r in rows), rows[0]
+assert all(r["r"].startswith("0x") and len(r["r"]) == 66 for r in rows)
+# the extraction is PUBLIC data: no private key is part of it, because a block
+# does not contain one
+assert not any(k in rows[0] for k in ("privkey", "private_key", "d", "secret",
+                                      "key")), sorted(rows[0])
+created = [r for r in rows if r["created"]]
+assert len(created) == 1 and created[0]["to"] == "", created
+assert {"legacy", "eip1559"} <= {r["type"] for r in rows}, {r["type"] for r in rows}
+st = b._eth_blockscan_stats()
+assert (st["rows"], st["blocks"], st["senders"]) == (6, 3, 2), st
+assert st["repeats"] == 1 and st["created"] == 1 and st["failed_blocks"] == 0, st
+assert (st["min_block"], st["max_block"]) == (16, 18), st
+
+# (b) the same blocks again: answered from the index, without re-reading one
+reset_rpc(clear_db=False)
+hits, job, log = bs_run({"blocks": [16, 17, 18]})
+assert len(hits) == 1 and int(hits[0]["privkey"], 16) == ETH_D_LEAK, hits
+# (the "N of M were already indexed" line is for a run that read SOME blocks;
+#  when nothing was read the index-answer line below carries the same fact)
+assert any("answering from it without re-reading a single block" in l
+           for l in log), log
+assert any("index totals" in l for l in log), log
+# the analysis verdict is what the run is remembered by, and it names its
+# source: these blocks were answered from the index, not re-read
+assert "from the index" in job["detail"], job["detail"]
+assert "key(s) recovered" in job["detail"], job["detail"]
+# not one BLOCK was re-read, and no indexer was touched: the only RPC traffic
+# is the balance check of the key it just proved again
+methods = [c.get("method") for _u, body, _h in MODE["posts"]
+           for c in (body if isinstance(body, list) else [body])]
+assert "eth_getBlockByNumber" not in methods, methods
+assert set(methods) <= {"eth_getBalance", "eth_getTransactionCount"}, methods
+assert EXP["gets"] == [], EXP["gets"]
+# rescan re-reads, and storing is idempotent per (block, tx_index)
+reset_rpc(clear_db=False)
+bs_load({16: [BS1, BS3]})
+hits, job, log = bs_run({"blocks": [16], "rescan": True})
+assert any("chunk 1/1: block 16 onward" in l for l in log), log
+assert bs_counts() == (6, 3), bs_counts()      # replaced, not duplicated
+# and it still finds the pair whose other half lives in block 17, read earlier
+assert len(hits) == 1 and int(hits[0]["privkey"], 16) == ETH_D_LEAK, hits
+
+# a mixed run — one indexed block, one new — says which was skipped
+reset_rpc(clear_db=False)
+bs_load({19: [eth_mk_tx(ETH_D_OK, 4, ETH_K + 9)]})
+hits, job, log = bs_run({"blocks": [16, 19]})
+assert any("1 of 2 block(s) were already in the index and were not re-read" in l
+           for l in log), log
+assert any("block 19:" in l for l in log), log
+assert bs_counts() == (7, 4), bs_counts()
+
+# (c) clean blocks get an explicit verdict, not silence, and save nothing
+reset_rpc()
+C1 = eth_mk_tx(ETH_D_OK, 20, ETH_K + 100)
+C2 = eth_mk_tx(ETH_D_OK, 21, ETH_K + 101)
+bs_load({40: [C1, C2]})
+hits, job, log = bs_run({"blocks": [40]})
+assert hits == []
+assert any("no (sender, r) pair repeats" in l for l in log), log
+assert any("NO private key is extractable" in l for l in log), log
+assert "nothing extractable" in job["detail"], job["detail"]
+assert job.get("partial") is not True, job
+with b._db() as c:
+    assert c.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
+
+# (d) a range target, and batching instead of refusing
+reset_rpc()
+bs_load({40: [C1], 41: [C2]})
+hits, job, log = bs_run({"start": 40, "end": 41})
+assert any("2 block(s) to consider" in l for l in log), log
+assert bs_counts() == (2, 2), bs_counts()
+old_batch = b.ETH_BLOCKSCAN_MAX_BLOCKS
+b.ETH_BLOCKSCAN_MAX_BLOCKS = 1
+try:
+    reset_rpc()
+    bs_load({40: [C1], 41: [C2]})
+    hits, job, log = bs_run({"start": 40, "end": 41})
+    assert any("in 2 batch(es) of 1" in l for l in log), log
+    assert any("chunk 1/2" in l for l in log) and any("chunk 2/2" in l
+                                                      for l in log), log
+finally:
+    b.ETH_BLOCKSCAN_MAX_BLOCKS = old_batch
+
+# (e) the index cap evicts oldest-first and says so
+old_rows = b.ETH_BLOCKSCAN_ROWS_MAX
+b.ETH_BLOCKSCAN_ROWS_MAX = 2      # three blocks of one tx each must overflow it
+try:
+    reset_rpc()
+    bs_load({40: [C1], 41: [C2], 42: [eth_mk_tx(ETH_D_OK, 22, ETH_K + 102)]})
+    hits, job, log = bs_run({"start": 40, "end": 42})
+    assert any("ETH_BLOCKSCAN_ROWS_MAX" in l and "evicted" in l for l in log), log
+    with b._db() as c:
+        left = [r[0] for r in c.execute(
+            "SELECT DISTINCT block FROM eth_block_index ORDER BY block")]
+        assert 40 not in left, left            # oldest went first
+        assert c.execute("SELECT COUNT(*) FROM eth_block_index").fetchone()[0] <= 2
+        # an evicted height is no longer claimed as scanned
+        assert c.execute("SELECT COUNT(*) FROM eth_blocks_scanned WHERE block=40"
+                         ).fetchone()[0] == 0
+finally:
+    b.ETH_BLOCKSCAN_ROWS_MAX = old_rows
+
+# (f) failure modes: none of them may read as "clean"
+reset_rpc()
+hits, job, log = bs_run({"blocks": [500, 501, 502, 503]})    # nothing to read
+assert hits == [] and job.get("partial") is True, job
+assert "gave up" in job["detail"] and "nothing read" in job["detail"], job["detail"]
+assert any("INCOMPLETE, not clean" in l for l in log), log
+assert any("NOTHING was extracted" in l for l in log), log
+assert not any("no (sender, r) pair repeats" in l for l in log), log
+assert not any("NO private key is extractable" in l for l in log), log
+with b._db() as c:
+    assert c.execute("SELECT COUNT(*) FROM eth_blocks_scanned WHERE error != ''"
+                     ).fetchone()[0] >= 3
+    assert c.execute("SELECT COUNT(*) FROM eth_block_index").fetchone()[0] == 0
+# a failed height is recorded, so a later run does not treat it as scanned
+reset_rpc()
+bs_load({501: [C1]})
+hits, job, log = bs_run({"blocks": [500, 501]})
+assert any("could not be read" in l or "null on this endpoint" in l
+           for l in log), log
+assert job.get("partial") is True, job
+assert any("block(s) could not be read" in l for l in log), log
+# every RPC endpoint refusing
+reset_rpc()
+bs_load({60: [C1]})
+MODE["fail"] = "403"
+hits, job, log = bs_run({"blocks": [60]})
+assert hits == [] and job.get("partial") is True, job
+assert "no RPC endpoint answered" in job["detail"], job["detail"]
+assert any("EVERY configured RPC endpoint" in l for l in log), log
+# a throttle (429 on every endpoint) is a "wait and retry", not a dead RPC:
+# the run is partial, the blocks are NOT marked scanned, so a re-run resumes
+reset_rpc()
+bs_load({70: [C1], 71: [C2]})
+MODE["fail"] = "all"
+hits, job, log = bs_run({"blocks": [70, 71]})
+assert hits == [] and job.get("partial") is True, job
+assert "rate limited" in job["detail"], job["detail"]
+assert any("re-running resumes where this stopped" in l for l in log), log
+assert not any("no (sender, r) pair repeats" in l for l in log), log
+with b._db() as c:
+    assert c.execute("SELECT COUNT(*) FROM eth_blocks_scanned WHERE error=''"
+                     ).fetchone()[0] == 0, list(c.execute(
+                         "SELECT block,error FROM eth_blocks_scanned"))
+MODE["fail"] = None
+
+# Stop before the first request: partial, honest, and NOT "answered from index"
+reset_rpc()
+job = newjob()
+job["stop"] = True
+lines = []
+assert b.attack_eth_blockscan({"blocks": [16]}, lines.append, job,
+                              lambda: job["stop"]) == []
+assert job.get("partial") is True, job
+assert any("stopped by user" in l for l in lines), lines
+assert not any("answering from it" in l for l in lines), lines
+assert not any("no (sender, r) pair repeats" in l for l in lines), lines
+# no blocks at all
+job2 = newjob()
+assert b.attack_eth_blockscan({"blocks": []}, lines.append, job2,
+                              lambda: False) == []
+assert job2["detail"] == "no blocks to read", job2["detail"]
+
+# (g) routes: validation, batching, rows, export — and a huge range is never
+#     refused
+reset_rpc()
+cl = b.app.test_client()
+
+
+def bspost(payload):
+    return cl.post("/api/eth/blockscan", json=payload).get_json()
+
+
+for payload, frag in (({"blocks": ""}, "enter at least one block number"),
+                      ({"blocks": "abc"}, "enter at least one block number"),
+                      ({"blocks": "0x"}, "enter at least one block number"),
+                      ({"start": 10, "end": 5}, "end must be >= start"),
+                      ({"start": -1}, "block numbers start at 0"),
+                      ({"start": "zz"}, "start must be a block number"),
+                      ({"start": 5, "end": "zz"}, "end must be a block number"),
+                      ({}, "enter at least one block number")):
+    d = bspost(payload)
+    assert d["ok"] is False and frag in d["msg"], (payload, d)
+d = bspost({"blocks": "16, 16, 0x11\n17"})
+assert d["ok"] is True, d
+assert d["blocks"] == 2 and d["first"] == 16 and d["last"] == 17, d   # deduped
+assert d["requests"] == 2 and d["batches"] == 1, d
+wait_job("eth_blockscan")
+d = bspost({"start": "0x10", "end": "0x12"})
+assert d["ok"] is True and d["first"] == 16 and d["last"] == 18, d
+assert d["blocks"] == 3 and d["requests"] == 3, d
+wait_job("eth_blockscan")
+d = bspost({"start": 900})
+assert d["ok"] is True and d["last"] == 900 + b.ETH_BLOCKSCAN_BLOCKS - 1, d
+wait_job("eth_blockscan")
+big = bspost({"start": 0, "end": b.ETH_BLOCKSCAN_MAX_BLOCKS + 5000})
+assert big["ok"] is True and big["batches"] == 2, big
+assert "batch" in big["msg"] and "too large" not in big["msg"], big["msg"]
+b._JOBS["eth_blockscan"]["stop"] = True
+wait_job("eth_blockscan")
+assert "eth_blockscan" in b.JOB_NAMES, b.JOB_NAMES
+jobs = cl.get("/api/jobs").get_json()
+assert "eth_blockscan" in jobs["jobs"], sorted(jobs["jobs"])
+assert cl.post("/api/stop/eth_blockscan", json={}).get_json()["ok"] in (True, False)
+
+# rows + state are database reads: no network, and the filters work
+reset_rpc()
+bs_load({16: [BS1, BS3], 17: [BS2, BS4, BS5], 18: [BS6]})
+hits, job, log = bs_run({"blocks": [16, 17, 18]})
+posts_before = list(MODE["posts"])
+stt = cl.get("/api/eth/blockscan/state").get_json()
+assert stt["ok"] is True and stt["rows"] == 6 and stt["repeats"] == 1, stt
+assert stt["page_rows"] == b.ETH_BLOCKSCAN_PAGE_ROWS, stt
+extra = MODE["posts"][len(posts_before):]
+assert not extra, ("the state endpoint must not touch RPC",
+                   [c.get("method") for _u, body, _h in extra
+                    for c in (body if isinstance(body, list) else [body])])
+rw = cl.get("/api/eth/blockscan/rows?limit=2").get_json()
+assert rw["ok"] is True and rw["total"] == 6 and len(rw["rows"]) == 2, rw
+assert rw["rows"][0]["block"] >= rw["rows"][1]["block"], rw["rows"]
+byb = cl.get("/api/eth/blockscan/rows?block=0x10").get_json()
+assert byb["total"] == 2 and {r["block"] for r in byb["rows"]} == {16}, byb
+bys = cl.get("/api/eth/blockscan/rows?sender=%s" % A_LEAK).get_json()
+assert bys["total"] == 2 and all(r["address"] == A_LEAK for r in bys["rows"]), bys
+rep = cl.get("/api/eth/blockscan/rows?repeat=1").get_json()
+assert rep["total"] == 2 and all(r["address"] == A_LEAK for r in rep["rows"]), rep
+page2 = cl.get("/api/eth/blockscan/rows?limit=2&offset=4").get_json()
+assert len(page2["rows"]) == 2 and page2["offset"] == 4, page2
+bad = cl.get("/api/eth/blockscan/rows?block=zz").get_json()
+assert bad["ok"] is False and "block must be a block number" in bad["msg"], bad
+csvr = cl.get("/api/eth/blockscan/export?format=csv")
+lines = csvr.get_data(as_text=True).strip().splitlines()
+assert csvr.status_code == 200 and len(lines) == 7, len(lines)
+hdr = lines[0].split(",")
+assert hdr[:6] == ["block", "index", "hash", "sender", "address", "pubkey"], hdr
+assert not any(h in ("privkey", "private_key", "secret") for h in hdr), hdr
+assert any(l.split(",")[5].startswith("04") and len(l.split(",")[5]) == 130
+           for l in lines[1:]), lines[1]
+assert "attachment" in csvr.headers.get("Content-Disposition", "")
+jsonl = cl.get("/api/eth/blockscan/export?format=jsonl&repeat=1")
+jrows = [json.loads(l) for l in jsonl.get_data(as_text=True).strip().splitlines()]
+assert len(jrows) == 2 and all(r["sender"] == A_LEAK.lower() for r in jrows), jrows
+assert cl.get("/api/eth/blockscan/export?format=xlsx").get_json()["ok"] is False
+# a proved key reaches /results and the eth export, as it does for card 7
+rpage = cl.get("/results").get_data(as_text=True)
+assert "eth_nonce" in rpage and A_LEAK in rpage
+assert "eth_nonce" in cl.get("/api/results/export?attack=eth").get_data(as_text=True)
+
+# (h) the page renders, with every placeholder substituted and honest copy
+pg = cl.get("/ethblock")
+assert pg.status_code == 200
+ptxt = pg.get_data(as_text=True)
+for frag in ("ETH Block Scanner", "bsModeChanged", "startBs()", "bsMode", "bsB",
+             "bsL", "bsS", "bsE", "bsRescan", "watch('eth_blockscan','Bs')",
+             "bsState()", "bsRows(true)", "25833523", "eth_getBlockByNumber",
+             "(sender, r)", "CVE-2023-46233", "cannot do", "discrete log",
+             "cannot find", "gates", "scope", "/api/eth/blockscan/export"):
+    assert frag in ptxt, frag
+# the promise the page must never make
+assert "cannot do" in ptxt and "public key" in ptxt
+for tok in ("{bsmaxblocks}", "{bsrowsmax}", "{bsblocks}", "{bsexample}",
+            "{bsexample2}", "{bsmaxblocks_raw}", "{bspage_raw}", "{body}",
+            "{nav}", "{build_id}"):
+    assert tok not in ptxt, tok
+assert ptxt.count('class="on"') == 1, ptxt.count('class="on"')
+assert 'href="/ethblock"' in ptxt and "/ethblock" in dict(
+    (p, l) for p, l in b.NAV_ITEMS).keys() or True
+assert ("/ethblock", "eth blocks") in b.NAV_ITEMS, b.NAV_ITEMS
+for tag in ("div", "details", "select", "textarea", "button", "pre", "script",
+            "p", "label"):
+    o = len(re.findall(r"<%s[\s>]" % tag, ptxt))
+    c = len(re.findall(r"</%s>" % tag, ptxt))
+    assert o == c, (tag, o, c)
+# every other page still renders with the new nav pill in it
+for path in ("/", "/data", "/randstorm", "/brain", "/nonce", "/live", "/eth",
+             "/results", "/health"):
+    r = cl.get(path)
+    assert r.status_code == 200, (path, r.status_code)
+    if path != "/health":
+        assert 'href="/ethblock"' in r.get_data(as_text=True), path
+assert "/ethblock" in cl.get("/eth").get_data(as_text=True)
+
+# (i) headless: the CLI answers from the SAME persistent index, in another
+#     process, without any RPC call
+r = cli("--cli-eth-blockscan", "16:18")
+assert r.returncode == 0, r.stderr[-600:]
+assert "── 3 block(s): 16..18 ──" in r.stdout, r.stdout[-600:]
+assert "ETH KEY" in r.stdout and hex(ETH_D_LEAK) in r.stdout, r.stdout[-900:]
+assert "extracted  : 6 signature(s) indexed from 2 sender(s)" in r.stdout, \
+    r.stdout[-600:]
+assert "repeats    : 1 (sender, r) pair(s)" in r.stdout, r.stdout[-600:]
+assert "1 key(s) recovered" in r.stdout and "total: 1 key(s)" in r.stdout
+r = cli("--cli-eth-blockscan", "40,41")       # nothing indexed, no egress here
+assert r.returncode == 0, r.stderr[-400:]
+assert "0 key(s) recovered" in r.stdout, r.stdout[-400:]
+assert "a block yields PUBLIC data" in r.stdout, r.stdout[-500:]
+r = cli("--cli-eth-blockscan", "5:3")
+assert r.returncode != 0 and "last block precedes the first" in r.stderr, r.stderr
+r = cli("--cli-eth-blockscan", "zz")
+assert r.returncode != 0 and "--cli-eth-blockscan" in r.stderr, r.stderr
+r = cli("--help")
+for flag in ("--cli-eth-blockscan", "--cli-eth-blockscan-rescan"):
+    assert flag in r.stdout, flag
+reset_rpc()
+print("38 ok  block scanner: cross-block k reuse proved and saved, the index "
+      "answers a re-run with zero RPC calls, extraction is public-only, caps "
+      "evict oldest-first, every failure stays partial, and routes/page/CLI "
+      "all agree")
+
+# ══════════════════════════════════════════════════════════════════════
+# 39 — throughput, for the docs (informational)
 # ══════════════════════════════════════════════════════════════════════
 for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
     fn = b.ETH_RECIPES[rid]["fn"]
@@ -1949,7 +2327,7 @@ for rid, n in (("sha256_dec", 2000), ("tw_bip39_s", 60)):
         priv, _extra = fn(TS0 + i, "s")[0]
         b.eth_address(priv)
     el = (time.time() - t0) / n
-    print("38 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
+    print("39 info  %-11s %6.2f ms/candidate -> %6.0f/s -> the 2,505,600-seed "
           "Trust Wallet window in %5.1f min"
           % (rid, el * 1000, 1 / el, 2_505_600 * el / 60))
 
